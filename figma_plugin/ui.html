@@ -1,0 +1,217 @@
+<!-- figma_plugin/ui.html -- the only part of the plugin with network access.
+     Holds the WebSocket connection to the Python bridge and relays messages
+     to/from code.js via postMessage. No agent logic here: it just moves
+     Request/Response JSON back and forth. See CLAUDE.md section 7.
+
+     The bridge URL is editable and saved via figma.clientStorage (through
+     code.js) so it doesn't have to match a hardcoded default. -->
+<style>
+  :root {
+    --accent: #6366f1;
+    --ok: #10b981;
+    --warn: #f59e0b;
+    --err: #ef4444;
+    --bg: #ffffff;
+    --surface: #f7f8fa;
+    --border: #e3e6ec;
+    --text: #101828;
+    --text-dim: #667085;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151c; --surface: #171b24; --border: #262b38;
+      --text: #e8eaf0; --text-dim: #9aa1b1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    background: var(--bg); color: var(--text);
+    font: 12px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .head { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+  .mark {
+    width: 22px; height: 22px; border-radius: 6px; flex: none;
+    background: linear-gradient(135deg, var(--accent), #a855f7);
+    display: grid; place-items: center; color: #fff; font-size: 11px; font-weight: 700;
+  }
+  .title { font-weight: 650; font-size: 13px; }
+  .spacer { flex: 1; }
+
+  .status {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px; border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--border);
+    margin-bottom: 12px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--text-dim); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(16,185,129,.2); }
+  .dot.off { background: var(--err); }
+  .dot.wait { background: var(--warn); }
+  .status-text { font-weight: 600; }
+  .status-sub { color: var(--text-dim); font-size: 11px; }
+
+  label { display: block; font-weight: 600; font-size: 11px; margin-bottom: 5px; }
+  input {
+    width: 100%; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-family: var(--mono); font-size: 11.5px; outline: 0;
+  }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(99,102,241,.15); }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  button {
+    padding: 8px 14px; border-radius: 8px; border: 1px solid transparent;
+    background: var(--accent); color: #fff; font-weight: 600; font-size: 12px; cursor: pointer;
+  }
+  button.ghost { background: transparent; border-color: var(--border); color: var(--text); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .hint { color: var(--text-dim); font-size: 11px; margin-top: 6px; }
+
+  details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+  summary { cursor: pointer; font-weight: 600; font-size: 11.5px; color: var(--text-dim); }
+  summary::-webkit-details-marker { color: var(--text-dim); }
+  ol { margin: 10px 0 0; padding-left: 18px; color: var(--text-dim); font-size: 11.5px; }
+  ol li { margin-bottom: 7px; }
+  code { font-family: var(--mono); background: var(--surface); border: 1px solid var(--border); padding: 1px 4px; border-radius: 4px; font-size: 11px; }
+
+  #log {
+    margin-top: 12px; height: 88px; overflow-y: auto;
+    font-family: var(--mono); font-size: 10.5px; line-height: 1.6;
+    color: var(--text-dim); white-space: pre-wrap;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px;
+  }
+</style>
+
+<div class="head">
+  <span class="mark">F</span>
+  <span class="title">Designer Agent</span>
+</div>
+
+<div class="status">
+  <span class="dot wait" id="dot"></span>
+  <div>
+    <div class="status-text" id="status-text">Connecting…</div>
+    <div class="status-sub" id="status-sub">Reaching the local agent</div>
+  </div>
+</div>
+
+<label for="url">Bridge URL</label>
+<input id="url" spellcheck="false" autocomplete="off" placeholder="ws://localhost:9223" />
+<div class="row">
+  <button id="save">Save &amp; reconnect</button>
+  <button class="ghost" id="reset">Reset</button>
+</div>
+<div class="hint" id="hint">Must match <code>BRIDGE_HOST</code>/<code>BRIDGE_PORT</code> in the agent's .env.</div>
+
+<details id="help">
+  <summary>Not connecting? Read this</summary>
+  <ol>
+    <li>Start the agent first: run <code>python webapp.py</code> in the project folder.</li>
+    <li>Keep this plugin window <strong>open</strong> for the whole run — closing it drops the connection.</li>
+    <li>Use the <strong>design editor</strong>, not Dev Mode. Dev Mode is read-only, so edits fail.</li>
+    <li>If you changed the port, the URL above <em>and</em> <code>networkAccess</code> in
+        <code>manifest.json</code> must both match — Figma blocks any host not listed there.</li>
+    <li>Reconnects are automatic; this panel retries every couple of seconds.</li>
+  </ol>
+</details>
+
+<div id="log"></div>
+
+<script>
+  var DEFAULT_URL = "ws://localhost:9223";
+  var RECONNECT_MS = 2000;
+
+  var ws = null, bridgeUrl = DEFAULT_URL, reconnectTimer = null, manualReconnect = false;
+
+  var dot = document.getElementById("dot");
+  var statusText = document.getElementById("status-text");
+  var statusSub = document.getElementById("status-sub");
+  var urlInput = document.getElementById("url");
+  var logEl = document.getElementById("log");
+
+  function setStatus(state, text, sub) {
+    dot.className = "dot " + state;
+    statusText.textContent = text;
+    statusSub.textContent = sub;
+  }
+
+  function log(line) {
+    var stamp = new Date().toLocaleTimeString();
+    logEl.textContent += "[" + stamp + "] " + line + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function connect() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
+
+    setStatus("wait", "Connecting…", bridgeUrl);
+    try {
+      ws = new WebSocket(bridgeUrl);
+    } catch (e) {
+      // Figma blocks any host missing from manifest networkAccess -- the
+      // constructor itself throws, so say so rather than silently retrying.
+      setStatus("off", "Blocked", "Not allowed by manifest networkAccess");
+      log("cannot open " + bridgeUrl + " — " + e.message);
+      document.getElementById("help").open = true;
+      return;
+    }
+
+    ws.onopen = function () {
+      setStatus("on", "Connected", bridgeUrl);
+      log("connected");
+    };
+
+    ws.onclose = function () {
+      setStatus("off", "Disconnected", "Retrying in 2s — is the agent running?");
+      if (!manualReconnect) reconnectTimer = setTimeout(connect, RECONNECT_MS);
+      manualReconnect = false;
+    };
+
+    ws.onerror = function () { try { ws.close(); } catch (e) {} };
+
+    // A Request arrives from the Python agent -- hand it to code.js to run.
+    ws.onmessage = function (event) {
+      var request;
+      try { request = JSON.parse(event.data); }
+      catch (err) { log("bad message from bridge: " + err); return; }
+      if (request.type !== "hello") log("→ " + request.type);
+      parent.postMessage({ pluginMessage: request }, "*");
+    };
+  }
+
+  // code.js replies here: either a saved-config payload or a bridge Response.
+  window.onmessage = function (event) {
+    var msg = event.data.pluginMessage;
+    if (!msg) return;
+
+    if (msg.__config) {
+      bridgeUrl = msg.__config.bridgeUrl || DEFAULT_URL;
+      urlInput.value = bridgeUrl;
+      if (msg.__config.saved) log("saved bridge URL");
+      connect();
+      return;
+    }
+
+    if (msg.type !== "hello" && msg.id) log("← " + (msg.ok ? "ok" : "error: " + msg.error));
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  };
+
+  document.getElementById("save").onclick = function () {
+    manualReconnect = true;
+    parent.postMessage({ pluginMessage: { type: "__saveConfig", bridgeUrl: urlInput.value } }, "*");
+  };
+  document.getElementById("reset").onclick = function () {
+    urlInput.value = DEFAULT_URL;
+    manualReconnect = true;
+    parent.postMessage({ pluginMessage: { type: "__saveConfig", bridgeUrl: DEFAULT_URL } }, "*");
+  };
+  urlInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") document.getElementById("save").click();
+  });
+
+  // Ask code.js for the saved URL; connect() runs once it answers.
+  parent.postMessage({ pluginMessage: { type: "__loadConfig" } }, "*");
+</script>

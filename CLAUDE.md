@@ -1,0 +1,919 @@
+# CLAUDE.md — Figma Designer Agent
+
+This file is the source of truth for how this project is built. Read it fully before
+writing or changing code. It exists so any agent (or human) can pick up the work without
+re-deriving the architecture.
+
+**Two models, on purpose.** The **generator** (`MODEL_*`, currently `gpt-oss:20b-cloud` via
+Ollama Cloud — free, reliable native tool calls, ~5s per call) writes Plugin API scripts and
+runs ~50 times per design. The **vision critic** (`CRITIC_*`, optional) looks at a screenshot
+of each finished section and reports what is visibly broken; it runs a handful of times, so a
+paid hosted vision model costs very little here even though the generator is free. Neither
+model is referenced outside `agent/llm.py` — both are `.env` lines. See sections 5 and 8b.
+
+---
+
+## 1. What this project is
+
+A local agent that turns a **plain-language instruction** into a **complete Figma design**.
+You type "a mobile sign-in screen with email + password and a Google button," and the
+system builds it on a real Figma canvas — tokens, components, and layout, not a flat pile
+of rectangles.
+
+The agent does **not** know Figma from memory. It becomes competent through the harness:
+docs are retrieved into context on demand (section 9), work happens in small atomic steps,
+and every step is checked against ground truth — the file's metadata and its real geometry
+(section 8) — then corrected. Treat the harness, not the model, as where quality comes from.
+
+**Corollary learned the hard way:** if a piece of work is mechanical and always the same
+shape, the harness does it *itself* rather than asking the model. See section 6a — this is
+the single biggest source of reliability in the project.
+
+### The single most important design fact
+
+You **cannot** write to the Figma canvas from Python. Figma's document is only mutable from
+inside the Plugin API sandbox — JavaScript running inside the Figma desktop app. The REST
+API is read-only for canvas structure. So the architecture is necessarily split:
+
+- The **agent** (this Python code) is the brain. It plans and generates Plugin API JS.
+- A **Figma plugin** is the hands. It receives JS over a WebSocket, runs it inside Figma,
+  and sends back the result plus a screenshot.
+
+---
+
+## 2. Golden rules (do not violate these)
+
+1. **The model is one swappable endpoint.** All model access goes through `agent/llm.py`.
+   A `.env` change (or one extra client class), never a change scattered through the
+   codebase. See section 5.
+2. **Simplicity over cleverness.** Readable by someone new. Small functions, explicit
+   control flow, type hints, standard library where possible. No agent frameworks — the
+   loop is hand-rolled on purpose.
+3. **Small atomic Figma steps.** One logical operation per script. Figma scripts are
+   atomic: a failed script changes nothing, so retry is always safe.
+4. **Validate every step — structurally and visually.** Read back metadata, and run the
+   visual gate on every step that puts something on the canvas (section 8).
+5. **Tokens -> components -> composition.** Never hardcode colors/spacing into final nodes.
+   The harness creates the tokens itself (section 6a) and hands the model their names.
+6. **Every Figma script returns the node IDs it touched.** State lives in Python, not in
+   the model's memory.
+7. **If it is mechanical, the harness writes it — not the model.** Root frame, design
+   tokens, layout auditing and placeholder recovery are all Python-authored scripts. Each
+   one was added *after* watching the model fail the same thing repeatedly (section 6a).
+8. **Fix the harness from real traces, not from guesses.** Every gotcha and error hint in
+   this repo came from an actual failing run. When something breaks, read the trace and
+   close that specific hole.
+
+---
+
+## 3. Architecture
+
+```
+  Instruction  (CLI: main.py   |   Web dashboard: webapp.py)
+      |
+      v
++-----------------------------+        +--------------+        +-------------------+
+|  AGENT  (Python, this repo) |        |   BRIDGE     |        |  FIGMA DESKTOP    |
+|                             |        |  WebSocket   |        |                   |
+|  llm.py     -> the model    |  JS -> |  localhost   |  JS -> |  plugin ui.html   |
+|  loop.py    -> the loop     | -----> |              | -----> |  -> code.js       |
+|  planner.py -> decomposition|        |  request/    |        |  -> Plugin API    |
+|  scaffold.py-> harness JS   |        |  response    |        |  -> Canvas        |
+|  critic.py  -> visual gate  | <----- |  matching    | <----- |                   |
+|  tools/     -> exec + read  |  IDs,  |              |  IDs,  |  (returns result  |
+|  knowledge/ -> docs         |  meta, |              |  meta, |   + screenshot)   |
+|  state.py   -> run state    |  PNG   |              |  PNG   |                   |
++-----------------------------+        +--------------+        +-------------------+
+      ^
+      |  web/ -> dashboard: file gallery, settings, setup guide (webapp.py only)
+```
+
+Each part has one responsibility:
+
+| Component | Responsibility |
+|---|---|
+| **Model client** (`agent/llm.py`) | The only place the model is configured. One method: `complete(messages, tools)`. The swap point. Also normalizes tool calls that small models emit as plain text. |
+| **Agent loop** (`agent/loop.py`) | Drives the run: inspect -> scaffold -> plan -> per-step (generate -> execute -> structural gate -> visual gate -> retry). Hand-rolled. |
+| **Planner** (`agent/planner.py`) | Expands the instruction into a design brief, then into an ordered plan. |
+| **Scaffold** (`agent/scaffold.py`) | Python-authored Figma scripts the model never writes: tokens, text styles, placeholder sections (section 6a). |
+| **Critic** (`agent/critic.py`) | The visual gate: deterministic geometry analysis, plus optional screenshot critique (section 8). |
+| **Tools** (`tools/`) | The functions the model may call: `execute_figma_js`, `get_metadata`, `get_screenshot`. Keep this set small. `query_docs` is deliberately **not** offered — the gotchas are inlined in the system prompt instead (section 9). |
+| **Knowledge** (`knowledge/`) | Plugin API gotchas + typings; retrieves the relevant slice per step (section 9). |
+| **Bridge** (`bridge/`) | WebSocket server + message protocol. Sends JS to the plugin, matches responses by id, tracks which file is connected. |
+| **State** (`agent/state.py`) | Holds the plan, created node IDs, tokens, per-step results. Feeds the model concise summaries, never full history. |
+| **Web dashboard** (`web/`) | Optional browser UI: file gallery, credentials, setup guide, live run log. No agent logic. |
+
+The **Figma plugin** (`figma_plugin/`) is the only non-Python part. Keep it thin: execute
+received JS, return the result + a screenshot.
+
+---
+
+## 4. Directory structure
+
+```
+figma-agent/
+|-- CLAUDE.md                # this file
+|-- README.md                # human quickstart
+|-- .env.example             # config template (copy to .env — or use the dashboard)
+|-- requirements.txt
+|-- config.py                # loads .env into a typed Settings object
+|-- main.py                  # CLI:      python main.py "your instruction"
+|-- webapp.py                # dashboard: python webapp.py  -> localhost:8787
+|
+|-- agent/
+|   |-- llm.py               # ModelClient — THE model swap point (section 5)
+|   |-- loop.py              # the orchestration loop (section 6)
+|   |-- planner.py           # instruction -> design brief -> ordered plan
+|   |-- scaffold.py          # Python-authored Figma scripts (section 6a)
+|   |-- critic.py            # the visual gate (section 8)
+|   |-- prompts.py           # system prompt + templates + few-shot exemplars
+|   |-- state.py             # RunState dataclass
+|
+|-- tools/
+|   |-- registry.py          # tool JSON schemas + dispatch
+|   |-- figma_exec.py        # execute_figma_js
+|   |-- figma_read.py        # get_metadata, get_screenshot
+|   |-- docs.py              # query_docs (calls knowledge/)
+|
+|-- bridge/
+|   |-- server.py            # asyncio websocket server, id-based req/resp matching
+|   |-- protocol.py          # Request/Response dataclasses (the wire contract)
+|
+|-- knowledge/
+|   |-- gotchas.md           # the Plugin API traps (section 11)
+|   |-- api_types.d.ts       # Figma Plugin API typings, for retrieval grounding
+|   |-- index.py             # chunk + retrieve (section 9)
+|
+|-- web/                     # the dashboard (webapp.py only; no agent logic)
+|   |-- app.py               # stdlib HTTP server + JSON API + run orchestration
+|   |-- registry.py          # local history of Figma files seen, with thumbnails
+|   |-- settings_store.py    # UI-entered credentials, layered over .env
+|   |-- static/index.html    # single-page UI: gallery, settings, setup guide, themes
+|
+|-- figma_plugin/            # TypeScript/JS — the only non-Python part
+|   |-- manifest.json
+|   |-- code.ts / code.js    # runs in Figma: eval JS, call Figma API, screenshot
+|   |-- ui.html              # holds the WebSocket; relays to code.js via postMessage
+|
+|-- bench/                   # the design-quality benchmark (section 16a)
+|   |-- spec.py              # Task + Criterion dataclasses; tasks are DATA
+|   |-- tasks/*.json         # frozen instructions + acceptance criteria
+|   |-- capture.py           # one-round-trip read of the finished design
+|   |-- score.py             # the deterministic scorer
+|   |-- run.py               # CLI: run tasks, save results, re-score offline
+|   |-- results/             # git-ignored; one file per run, never overwritten
+|
+|-- tests/                   # no Figma, no network, no model — all fakes
+    |-- test_bridge.py       # protocol round-trips + handshake + disconnects
+    |-- test_loop.py         # loop logic with a fake ModelClient + fake bridge
+    |-- test_critic.py       # the visual gate's geometry analysis
+    |-- test_scaffold.py     # palette parsing + generated JS actually compiles
+    |-- test_llm.py          # tool-call recovery for small models
+    |-- test_settings.py     # settings precedence, masking, dashboard API
+    |-- test_registry.py     # file-gallery history
+    |-- test_docs.py         # retrieval never answers with silence
+    |-- fixtures/
+```
+
+Rule: **one concern per file.** If a file starts doing two jobs, split it.
+
+---
+
+## 5. The model and the swap point
+
+The one hard requirement is **tool calling**. Everything else is a trade-off. All model
+access goes through **one file**, `agent/llm.py`, which speaks the OpenAI-compatible chat
+API — so switching provider is a `.env` change, not a code change.
+
+### The three options, with real measured numbers
+
+| Option | Setup | Speed | Notes |
+|---|---|---|---|
+| **Ollama Cloud** (current) | `ollama signin`, `ollama pull gpt-oss:20b-cloud` | ~5s/call | Free "Low Usage" tier, native tool calls, **no vision**. Runs on Ollama's infra via the local endpoint. |
+| **Hosted API** (OpenRouter, Anthropic, …) | API key | seconds | Best quality; costs money. Watch the account balance vs. the model's default `max_tokens` — a 402 here looks like a config bug but isn't. |
+| **Fully local** (`qwen2.5-coder:7b`) | `ollama pull` | **minutes**/call | Free and offline, but without a GPU a full run takes a very long time. Also emits tool calls as plain text — see below. |
+
+```
+# Current .env
+MODEL_BASE_URL=http://localhost:11434/v1
+MODEL_API_KEY=ollama
+MODEL_NAME=gpt-oss:20b-cloud
+```
+
+Not every `:cloud` model is free — `glm-5.2:cloud` returns 403 "requires a subscription".
+**Verify with a real request** (the dashboard's "Test connection" button does exactly this)
+rather than assuming from the name.
+
+### Interface
+
+```python
+# agent/llm.py — the ONLY place a model provider is defined.
+class ModelClient:
+    """One method the whole system depends on. Swap the body, keep the shape."""
+    def complete(self, messages: list[dict], tools: list[dict]):
+        """Return the assistant message (text and/or tool calls). If the model is
+        multimodal it can also SEE images passed in messages — section 8."""
+        ...
+```
+
+### Tool-call recovery (why `llm.py` is bigger than one method)
+
+Small models frequently emit a *correct* tool call as plain JSON text in `content` instead
+of populating the API's `tool_calls` field — `qwen2.5-coder:7b` does this on every call, and
+`tool_choice: "required"` does not fix it. `agent/llm.py` normalizes three real shapes seen
+in live runs back into proper tool calls:
+
+- a bare `{"name": ..., "arguments": {...}}`
+- an invented `{"calls": [ ... ]}` wrapper when batching
+- several ```` ```json ```` blocks buried in prose
+
+The loop never knows the difference. Keep this in `llm.py` — it is provider quirk handling,
+which is exactly what the swap point is for.
+
+### Cost discipline
+
+Debug the **harness** (does the loop close, do tools fire, do the gates block) against the
+fakes in `tests/` — 87 tests run with no network, no Figma and no model. Spend real model
+calls on genuine design runs.
+
+---
+
+## 6. The agent loop (the workflow)
+
+```python
+# agent/loop.py — this mirrors the real code
+def run(instruction, bridge, llm, max_retries, max_steps) -> RunResult:
+    state = RunState(instruction)
+
+    inspect_file(state, bridge)            # 1. READ-ONLY: existing nodes + geometry,
+                                           #    and discover REAL Inter style strings.
+                                           #    Never assume canvas state.
+
+    state.enhanced_brief = planner.enhance_instruction(instruction, llm)   # 2. design brief
+    create_root_frame(state, bridge)       # 3. HARNESS-AUTHORED (section 6a)
+    bootstrap_tokens(state, bridge)        # 4. HARNESS-AUTHORED (section 6a)
+
+    state.plan = planner.make_plan(state.enhanced_brief, state, llm)[:max_steps]
+
+    for step in state.plan:                # 5. one step at a time
+        run_step(...)                      #    retries + both gates, below
+
+    final_validation(state, bridge)        # 6. screenshot + layout review + binding audit
+    return state.result()
+
+
+def run_step(step, state, bridge, llm, max_retries, index, total):
+    docs = query_docs(step, sources=STEP_DOC_SOURCES)   # TYPINGS only (s.9)
+    landed_ids, prior_defects, prior_error = [], [], ""
+    seen_calls = set()                    # spans every attempt, not just one
+
+    for attempt in range(max_retries):
+        # prior_node_ids turns this into a REPAIR, not a rebuild
+        outcome = converse_step(step, docs, state, bridge, llm, label, index,
+                                prior_node_ids=landed_ids,
+                                prior_defects=prior_defects,
+                                prior_error=prior_error,
+                                seen_calls=seen_calls)
+        _remember(landed_ids, outcome.created_node_ids)      # whatever hit the canvas
+
+        if outcome.ok:
+            # Judged on THIS step's nodes only -- section 8.
+            defects = visual_gate(step, state, bridge, llm, label,
+                                  outcome.created_node_ids)
+            if not defects:
+                state.record_step_result(step, outcome)      # passed both gates
+                state.record_section(outcome.section_name)   # later steps must know
+                return
+            state.add_node_ids(outcome.created_node_ids)
+            prior_defects, prior_error = defects, ""         # next attempt REPAIRS
+            continue
+
+        # A script threw. Scripts are atomic, but earlier scripts in the same
+        # attempt did land -- so repair from those rather than rebuilding.
+        state.add_node_ids(outcome.created_node_ids)
+        docs = augment_with_error(docs, outcome.summary)     # exact error + hint
+        prior_defects, prior_error = [], outcome.summary
+    state.mark_failed(step)
+    fallback_for_step(step, state, bridge)                   # placeholder (section 6a)
+```
+
+**The single most important property of this loop:** a retry never re-issues the
+original step description as its headline instruction. Doing so produced a second
+copy of the section every time — the model was being told to build the thing it had
+just built. A retry that has anything on the canvas is framed as *"these nodes exist,
+fix them in place, do not append"*.
+
+Non-negotiable behaviors: inspect before creating; small scripts that `return` their node
+IDs; on error read the message and fix (never blind-retry); feed the model concise state, not
+the full transcript.
+
+### Guardrails inside the step loop
+
+All of these exist because a live run burned a whole step budget without them:
+
+| Guardrail | Why |
+|---|---|
+| `MAX_TOOL_TURNS_PER_STEP = 8` | A confused model can otherwise loop forever. |
+| Repeated-call guard | Identical calls are refused — one step ran the same `createPaintStyle` script 8×; another created 7 duplicate footer frames. **The guard is owned by `run_step`, so it spans every attempt**; when it lived in `converse_step` it reset with each retry's fresh conversation, which is how those 7 footers happened. |
+| Repair-mode retries | A retry that has nodes on the canvas is told to modify them, never to rebuild. See the note under the loop above. |
+| ~~`MAX_DOC_QUERIES_PER_STEP`~~ | Gone. It existed to stop steps burning their turns on `query_docs`; removing the tool removed the problem (section 9). |
+| "You replied with text" | If a step ends with no script ever executed, it is a FAILURE, not a success. |
+| `ERROR_HINTS` | Recurring errors map to their exact fix, fed back on retry (section 7). |
+
+---
+
+## 6a. What the harness does itself (do not delegate these)
+
+Everything here was moved out of the model's hands **after watching it fail repeatedly**.
+These are Python-authored scripts in `agent/scaffold.py` and `agent/loop.py`. They are
+deterministic, unit-tested, and compiled as JavaScript in CI.
+
+| Harness does it | Why the model couldn't |
+|---|---|
+| **Root frame** (`create_root_frame`) | The model tried `layoutSizingHorizontal = 'FILL'` on a child of the PAGE — never legal — and failed 3× in a row. Every "append into root frame" step then had no parent, so 7 of 10 steps failed. |
+| **Reuse of an existing root** | Re-running must *continue* a design, not stamp a second copy on top. Looks for an auto-layout frame (preferring one we made, then matching width); creates a new one clear of existing content only if none is found. |
+| **Design tokens** (`bootstrap_tokens`) | Token steps failed more than any other: `createVariableSet`, `figma.createStyle`, collection-id-vs-object, invented mode ids. The palette is already spelled out in the model's own brief, so we parse the hex codes and write the API calls ourselves. |
+| **Text styles** | Same story, plus font-style guessing. A fixed Inter type scale is created instead. |
+| **Layout auditing** (`agent/critic.py`) | Overlap and overflow are geometry, not judgement — section 7 says do arithmetic in Python. |
+| **Placeholder recovery** | When a section step exhausts its retries, a labelled `TODO — <section>` frame keeps the page's structure and makes the gap visible, instead of leaving a hole. Tokens/components get no placeholder: a fake component is worse than none. |
+| **Colour roles + contrast** (`describe_palette`, `readable_pairings`) | Token *names* come from the brief, so they can be `deep-navy`, `cta`, `soft-cream` — nothing tells the model which is a background and which is a foreground. It bound text to whatever sounded right and produced invisible copy that passed every gate, because geometry cannot see contrast. Roles are now derived from WCAG luminance and the legal fg/bg pairs are *measured* and handed over as fact. |
+| **Tracking what's been built** (`record_section`) | `existing_sections` was filled in once, only when reusing a root frame — so on a fresh run every step was told the page was empty and duly rebuilt what was already there. Each completed section (and each TODO placeholder) is now recorded as it lands. |
+
+Consequence for the planner: it is told the root frame and all styles **already exist** and
+must not plan steps for them. Plans went from 30+ trivial steps to 6–12 meaningful ones.
+
+---
+
+## 7. Making the loop effective (performance)
+
+These are the levers that move UI quality and keep the run affordable. Apply all of them.
+
+- **Keep each step small.** One logical operation = a small target the model rarely misses,
+  and an atomic unit that costs nothing to retry.
+- **Gate before advancing.** A step is not "done" until it passes the structural check and
+  (if visual) the visual gate. Never let a broken step compound into the next. ✅ implemented
+- **Feed errors back verbatim, with a targeted fix.** `augment_with_error` includes the exact
+  error text, plus a specific correction from `ERROR_HINTS` for errors the model has proven it
+  cannot self-correct from (FILL ordering, font style strings, `lineHeight` shape, optional
+  chaining, `createComponentSet`). ✅ implemented
+- **Use few-shot exemplars.** Three known-good scripts are in every step prompt. ✅ implemented
+- **Do arithmetic in Python, not the model.** Positioning math, palette conversion, root
+  geometry, and all overlap/overflow analysis are computed in code; the model makes
+  *decisions*, not calculations. ✅ implemented
+- **Batch reads.** The visual gate reads the whole subtree's geometry in ONE round trip
+  rather than per-node. ✅ implemented
+- **Concise state feedback.** Pass node IDs and short summaries; never replay the transcript.
+  Context is the scarcest resource even on a frontier model. ✅ implemented
+- **Escalate by decomposing, not repeating.** After N identical failures, re-plan into smaller
+  steps rather than retrying. Partially done: identical repeated calls are refused and a
+  failed section falls back to a placeholder, but there is no automatic re-planning yet.
+- **Screenshot at checkpoints, not every micro-step.** The gate runs only on steps that put
+  something on the canvas — never for token or component-definition steps. ✅ implemented
+- **Cache the stable prefix.** On a paid hosted model, the system prompt + gotchas + exemplars
+  are a fixed prefix worth caching. ✗ not implemented (no benefit on the current free tier).
+
+---
+
+## 8. The visual gate (`agent/critic.py`)
+
+This is what makes designs actually *look* right. It has **two halves that catch different
+bugs**, and the first one works with any model.
+
+### 8a. Deterministic geometry analysis (always on, free)
+
+`find_layout_defects(tree)` reads the real node tree — position, size, visibility, text and
+font size, four levels deep — and computes what is visibly wrong. No model, no tokens, and
+it cannot hallucinate a defect:
+
+| Defect | What it catches |
+|---|---|
+| `collapsed` | A node with no area. The classic Figma trap: a TEXT node collapses to ~0px and silently vanishes from the render. |
+| `collapsed-text` | Text under 8px wide — needs `textAutoResize` and an explicit width. |
+| `clipped-text` | Node height smaller than its own font size, so glyphs are cut off. |
+| `overflow` | A child extending outside its parent's bounds. |
+| `overlap` | Two siblings overlapping by more than 2px — **only** checked when the parent is not auto-layout, since auto-layout cannot produce overlap (avoids false positives). |
+| `empty-frame` | A frame over 40×40 with no children: a blank region. Smaller ones are icon placeholders and ignored. |
+| `invisible` / `empty-text` | Hidden nodes and text with no characters. |
+
+The 2px tolerances exist so rounding never produces noise. This is section 7's "do
+arithmetic in Python" applied to layout: overlap is geometry, not judgement.
+
+### 8b. Screenshot critique (a SEPARATE vision model)
+
+**The critic is its own model** (`CRITIC_*` in `.env`, built by
+`llm.build_critic_client`). The generator needs reliable tool calling and runs ~50 times per
+design; the critic needs eyes and runs a handful of times. One model rarely does both well,
+and because the critic runs so rarely, a paid hosted vision model costs very little even when
+the generator is free. Leave `CRITIC_MODEL_NAME` blank and screenshot critique is skipped
+entirely — no images are ever sent, so a text-only endpoint never eats a 400 per step.
+
+Three rules make this safe to switch on. Without them a vision model makes output **worse**:
+
+1. **Structured, severity-tagged defects.** The critic returns JSON
+   (`{severity, element, problem}`), and only `blocking` can fail a step. `minor` items are
+   recorded in `RunResult.warnings` and never gate. The old parser treated every non-`CLEAN`
+   line as blocking — and a vision model always has something to say about a work in
+   progress, so it would have failed nearly every step. Anything unparseable, or with an
+   unrecognised severity, is treated as minor: **ambiguity must never block.**
+2. **Scoped to the section.** The screenshot is of the node the step built, not the whole
+   page, matching the geometry gate's scoping.
+3. **A visual complaint must never produce a placeholder.** On the final attempt, if only the
+   vision critic is unhappy (no geometry defects), the section is **kept** and the notes go to
+   `warnings`. Geometry defects are facts — a 0×0 node renders nothing. "It could look better"
+   is judgement, and trading a real section for an empty `TODO` frame over judgement is a
+   regression, not a gate.
+
+### 8c. How the critique is assembled
+
+When the model can see images, `get_screenshot` is called and the model is sent **both**
+signals: metadata is structural ground truth (sizes, counts, hierarchy), the screenshot is
+visual ground truth (does it read as a clean UI). They catch different bugs — a field can be
+the right size in metadata and still visually overlap its label.
+
+```python
+{"role": "user", "content": [
+    {"type": "text", "text": "Critique this screen. List concrete visual defects, or reply CLEAN."},
+    {"type": "text", "text": f"metadata: {metadata_json}"},
+    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
+]}
+```
+
+If a configured critic turns out to reject images, that is recorded once and never retried
+for the rest of the run.
+
+### Choosing a critic model — probe, never trust the name
+
+`python check_critic.py` sends a solid-colour PNG and checks the model names the **right**
+colour (the prompt never says which). That separates three failures the SDK reports almost
+identically: an endpoint that rejects images, a model name that is dead, and — the dangerous
+one — an endpoint that **accepts the image and answers from the text alone**, where critique
+still comes back and every defect in it is invented.
+
+This is not theoretical. Probing this project's own endpoint found `qwen3-vl:235b` and
+`gemma3:27b` both **retired** by the provider, and `kimi-k3:cloud` returning 403. Two of
+those were recommended in an earlier draft of this file purely from the model's name.
+
+Measured on Ollama Cloud (`gemma4:cloud` is what `.env` uses):
+
+| Model | Vision | Contract | False positives | Speed |
+|---|---|---|---|---|
+| `gemma4:cloud` | ✅ | valid JSON | **none** — stayed CLEAN on a good section | ~3s |
+| `gemma4:31b-cloud` | ✅ | valid JSON | none | ~3s |
+| `minimax-m3:cloud` | ✅ | valid JSON | **blocked a well-formed section** | ~14s |
+
+The false-positive column is the one that matters. A critic that fails good sections is worse
+than no critic: it burns retries and, before the "never placeholder on a visual complaint"
+rule (above), it would have replaced real sections with `TODO` frames. Test any candidate
+against a *good* section, not just a broken one.
+
+### How it gates
+
+A step that succeeds structurally but fails the visual gate is **not done**. The defect list
+becomes the retry's *headline instruction* — "these nodes exist, fix exactly these problems,
+do not append" — not a footnote appended to the docs blob. At the end, `final_layout_review`
+reports remaining defects in `RunResult.layout_defects` and in the dashboard.
+
+**The gate is scoped to the step's own nodes** (`find_layout_defects(tree, scope_ids=...)`).
+Reading the whole root frame meant a defect left by step 2 failed step 7, which then spent
+its entire retry budget on a problem it did not cause and could not see — and, before repair
+mode, built a duplicate section on each of those attempts. Whole-page analysis now happens
+exactly once, in `final_layout_review`. An id that isn't in the tree yields **no** defects;
+it must never fall back to judging the whole page.
+
+**Cost control.** The gate only runs on steps that put something on the canvas — never for
+token or component-definition steps (section 8's "checkpoints, not every micro-step").
+
+---
+
+## 9. RAG in detail (grounding the model in the real API)
+
+Purpose: replace baked-in Figma knowledge. The model should reason over the *actual* current
+Plugin API surface, not its training memory.
+
+**What to embed.**
+- `api_types.d.ts` — the Figma Plugin API typings (npm: `@figma/plugin-typings`). Chunk it by
+  interface/method: each chunk is one type or method signature plus its doc comment.
+- `gotchas.md` — the traps in section 11. Chunk by rule (one trap per chunk).
+
+**Current implementation (`knowledge/index.py`): keyword overlap, no vector store.**
+`gotchas.md` is split at each `##` heading, `api_types.d.ts` at each interface/type, and the
+step description is scored against those chunks. Zero dependencies, and verified to retrieve
+the right chunk for the exact queries that failed in live runs. Swap in embeddings later by
+changing this one file — `retrieve(query) -> str` is the whole interface.
+
+**The gotchas are not retrieved — they are carried.** The whole corpus is ~4k tokens, which
+is small enough to simply live in the system prompt (`prompts.system_prompt()`). As a *tool*
+it cost two or three round trips per step and needed its own budget guardrail to stop steps
+searching until they ran out of turns — and since the entire conversation is resent on every
+turn anyway, a "saved" lookup saved nothing. Per-step `retrieve()` is now restricted to
+`api_types.d.ts` (`STEP_DOC_SOURCES`), so the same context is never spent twice.
+
+`query_docs` is no longer in `TOOL_SCHEMAS`, but `dispatch` still answers it: a small model
+that calls it from memory should get documentation back, not an "unknown tool" error.
+
+**Retrieval must never answer with silence.** An empty result caused the worst failure mode
+observed: the model rephrased the same search up to 6 times in a row and burned the step's
+entire budget. `query_docs` returns an explicit *"no match — stop searching and attempt a
+script; the error will tell you more"*.
+
+**Always in the step prompt, regardless of retrieval:**
+- the **original instruction and the design brief**. The planner is told to keep each step
+  under 20 words and to strip out colours, fonts and pixel values — so without this the
+  builder, which makes every visual decision, was the only stage that never saw the design.
+  It is the single largest quality lever in the harness.
+- the **plan outline** with the current step marked `>>> THIS STEP`, so a section is built to
+  sit between its actual neighbours
+- the palette as `name · hex · role`, plus the **measured** WCAG-AA pairings
+- the root frame id and the sections already inside it
+- the token and text-style names the harness created (section 6a)
+- the **real** Inter style strings, read at runtime with `listAvailableFontsAsync()` — a run
+  died on `"Inter SemiBold"` because the actual style is `"Semi Bold"` with a space
+- three **few-shot exemplars**: section (create → resize → append → *then* sizing), text
+  (font-load first, real width), and clone-edit-reassign for fills
+
+**Not yet built:** embeddings over the full `.d.ts`, and prompt caching of a stable prefix.
+Both are worth doing on a paid hosted model; neither matters much on the free tier.
+
+---
+
+## 10. The bridge (Python <-> Figma contract)
+
+WebSocket server in Python. The Figma plugin connects as a client. Messages are JSON, matched
+by `id`.
+
+```python
+# bridge/protocol.py — the wire contract. Keep it tiny and stable.
+from dataclasses import dataclass
+from typing import Any, Literal
+
+@dataclass
+class Request:
+    id: str
+    type: Literal["exec", "screenshot", "metadata", "ping", "hello"]
+    code: str | None = None      # for "exec"
+    node_id: str | None = None   # for "screenshot"/"metadata"
+
+@dataclass
+class Response:
+    id: str
+    ok: bool
+    result: Any = None
+    image_base64: str | None = None   # for screenshots -> feeds section 8
+    error: str | None = None
+```
+
+The plugin has **two parts** (a Figma constraint, not a choice):
+- `ui.html` — has network access, holds the WebSocket, relays to the worker via `postMessage`.
+  Its bridge URL is editable and saved in `figma.clientStorage`.
+- `code.js` — has the Plugin API, `eval`s received JS, captures the return value, takes a
+  screenshot, posts the result back to `ui.html`.
+
+Bridge rules: edits work only in Figma's **design editor**, not Dev Mode (read-only) — fail
+clearly if the plugin reports Dev Mode. Every request gets exactly one response, matched by
+`id`, with a graceful timeout. The bridge is dumb: it moves messages and matches ids, no agent
+logic.
+
+### Three things learned from live failures
+
+1. **The `hello` handshake.** On connect, the bridge asks which file the plugin is in and
+   gets back `{fileKey, fileName}`. This is what lets the dashboard show a gallery and target
+   a specific file. It requires `"enablePrivatePluginApi": true` in the manifest — otherwise
+   `figma.fileKey` is always `undefined`. The handshake talks to the socket directly rather
+   than through the pending-futures path, because the normal reader has not started yet at
+   that point and routing through it deadlocks.
+2. **Keepalive pings are disabled** (`ping_interval=None`). Figma throttles a plugin's UI
+   iframe when its window is not focused, so it misses the 20s ping deadline; the server then
+   killed a healthy connection ("no close frame received or sent"), `ui.html` reconnected 2s
+   later, and the cycle repeated forever. This link is loopback-only and every request already
+   has its own timeout.
+3. **Disconnects are normal, not errors.** `ConnectionClosed` is caught and logged as one
+   line; letting it propagate made the websockets library dump a stack trace on every routine
+   plugin close.
+
+Use `localhost`, not `127.0.0.1` — Figma's manifest validator rejects raw IP literals in
+`networkAccess.allowedDomains` ("must be a valid URL").
+
+---
+
+## 11. Figma Plugin API gotchas (the model must follow these)
+
+Full version lives in `knowledge/gotchas.md` and is always in context. Essentials:
+
+- **Colors are 0-1, not 0-255.** `{r:1,g:0,b:0}` is red. Paint `color` takes `{r,g,b}`;
+  opacity is a separate paint field. (Variable *values* use `{r,g,b,a}` — the one exception.)
+- **Fills/strokes are read-only arrays.** Clone, modify, reassign — never mutate in place.
+- **Load fonts before touching text.** `await figma.loadFontAsync({family, style})` first, and
+  **verify the exact style string** with `listAvailableFontsAsync()` — Inter is `"Semi Bold"`
+  *with a space*, not `"SemiBold"`. Guessing throws.
+- **`resize()` resets sizing modes to FIXED.** Call `resize()` *before* setting HUG/FILL.
+- **TEXT nodes ignore FILL by default** and collapse to ~0px wide. For wrapping text: set
+  `textAutoResize='HEIGHT'` and an explicit width, then verify `node.width > 0`.
+- **HUG/FILL need an auto-layout parent.** Append the child first, *then* set
+  `layoutSizingHorizontal/Vertical`. `HUG` is only valid on the auto-layout frame or a TEXT child.
+- **`setBoundVariableForPaint` returns a NEW paint** — capture and reassign it.
+- **Every script returns its node IDs:** `return { createdNodeIds: [...] }`.
+- **Scripts are atomic.** A failed script makes zero changes. Read the error, fix, retry.
+- **Never use `figma.notify()`** — it throws. Use `return`.
+- **Position top-level nodes away from (0,0).**
+- **Switch pages with `await figma.setCurrentPageAsync(page)`** — the sync setter throws.
+- **The plugin preloads Inter only.** Load any other font family before use.
+
+Added after real failures (all in `gotchas.md` with worked examples):
+
+- **`create*` is SYNC, `get*Async`/`set*Async` is ASYNC.** There is no
+  `createPaintStyleAsync`, `createTextStyleAsync`, `createVariableAsync` or
+  `createVariableCollectionAsync` — adding "Async" to a creator throws "not a function".
+- **These variable APIs do not exist:** `figma.createVariableSet`, `figma.variableSets`,
+  `figma.variables.getVariableByName`, `figma.getLocalVariableByName`, `figma.createVariable`.
+  The real set is `createVariableCollection`, `createVariable(name, collectionOBJECT, type)`,
+  `getLocalVariablesAsync`, `getLocalVariableCollectionsAsync`, `setBoundVariableForPaint`.
+  There is no lookup-by-name — list and filter.
+- **There is no "spacing style".** Spacing is a `FLOAT` variable. `figma.createStyle()` does
+  not exist.
+- **There is no `{type: 'VARIABLE'}` paint.** Start from a SOLID paint, bind it, reassign.
+- **Exact enum values:** `textCase` is `'UPPER'` (not `'UPPERCASE'`); `layoutSizing*` is
+  `'FIXED'|'HUG'|'FILL'` (not `'AUTO'`); `counterAxisAlignContent` is `'AUTO'|'SPACE_BETWEEN'`;
+  `primaryAxisAlignItems` uses `'MIN'`/`'MAX'`, not `'LEFT'`/`'RIGHT'`.
+- **`lineHeight`/`letterSpacing` are objects**, not numbers: `{unit:'PIXELS', value:56}`.
+- **No optional chaining (`?.`) or nullish coalescing (`??`)** — the sandbox rejects them
+  with "unexpected token in expression: '?'".
+- **`figma.createComponentSet()` does not exist** — use `figma.combineAsVariants([a,b], parent)`,
+  or skip variants entirely for a static mockup.
+- **Always `await figma.getNodeByIdAsync(id)`** — the sync getter throws under
+  `documentAccess: "dynamic-page"`. Check every call in the script, not just the first.
+- **Style ids (`S:...`) are not node ids.** Do not put them in `createdNodeIds`.
+- **`vectorPaths` needs `data` and `windingRule`** (not `d`), and only `M L C Q Z` commands.
+  For simple icons, prefer an ELLIPSE or rounded RECTANGLE.
+
+Canonical script shape:
+
+```javascript
+// load fonts -> create/mutate -> RETURN ids.  Small and atomic.
+await figma.loadFontAsync({ family: "Inter", style: "Semi Bold" }); // exact style string
+const frame = figma.createFrame();
+frame.resize(320, 52);                 // resize BEFORE sizing modes
+figma.currentPage.appendChild(frame);
+frame.x = 200; frame.y = 200;          // keep off (0,0)
+return { createdNodeIds: [frame.id] }; // ALWAYS return ids
+```
+
+---
+
+## 12. Coding conventions (keep it easy to understand)
+
+- Type hints on every function; a one-line docstring saying *why*.
+- Functions stay small (~40 lines). One job each.
+- Explicit over implicit. No metaprogramming, no magic, no deep inheritance.
+- Errors are visible: catch, log a clear message, recover or fail loudly. Never swallow.
+- Few, boring dependencies. Currently exactly four: `openai`, `websockets`, `python-dotenv`,
+  `pytest`. The dashboard uses stdlib `http.server` — **no web framework**. Justify anything
+  new; `sentence-transformers` + a vector store only if retrieval genuinely needs it.
+- Config comes from `config.py` (a typed `Settings`), not scattered `os.getenv`.
+- Naming says intent: `execute_figma_js`, not `run`.
+- No secrets in code — only `.env` (git-ignored). `.env.example` shows the shape.
+
+---
+
+## 13. Anti-patterns (do NOT do these)
+
+- Do not add an agent framework. The loop is hand-rolled for clarity and control.
+- Do not touch a model provider outside `agent/llm.py`.
+- Do not put agent logic in the bridge or the plugin. They only move and execute.
+- Do not generate large multi-operation Figma scripts. One logical step per call.
+- Do not skip the inspect-first, the structural gate, or the visual gate to "save time."
+- Do not hardcode colors/spacing into final nodes. Bind to variables.
+- Do not feed the whole transcript back to the model. Summarize; pass node IDs.
+- Do not guess font style strings. Discover them at runtime.
+- Do not screenshot every micro-step. Checkpoints only (section 8).
+- Do not ask the model to do mechanical work the harness can do deterministically (6a).
+- Do not hardcode a position for anything created on a re-run — check what exists first, or
+  you stamp a second copy on top of the user's work.
+
+---
+
+## 14. Configuration & setup
+
+```bash
+# .env — model settings can also be entered in the dashboard instead
+MODEL_BASE_URL=http://localhost:11434/v1
+MODEL_API_KEY=ollama
+MODEL_NAME=gpt-oss:20b-cloud     # must support TOOL CALLING
+
+# Bridge. Use "localhost", not "127.0.0.1" — Figma's manifest validator
+# rejects raw IP literals in networkAccess.allowedDomains.
+BRIDGE_HOST=localhost
+BRIDGE_PORT=9223
+
+# Loop limits (guardrails against runaway runs / spend)
+MAX_RETRIES=3
+MAX_STEPS=40
+```
+
+Three places must agree on host/port: `.env`, `figma_plugin/manifest.json`'s `networkAccess`,
+and the plugin's Bridge URL field (editable in its UI, saved in `clientStorage`).
+
+**Credentials without `.env`.** `webapp.py` boots with no model configured and collects it in
+the dashboard's Settings panel: base URL, key, model name, a "Test connection" button that
+makes one real call, and a label on each field showing whether it came from `.env` or the UI.
+Values are saved to `web/runtime_settings.json` (git-ignored) and **take precedence over
+`.env`**; the API key is never sent back to the browser (masked). `main.py` still requires
+`.env` and fails loudly — it has nowhere to ask.
+
+Run:
+
+```bash
+pip install -r requirements.txt
+cd figma_plugin && npm install && npm run build && cd ..
+
+# Figma Desktop: Plugins -> Development -> Import plugin from manifest ->
+#   figma_plugin/manifest.json, then run it inside a DESIGN file (not Dev Mode).
+
+python webapp.py       # dashboard at localhost:8787 — gallery, settings, setup guide
+# or
+python main.py "a mobile sign-in screen with email, password, and a Google button"
+```
+
+**Python does not hot-reload.** After changing any agent code, restart `webapp.py` — several
+debugging sessions were lost to a stale process still running the old harness.
+
+### The dashboard (`webapp.py`)
+
+Optional browser UI; the CLI still works unchanged. It adds:
+
+- a **file gallery** built automatically from files opened with the plugin running (name +
+  real screenshot + last-seen, stored in git-ignored `web/known_files.json`). No Figma
+  account or REST token — it only ever shows files it has actually seen via the handshake.
+- **choosing which file to build in.** Picking one that isn't currently open puts the run in
+  "waiting for file" and starts it the moment that file connects.
+- live status pills for plugin/model, the run log, and the final screenshot.
+- **dark/light themes** (follows the OS, remembers your choice).
+- a **Connect Figma** guide with the exact manifest path to import, step 4 turning green when
+  the plugin connects.
+
+---
+
+## 15. Build phases — current status
+
+| Phase | What it is | Status |
+|---|---|---|
+| **0** — bridge only | Hardcoded script in, screenshot back | ✅ done |
+| **1** — model + one tool | `execute_figma_js`, loop closes | ✅ done |
+| **2** — observe + recover | metadata, screenshots, retry-on-error, structural gate | ✅ done |
+| **3** — visual gate + retrieval | Geometry gate ✅; screenshot critique built but **inactive** (text-only model); keyword retrieval ✅, embeddings ✗ | ◑ partial |
+| **4** — planning | brief → plan → tokens/components/composition | ✅ done |
+| **5** — discipline + polish | harness-authored tokens ✅, final review ✅, dashboard ✅; prompt caching ✗ | ◑ partial |
+
+Do not start a phase until the previous one runs end to end.
+
+**Known gaps, in rough priority order:**
+1. **No baseline recorded yet.** The benchmark exists (section 16a) but has never been run
+   against live Figma, so every improvement in this file is still argued from code reading
+   rather than measured. Capture a baseline before changing anything else.
+2. **No requirement-coverage check.** Every gate measures geometry; none asks whether the
+   sign-in screen actually contains a password field. `success` still only means "no step
+   exhausted its retries", so a run can satisfy none of the instruction and report success.
+3. **The planner emits `list[str]`.** Structure is then recovered by keyword-matching English
+   in `_is_section_step`, so phrasing silently changes whether the gate and the placeholder
+   fallback run. It should emit a typed spec with per-section acceptance criteria.
+4. **No deterministic design checks** beyond geometry: contrast is computed for the *prompt*
+   but not yet enforced in `critic.py`, and nothing checks spacing-scale or type-ramp
+   adherence. All arithmetic, all cheap, none written.
+5. **No vision critic is configured yet.** The architecture is in place and safe to enable
+   (section 8b), but `CRITIC_MODEL_NAME` is blank, so screenshot critique never runs. This is
+   now the biggest single quality lever available — it is the only check that can see
+   contrast, balance and whether the screen reads as the product that was asked for.
+6. Design quality on a 20B model. Real, but it was masked by the plumbing gaps above; retest
+   it once the benchmark exists.
+7. No embeddings over `api_types.d.ts` (the corpus is ~650 lines — this would gain nothing);
+   no prompt caching (the system prompt is now a ~5k-token stable prefix, so this is finally
+   worth doing on a paid model).
+
+---
+
+## 16. Testing
+
+**186 tests, no network, no Figma, no model.** `pytest` runs the whole suite in ~7 seconds.
+
+| File | Covers |
+|---|---|
+| `test_bridge.py` | Protocol round-trips over a real loopback socket, the `hello` handshake, timeouts, abrupt disconnects |
+| `test_loop.py` | The loop with `FakeModelClient` (scripted tool calls) + `FakeBridge` (canned results): retries, both gates, root-frame reuse, repeat guard, doc-query budget, placeholder fallback |
+| `test_critic.py` | The visual gate's geometry analysis — and that a clean tree reports **nothing** |
+| `test_scaffold.py` | Palette parsing, and that generated JS **actually compiles** via `new AsyncFunction(...)`, exactly as the plugin evals it |
+| `test_llm.py` | Tool-call recovery for models that emit them as text |
+| `test_settings.py` | Settings precedence (UI over `.env`), key masking, dashboard API |
+| `test_prompts.py` | That the step prompt actually carries the brief, the plan outline and the repair framing — the information-plumbing regressions |
+| `test_registry.py`, `test_docs.py` | File-gallery history; retrieval never answering with silence; the gotchas being carried rather than searched for |
+| `test_bench.py` | The scorer (section 16a): that it catches duplicates, placeholders, off-scale spacing and unbound fills — and that an unmeasured dimension is excluded rather than scored zero |
+
+Two rules that keep this suite honest:
+
+- **`FakeBridge` auto-serves harness-authored scripts** (inspect, root frame, tokens, fonts,
+  layout read, audit) so each test only scripts the model-driven calls it cares about. Adding
+  a new harness script means teaching `_harness_response` about it, not editing every test.
+- **Generated JavaScript is compiled in CI.** A syntax slip in `scaffold.py` or `critic.py`
+  fails here rather than halfway through a live run.
+
+Also verify plugin changes: `cd figma_plugin && npm run build && npm run lint` — the ESLint
+plugin catches disallowed Figma API usage. Keep Figma-dependent checks as a manual smoke test.
+
+---
+
+## 16a. The design benchmark (`bench/`)
+
+`pytest` proves the harness *works*. It says nothing about whether the designs are any
+**good** — which is the only thing that actually matters. The benchmark closes that gap.
+
+```bash
+python -m bench.run --list                 # the task set
+python -m bench.run login --repeat 3       # build it for real, score it, save it
+python -m bench.run --all --repeat 3       # the full sweep
+python -m bench.run --rescore bench/results/<file>.json   # no Figma needed
+```
+
+**Six frozen tasks**, chosen to stress different shapes: `login` and `signup` (form-heavy,
+catches silently dropped requirements), `dashboard` (data-dense, repeated elements),
+`product` (non-text nodes), `settings` (two-column — the layout a vertical-only plan
+misses), `landing` (longest, tests whether quality survives many steps).
+
+**The instruction strings are FROZEN.** Rewording one invalidates every result recorded
+before it, which defeats the point of having a benchmark. Add a new task instead.
+
+### Scoring
+
+| Dimension | Weight | Computed from |
+|---|---|---|
+| `requirements` | 30% | Share of the task's acceptance criteria found in the node tree |
+| `figma_correctness` | 15% | Failed steps, placeholder fallbacks, **duplicate sections** |
+| `layout` | 15% | Geometry defects (`critic`) + share of spacing values on the scale |
+| `design_system` | 15% | Share of fills that are token-backed rather than ad hoc |
+| `typography` | 10% | Type-ramp adherence + share of text that is actually readable |
+| `visual` | 15% | A vision judge — **absent until one is configured** |
+
+Two rules that keep the number honest:
+
+1. **An unmeasured dimension is excluded, never scored zero.** The total is renormalised
+   over what was actually measured (`measured_weight`, currently 0.85). Scoring `visual` as
+   zero would make merely switching on a judge look like a 15-point improvement.
+2. **85% is deterministic** — computed from the node tree, no model involved. It cannot
+   drift and cannot flatter a run. Always report the deterministic sub-scores separately
+   from the judge, so a change that only moved the judge is visible as exactly that.
+
+`requirements` is a **proxy**: it checks that text matching `/password/i` exists somewhere,
+which is evidence a password field was built, not proof it was built well. Read it that way.
+
+### Comparing two things
+
+- **Change one variable at a time.** Never model *and* architecture in the same comparison.
+- **Run `--repeat 3` minimum.** Single-run variance on a small model is wide enough to
+  swallow most real improvements; one run of A beating one run of B tells you nothing.
+- **Compare paired per task**, not on the aggregate — a change can help forms and hurt
+  dashboards, and the mean hides it.
+- Every run saves its full capture, so a scorer change can be re-applied to every result
+  already recorded (`--rescore`) without rebuilding anything in Figma.
+
+---
+
+## 17. Quick reference
+
+| I want to... | Look in |
+|---|---|
+| Change the model / provider | `.env` or the dashboard's Settings (only `agent/llm.py` defines access) |
+| Turn on / change the vision critic | `CRITIC_*` in `.env` (section 8b) |
+| Handle a new provider quirk | `agent/llm.py` (section 5) |
+| Change how a run is orchestrated | `agent/loop.py` |
+| Change what the harness builds itself | `agent/scaffold.py` (section 6a) |
+| Tune the visual gate / add a defect check | `agent/critic.py` (section 8) |
+| Change what every step prompt says | `agent/prompts.py` (system prompt, exemplars, notes) |
+| Change retrieval / what docs are injected | `knowledge/index.py` (section 9) |
+| Add/adjust a tool the model can call | `tools/registry.py` + the tool file |
+| Change the Python<->Figma message shape | `bridge/protocol.py` |
+| Fix a Figma API mistake pattern | `knowledge/gotchas.md` (section 11) |
+| Map a recurring error to its fix | `ERROR_HINTS` in `agent/loop.py` |
+| Change what a "design" decomposes into | `agent/planner.py` (plan) / `enhance_instruction` (brief) |
+| Know whether a change actually helped | `python -m bench.run --all --repeat 3` (section 16a) |
+| Add a benchmark task or criterion | `bench/tasks/*.json` — data, no code change |
+| Change how design quality is scored | `bench/score.py`, then `--rescore` past results |
+| Change the dashboard UI | `web/static/index.html` (single file) |
+| Change the dashboard API or run wiring | `web/app.py` |
+| Change the plugin's behaviour or UI | `figma_plugin/code.ts` + `ui.html` (rebuild with `npm run build`) |
+
+---
+
+## 18. Debugging a bad run
+
+1. **Restart `webapp.py` first.** Python does not hot-reload; a stale process has wasted more
+   time here than any real bug.
+2. **Read the trace, not the screenshot.** The log names the failing step, the exact Plugin
+   API error, and which gate rejected it.
+3. **Ask where the failure belongs.** A mechanical, always-identical failure belongs in
+   `scaffold.py` (section 6a) or `ERROR_HINTS` — not in another prompt tweak. Three rounds of
+   prompt edits failed to stop `FILL can only be set on children of auto-layout frames`;
+   moving the root frame into the harness fixed it permanently.
+4. **Add a gotcha with a worked example**, then confirm retrieval actually surfaces it for the
+   query that failed (`knowledge.index.retrieve("...")`).
+5. **Verify every API name against the real typings** before writing guidance:
+   `grep <name> figma_plugin/node_modules/@figma/plugin-typings/plugin-api.d.ts`. Several
+   confident-looking APIs in earlier drafts simply did not exist.
+6. **Write a test from the real trace.** Every guardrail in section 6 exists because a live
+   run produced it; the tests encode those exact traces so they cannot regress.

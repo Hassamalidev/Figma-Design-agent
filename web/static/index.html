@@ -1,0 +1,965 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Figma Designer Agent</title>
+<style>
+/* ============================ design system ============================ */
+:root {
+  --radius-sm: 6px;  --radius-md: 10px;  --radius-lg: 14px;  --radius-xl: 18px;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.30);
+  --shadow-md: 0 4px 16px rgba(0,0,0,.35);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,.45);
+  --success: #22c55e;  --warning: #f59e0b;  --error: #ef4444;  --info: #3b82f6;
+  --header-h: 60px;  --sidebar-w: 240px;  --footer-h: 36px;
+  --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --ease: cubic-bezier(.22,.61,.36,1);
+}
+[data-theme="dark"] {
+  --bg-1: #09090b;  --bg-2: #0f0f11;  --bg-3: #18181b;  --bg-4: #27272a;
+  --border-subtle: rgba(255,255,255,.05);
+  --border-focus:  rgba(255,255,255,.10);
+  --border-accent: rgba(255,255,255,.15);
+  --text-1: #fafafa;  --text-2: #a1a1aa;  --text-3: #71717a;  --text-4: #52525b;
+  --accent: #e4e4e7;  --accent-fg: #09090b;
+  --glass: rgba(9,9,11,.80);
+  --glow-1: rgba(99,102,241,.10);  --glow-2: rgba(168,85,247,.08);
+}
+[data-theme="light"] {
+  --bg-1: #fbfbfc;  --bg-2: #ffffff;  --bg-3: #f4f4f5;  --bg-4: #e4e4e7;
+  --border-subtle: rgba(9,9,11,.07);
+  --border-focus:  rgba(9,9,11,.12);
+  --border-accent: rgba(9,9,11,.18);
+  --text-1: #18181b;  --text-2: #52525b;  --text-3: #71717a;  --text-4: #a1a1aa;
+  --accent: #18181b;  --accent-fg: #ffffff;
+  --glass: rgba(255,255,255,.80);
+  --glow-1: rgba(99,102,241,.07);  --glow-2: rgba(168,85,247,.05);
+  --shadow-sm: 0 1px 2px rgba(9,9,11,.05);
+  --shadow-md: 0 4px 16px rgba(9,9,11,.07);
+  --shadow-lg: 0 12px 40px rgba(9,9,11,.10);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg-1); color: var(--text-1);
+  font-family: var(--font); font-size: 14px; line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  transition: background .25s var(--ease), color .25s var(--ease);
+}
+button, input, textarea, select { font: inherit; color: inherit; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--bg-4); border-radius: 99px; border: 3px solid transparent; background-clip: content-box; }
+::selection { background: var(--border-accent); }
+
+/* ambient drifting glow -- depth without distraction */
+.ambient { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
+.ambient::before, .ambient::after {
+  content: ""; position: absolute; width: 60vw; height: 60vw; border-radius: 50%; filter: blur(120px);
+}
+.ambient::before { background: var(--glow-1); top: -20vw; left: -10vw; animation: drift1 32s ease-in-out infinite; }
+.ambient::after  { background: var(--glow-2); bottom: -25vw; right: -10vw; animation: drift2 40s ease-in-out infinite; }
+@keyframes drift1 { 0%,100% { transform: translate(0,0); } 50% { transform: translate(6vw,4vw); } }
+@keyframes drift2 { 0%,100% { transform: translate(0,0); } 50% { transform: translate(-5vw,-5vw); } }
+@media (prefers-reduced-motion: reduce) { .ambient::before, .ambient::after { animation: none; } }
+
+/* ============================== header ============================== */
+.header {
+  position: sticky; top: 0; z-index: 40; height: var(--header-h);
+  display: flex; align-items: center; gap: 14px; padding: 0 18px;
+  background: var(--glass); backdrop-filter: blur(24px) saturate(180%);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: -.01em; white-space: nowrap; }
+.brand-mark {
+  width: 26px; height: 26px; border-radius: var(--radius-sm); flex: none;
+  background: linear-gradient(135deg,#6366f1,#a855f7); color: #fff;
+  display: grid; place-items: center; font-size: 13px; font-weight: 700;
+}
+.spacer { flex: 1; }
+
+.tabs { display: flex; gap: 2px; padding: 3px; background: var(--bg-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }
+.tab {
+  display: flex; align-items: center; gap: 7px; padding: 6px 13px;
+  border: 0; background: transparent; color: var(--text-3);
+  border-radius: var(--radius-sm); cursor: pointer; font-size: 13px; font-weight: 500;
+  transition: background .18s var(--ease), color .18s var(--ease);
+}
+.tab:hover { color: var(--text-1); background: var(--bg-3); }
+.tab.active { color: var(--text-1); background: var(--bg-4); }
+.tab .count {
+  font-size: 10.5px; font-weight: 600; padding: 1px 6px; border-radius: 99px;
+  background: var(--bg-4); color: var(--text-3); line-height: 1.5;
+}
+.tab.active .count { background: var(--border-accent); color: var(--text-1); }
+
+.pill {
+  display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px;
+  background: var(--bg-2); border: 1px solid var(--border-subtle);
+  border-radius: 99px; font-size: 12px; color: var(--text-2); white-space: nowrap;
+}
+.pill.button { cursor: pointer; transition: border-color .18s var(--ease); }
+.pill.button:hover { border-color: var(--border-accent); }
+.dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--text-4); }
+.dot.on   { background: var(--success); box-shadow: 0 0 0 3px rgba(34,197,94,.18); }
+.dot.off  { background: var(--error);   box-shadow: 0 0 0 3px rgba(239,68,68,.15); }
+.dot.info { background: var(--info); }
+
+.icon-btn {
+  width: 32px; height: 32px; flex: none; display: grid; place-items: center;
+  border-radius: var(--radius-sm); cursor: pointer; background: transparent;
+  border: 1px solid transparent; color: var(--text-3);
+  transition: background .18s var(--ease), color .18s var(--ease), border-color .18s var(--ease);
+}
+.icon-btn:hover { background: var(--bg-3); color: var(--text-1); border-color: var(--border-subtle); }
+.icon-btn svg { width: 16px; height: 16px; }
+
+/* ============================== layout ============================== */
+.shell { display: flex; min-height: calc(100vh - var(--header-h)); position: relative; z-index: 1; }
+
+.sidebar {
+  width: var(--sidebar-w); flex: none; padding: 20px 12px 60px;
+  border-right: 1px solid var(--border-subtle);
+  position: sticky; top: var(--header-h); height: calc(100vh - var(--header-h)); overflow-y: auto;
+}
+.side-label { font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--text-4); padding: 0 10px; margin: 0 0 8px; }
+.side-group { margin-bottom: 26px; }
+.side-item {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 7px 10px; border: 0; background: transparent; color: var(--text-2);
+  border-radius: var(--radius-sm); cursor: pointer; font-size: 13px; text-align: left;
+  transition: background .18s var(--ease), color .18s var(--ease);
+}
+.side-item:hover { background: var(--bg-2); color: var(--text-1); }
+.side-item.active { background: var(--bg-3); color: var(--text-1); font-weight: 500; }
+.side-item svg { width: 15px; height: 15px; flex: none; opacity: .8; }
+.side-item .kbd { margin-left: auto; }
+.side-item .swatch { width: 8px; height: 8px; border-radius: 3px; flex: none; }
+.side-item .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.kbd {
+  font-family: var(--mono); font-size: 10px; padding: 2px 5px; line-height: 1.4;
+  border: 1px solid var(--border-subtle); border-radius: 4px;
+  background: var(--bg-3); color: var(--text-3);
+}
+
+.main { flex: 1; min-width: 0; padding: 32px 28px calc(var(--footer-h) + 40px); }
+.page { max-width: 900px; margin: 0 auto; }
+.panel { display: none; animation: fade .28s var(--ease); }
+.panel.active { display: block; }
+@keyframes fade { from { opacity: 0; transform: translateY(6px); } }
+
+h1 { font-size: 26px; font-weight: 600; letter-spacing: -.025em; margin: 0 0 6px; }
+.subtitle { color: var(--text-2); margin: 0 0 26px; font-size: 14px; }
+.section-label { font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--text-4); margin: 32px 0 12px; }
+
+/* ============================== banner ============================== */
+.banner {
+  display: none; align-items: center; gap: 14px; padding: 15px 17px; margin-bottom: 22px;
+  border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); background: var(--bg-2);
+}
+.banner.show { display: flex; }
+.banner.warn { border-color: rgba(245,158,11,.28); background: linear-gradient(90deg, rgba(245,158,11,.07), transparent 60%), var(--bg-2); }
+.banner-ico { width: 34px; height: 34px; flex: none; display: grid; place-items: center; border-radius: var(--radius-md); background: rgba(245,158,11,.13); color: var(--warning); }
+.banner-ico svg { width: 17px; height: 17px; }
+.banner-title { font-weight: 600; font-size: 13.5px; }
+.banner-text { color: var(--text-2); font-size: 12.5px; }
+
+/* ============================= composer ============================= */
+.composer {
+  background: var(--bg-2); border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xl); transition: border-color .2s var(--ease), box-shadow .2s var(--ease);
+}
+.composer:focus-within { border-color: var(--border-accent); box-shadow: 0 0 0 4px rgba(255,255,255,.03); }
+#instruction {
+  width: 100%; min-height: 150px; resize: vertical; background: transparent;
+  border: 0; outline: 0; padding: 20px 20px 8px; font-size: 15px; line-height: 1.65;
+}
+#instruction::placeholder { color: var(--text-4); }
+.composer-foot { display: flex; align-items: center; gap: 8px; padding: 10px 12px 12px 16px; border-top: 1px solid var(--border-subtle); }
+.composer-hint { flex: 1; font-size: 12px; color: var(--text-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; padding: 9px 17px;
+  border: 1px solid transparent; border-radius: var(--radius-md); cursor: pointer;
+  font-weight: 600; font-size: 13px; white-space: nowrap;
+  background: var(--accent); color: var(--accent-fg);
+  transition: opacity .18s var(--ease), transform .08s var(--ease), background .18s var(--ease);
+}
+.btn:hover:not(:disabled) { opacity: .88; }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: .35; cursor: not-allowed; }
+.btn.ghost { background: transparent; border-color: var(--border-focus); color: var(--text-1); }
+.btn.ghost:hover:not(:disabled) { background: var(--bg-3); opacity: 1; }
+.btn.sm { padding: 6px 12px; font-size: 12px; }
+.btn svg { width: 13px; height: 13px; }
+
+/* ============================= templates ============================= */
+.template-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.template {
+  position: relative; overflow: hidden; text-align: center;
+  padding: 22px 16px; background: var(--bg-2);
+  border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); cursor: pointer;
+  transition: border-color .2s var(--ease), transform .16s var(--ease), background .2s var(--ease);
+}
+/* top-edge highlight -- subtle luxury */
+.template::before, .card::before {
+  content: ""; position: absolute; top: 0; left: 12%; right: 12%; height: 1px;
+  background: linear-gradient(90deg, transparent, var(--border-accent), transparent);
+  opacity: 0; transition: opacity .25s var(--ease);
+}
+.template:hover, .card:hover { border-color: var(--border-focus); transform: translateY(-2px); background: var(--bg-2); }
+.template:hover::before, .card:hover::before { opacity: 1; }
+.template-ico {
+  width: 42px; height: 42px; margin: 0 auto 12px; display: grid; place-items: center;
+  border-radius: var(--radius-md); background: var(--bg-3); color: var(--text-2);
+  border: 1px solid var(--border-subtle);
+}
+.template-ico svg { width: 19px; height: 19px; }
+.template-name { font-weight: 600; font-size: 13.5px; margin-bottom: 2px; }
+.template-desc { font-size: 11.5px; color: var(--text-4); }
+
+/* ============================= run panel ============================= */
+.run-panel { display: none; margin: 22px 0; background: var(--bg-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); overflow: hidden; }
+.run-panel.show { display: block; }
+.run-head { display: flex; align-items: center; gap: 10px; padding: 13px 17px; border-bottom: 1px solid var(--border-subtle); }
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 99px; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+.badge.waiting_for_file, .badge.running { background: rgba(245,158,11,.14); color: var(--warning); }
+.badge.done  { background: rgba(34,197,94,.14); color: var(--success); }
+.badge.error { background: rgba(239,68,68,.14); color: var(--error); }
+.spin { width: 10px; height: 10px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+#log { max-height: 330px; overflow-y: auto; padding: 13px 17px; font-family: var(--mono); font-size: 11.5px; line-height: 1.75; color: var(--text-2); white-space: pre-wrap; word-break: break-word; }
+#result { padding: 0 17px 17px; }
+#result img { max-width: 100%; border-radius: var(--radius-md); border: 1px solid var(--border-subtle); margin-top: 12px; display: block; }
+.result-row { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 6px; font-size: 13.5px; }
+.issue { font-size: 12px; color: var(--warning); margin-top: 4px; }
+.issue.bad { color: var(--error); }
+
+/* ============================== cards ============================== */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
+.card { position: relative; overflow: hidden; background: var(--bg-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); cursor: pointer; transition: border-color .2s var(--ease), transform .16s var(--ease); }
+.card.selected { border-color: var(--border-accent); box-shadow: inset 0 0 0 1px var(--border-accent); }
+.thumb { aspect-ratio: 16/10; background: var(--bg-3); display: grid; place-items: center; color: var(--text-4); font-size: 11.5px; border-bottom: 1px solid var(--border-subtle); position: relative; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.card-body { padding: 11px 13px; display: flex; align-items: center; gap: 9px; }
+.card-info { min-width: 0; flex: 1; }
+.card-name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-meta { color: var(--text-4); font-size: 11px; }
+.card-actions { position: absolute; top: 9px; right: 9px; display: flex; gap: 5px; opacity: 0; transform: translateY(-3px); transition: opacity .2s var(--ease), transform .2s var(--ease); }
+.card:hover .card-actions { opacity: 1; transform: translateY(0); }
+.mini-btn { width: 27px; height: 27px; display: grid; place-items: center; border-radius: var(--radius-sm); cursor: pointer; background: var(--glass); backdrop-filter: blur(12px); border: 1px solid var(--border-focus); color: var(--text-1); }
+.mini-btn:hover { background: var(--bg-4); }
+.mini-btn svg { width: 13px; height: 13px; }
+
+.empty { grid-column: 1/-1; text-align: center; padding: 60px 24px; border: 1px dashed var(--border-focus); border-radius: var(--radius-lg); color: var(--text-3); }
+.empty h3 { margin: 0 0 6px; font-size: 15px; color: var(--text-1); font-weight: 600; }
+.empty p { margin: 0 0 18px; font-size: 13px; }
+
+/* ============================== history ============================== */
+.hist-item { display: flex; align-items: center; gap: 14px; padding: 13px; background: var(--bg-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); margin-bottom: 10px; transition: border-color .2s var(--ease); }
+.hist-item:hover { border-color: var(--border-focus); }
+.hist-thumb { width: 82px; height: 52px; flex: none; border-radius: var(--radius-sm); background: var(--bg-3); border: 1px solid var(--border-subtle); overflow: hidden; display: grid; place-items: center; color: var(--text-4); font-size: 10px; }
+.hist-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.hist-body { flex: 1; min-width: 0; }
+.hist-prompt { font-size: 13px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.hist-meta { font-size: 11px; color: var(--text-4); margin-top: 3px; }
+.status-badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 99px; font-size: 11px; font-weight: 600; flex: none; }
+.status-badge.ok   { background: rgba(34,197,94,.13); color: var(--success); }
+.status-badge.bad  { background: rgba(239,68,68,.13); color: var(--error); }
+.status-badge.warn { background: rgba(245,158,11,.13); color: var(--warning); }
+
+/* ============================== settings ============================== */
+.setting-card { background: var(--bg-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 6px 18px; margin-bottom: 16px; }
+.setting-row { display: flex; align-items: center; gap: 16px; padding: 15px 0; border-bottom: 1px solid var(--border-subtle); }
+.setting-row:last-child { border-bottom: 0; }
+.setting-info { flex: 1; min-width: 0; }
+.setting-name { font-weight: 500; font-size: 13.5px; }
+.setting-desc { font-size: 12px; color: var(--text-3); margin-top: 2px; }
+
+.toggle { width: 40px; height: 23px; flex: none; border-radius: 99px; background: var(--bg-4); border: 1px solid var(--border-subtle); cursor: pointer; padding: 0; position: relative; transition: background .22s var(--ease); }
+.toggle::after { content: ""; position: absolute; top: 2px; left: 2px; width: 17px; height: 17px; border-radius: 50%; background: var(--text-3); transition: transform .22s var(--ease), background .22s var(--ease); }
+.toggle[aria-checked="true"] { background: var(--accent); }
+.toggle[aria-checked="true"]::after { transform: translateX(17px); background: var(--accent-fg); }
+
+.field { margin: 15px 0; }
+.field label { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 500; margin-bottom: 6px; }
+.field input, .field select { width: 100%; padding: 9px 12px; border-radius: var(--radius-md); background: var(--bg-3); border: 1px solid var(--border-subtle); outline: 0; transition: border-color .18s var(--ease); }
+.field input:focus, .field select:focus { border-color: var(--border-accent); }
+.field .help { font-size: 11.5px; color: var(--text-4); margin-top: 6px; }
+.num { width: 86px !important; flex: none; }
+.tag { font-size: 9.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: var(--bg-3); color: var(--text-4); border: 1px solid var(--border-subtle); }
+.tag.env { color: var(--success); border-color: rgba(34,197,94,.3); }
+.tag.ui  { color: var(--info);    border-color: rgba(59,130,246,.3); }
+.test-result { font-size: 12px; margin-left: auto; text-align: right; }
+.test-result.ok  { color: var(--success); }
+.test-result.bad { color: var(--error); }
+code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); border: 1px solid var(--border-subtle); padding: 1.5px 5px; border-radius: 4px; }
+
+/* ============================== footer ============================== */
+.footer {
+  position: fixed; bottom: 0; left: 0; right: 0; height: var(--footer-h); z-index: 30;
+  display: flex; align-items: center; gap: 18px; padding: 0 18px;
+  background: var(--glass); backdrop-filter: blur(24px); border-top: 1px solid var(--border-subtle);
+  font-size: 11.5px; color: var(--text-4);
+}
+.foot-hint { display: flex; align-items: center; gap: 6px; }
+
+/* ============================== modal ============================== */
+.scrim { position: fixed; inset: 0; z-index: 100; display: none; background: rgba(0,0,0,.6); backdrop-filter: blur(4px); align-items: flex-start; justify-content: center; padding: 7vh 20px 40px; overflow-y: auto; }
+.scrim.show { display: flex; }
+.modal { width: 100%; max-width: 600px; background: var(--bg-2); border: 1px solid var(--border-focus); border-radius: var(--radius-xl); box-shadow: var(--shadow-lg); animation: pop .18s var(--ease); }
+@keyframes pop { from { opacity: 0; transform: translateY(-10px) scale(.985); } }
+.modal-head { display: flex; align-items: center; gap: 10px; padding: 18px 22px; border-bottom: 1px solid var(--border-subtle); }
+.modal-head h2 { margin: 0; font-size: 15.5px; font-weight: 600; }
+.modal-body { padding: 22px; }
+.modal-foot { display: flex; align-items: center; gap: 10px; padding: 15px 22px; border-top: 1px solid var(--border-subtle); }
+
+.steps { counter-reset: step; margin: 0; padding: 0; list-style: none; }
+.step { position: relative; padding: 0 0 22px 40px; counter-increment: step; }
+.step:not(:last-child)::after { content: ""; position: absolute; left: 13px; top: 28px; bottom: 2px; width: 1px; background: var(--border-subtle); }
+.step::before { content: counter(step); position: absolute; left: 0; top: 0; width: 27px; height: 27px; border-radius: 50%; display: grid; place-items: center; background: var(--bg-3); border: 1px solid var(--border-focus); font-size: 11.5px; font-weight: 600; color: var(--text-3); }
+.step.done::before { content: "✓"; background: var(--success); border-color: var(--success); color: #06210f; }
+.step h4 { margin: 3px 0 5px; font-size: 13.5px; font-weight: 600; }
+.step p { margin: 0 0 8px; font-size: 12.5px; color: var(--text-2); }
+.code-row { display: flex; align-items: center; gap: 8px; }
+.code-row code { flex: 1; padding: 8px 10px; overflow-x: auto; white-space: nowrap; }
+
+/* ============================= responsive ============================= */
+@media (max-width: 900px) {
+  .sidebar { display: none; }
+  .main { padding: 26px 18px calc(var(--footer-h) + 34px); }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+  .brand span { display: none; }
+}
+@media (max-width: 640px) {
+  .tabs { display: none; }
+  .tabs.mobile-open { display: flex; position: absolute; top: var(--header-h); left: 12px; right: 12px; flex-direction: column; padding: 8px; box-shadow: var(--shadow-lg); }
+  .grid, .template-grid { grid-template-columns: 1fr; }
+  .pill.hide-sm { display: none; }
+  .footer { display: none; }
+}
+@media (min-width: 641px) { #btn-menu { display: none; } }
+</style>
+</head>
+<body>
+<div class="ambient"></div>
+
+<header class="header">
+  <button class="icon-btn" id="btn-menu" aria-label="Menu">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+  </button>
+  <div class="brand"><span class="brand-mark">F</span><span>Figma Designer Agent</span></div>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="design">Design</button>
+    <button class="tab" data-tab="files">Files <span class="count" id="count-files">0</span></button>
+    <button class="tab" data-tab="history">History <span class="count" id="count-history">0</span></button>
+    <button class="tab" data-tab="settings">Settings</button>
+  </nav>
+
+  <div class="spacer"></div>
+  <span class="pill hide-sm" id="pill-plugin"><span class="dot" id="dot-plugin"></span><span id="txt-plugin">Offline</span></span>
+  <span class="pill button hide-sm" id="pill-model"><span class="dot info" id="dot-model"></span><span id="txt-model">Model</span>
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+  </span>
+  <button class="icon-btn" id="btn-setup" title="Setup guide" aria-label="Setup guide">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>
+  </button>
+  <button class="icon-btn" id="btn-theme" title="Toggle theme" aria-label="Toggle theme"></button>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <div class="side-group">
+      <p class="side-label">Workspace</p>
+      <button class="side-item active" data-tab="design">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+        Dashboard
+      </button>
+      <button class="side-item" data-tab="files">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4h6l2 2h8v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/></svg>
+        Recent Designs
+      </button>
+      <button class="side-item" data-tab="history">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        Activity
+      </button>
+    </div>
+
+    <div class="side-group">
+      <p class="side-label">Quick start</p>
+      <button class="side-item" id="side-new">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        New Design <span class="kbd">N</span>
+      </button>
+      <button class="side-item" data-tab="files" id="side-import">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+        Open File <span class="kbd">I</span>
+      </button>
+    </div>
+
+    <div class="side-group">
+      <p class="side-label">Recent files</p>
+      <div id="side-files"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="page">
+
+      <!-- ======================= DESIGN ======================= -->
+      <section class="panel active" id="panel-design">
+        <h1>Design</h1>
+        <p class="subtitle">Describe what you want to build and let the agent handle the rest.</p>
+
+        <div class="banner" id="banner">
+          <div class="banner-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></div>
+          <div class="banner-body" style="flex:1">
+            <div class="banner-title" id="banner-title"></div>
+            <div class="banner-text" id="banner-text"></div>
+          </div>
+          <button class="btn ghost sm" id="banner-action"></button>
+        </div>
+
+        <div class="composer">
+          <textarea id="instruction" placeholder="Describe the screen to build — e.g. a desktop landing page for a scheduling app, with a nav bar, hero, three feature columns and a footer."></textarea>
+          <div class="composer-foot">
+            <span class="composer-hint" id="hint">Select a file, then describe what to build.</span>
+            <button class="btn" id="run-btn" disabled>
+              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Run
+            </button>
+          </div>
+        </div>
+
+        <div class="run-panel" id="run-panel">
+          <div class="run-head">
+            <span class="badge" id="status-badge"></span>
+            <strong id="status-file" style="font-size:13px"></strong>
+          </div>
+          <div id="log"></div>
+          <div id="result"></div>
+        </div>
+
+        <p class="section-label">Start from a template</p>
+        <div class="template-grid" id="templates"></div>
+      </section>
+
+      <!-- ======================= FILES ======================= -->
+      <section class="panel" id="panel-files">
+        <h1>Files</h1>
+        <p class="subtitle">Every Figma file this agent has seen. Select one to build in it.</p>
+        <div class="grid" id="gallery"></div>
+      </section>
+
+      <!-- ====================== HISTORY ====================== -->
+      <section class="panel" id="panel-history">
+        <div style="display:flex;align-items:flex-start;gap:16px">
+          <div style="flex:1">
+            <h1>History</h1>
+            <p class="subtitle">Past generations, newest first.</p>
+          </div>
+          <button class="btn ghost sm" id="btn-clear-history">Clear</button>
+        </div>
+        <div id="history-list"></div>
+      </section>
+
+      <!-- ====================== SETTINGS ====================== -->
+      <section class="panel" id="panel-settings">
+        <h1>Settings</h1>
+        <p class="subtitle">Model credentials and how the agent runs.</p>
+
+        <p class="section-label">Model</p>
+        <div class="setting-card">
+          <div class="field">
+            <label>API base URL <span class="tag" id="tag-base">unset</span></label>
+            <input id="in-base" placeholder="https://openrouter.ai/api/v1" autocomplete="off" spellcheck="false" />
+            <div class="help">Any OpenAI-compatible endpoint. Local Ollama: <code>http://localhost:11434/v1</code>.</div>
+          </div>
+          <div class="field">
+            <label>API key <span class="tag" id="tag-key">unset</span></label>
+            <input id="in-key" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false" />
+            <div class="help" id="key-help">Stored on this machine only, sent nowhere but your endpoint.</div>
+          </div>
+          <div class="field">
+            <label>Model <span class="tag" id="tag-model">unset</span></label>
+            <input id="in-model" placeholder="gpt-oss:20b-cloud" autocomplete="off" spellcheck="false" />
+            <div class="help"><strong>Must support tool calling.</strong> A multimodal model also enables screenshot critique.</div>
+          </div>
+          <div class="setting-row">
+            <button class="btn" id="btn-save">Save</button>
+            <button class="btn ghost" id="btn-test">Test connection</button>
+            <span class="test-result" id="test-result"></span>
+          </div>
+        </div>
+
+        <p class="section-label">Run behaviour</p>
+        <div class="setting-card" id="prefs-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">Visual gate</div>
+              <div class="setting-desc">After each section, check the real geometry for collapsed text, overlap and overflow — and retry to fix what it finds.</div>
+            </div>
+            <button class="toggle" id="pref-visual_gate" role="switch" aria-checked="true"></button>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">Auto-select connected file</div>
+              <div class="setting-desc">Preselect whichever file is currently open with the plugin running.</div>
+            </div>
+            <button class="toggle" id="pref-auto_select" role="switch" aria-checked="true"></button>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">Retries per step</div>
+              <div class="setting-desc">Attempts before a step falls back to a labelled placeholder.</div>
+            </div>
+            <input class="num" type="number" min="1" max="10" id="pref-max_retries" />
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">Max steps</div>
+              <div class="setting-desc">Hard cap on plan length, to bound a runaway run.</div>
+            </div>
+            <input class="num" type="number" min="1" max="100" id="pref-max_steps" />
+          </div>
+        </div>
+
+        <p class="section-label">Connection</p>
+        <div class="setting-card">
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">Bridge</div>
+              <div class="setting-desc">Set in <code>.env</code>. Change it there and in the plugin's manifest + Settings.</div>
+            </div>
+            <code id="out-bridge">—</code>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">Figma plugin</div>
+              <div class="setting-desc" id="plugin-state">Checking…</div>
+            </div>
+            <button class="btn ghost sm" id="btn-setup2">Setup guide</button>
+          </div>
+        </div>
+
+        <p class="section-label">Keyboard</p>
+        <div class="setting-card">
+          <div class="setting-row"><div class="setting-info"><div class="setting-name">Run the current prompt</div></div><span class="kbd">Enter</span></div>
+          <div class="setting-row"><div class="setting-info"><div class="setting-name">New design</div></div><span class="kbd">N</span></div>
+          <div class="setting-row"><div class="setting-info"><div class="setting-name">Open files</div></div><span class="kbd">I</span></div>
+          <div class="setting-row"><div class="setting-info"><div class="setting-name">Newline in the prompt</div></div><span class="kbd">Shift + Enter</span></div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<footer class="footer">
+  <span class="foot-hint"><span class="kbd">Enter</span> run</span>
+  <span class="foot-hint"><span class="kbd">N</span> new</span>
+  <span class="foot-hint"><span class="kbd">I</span> files</span>
+  <div class="spacer"></div>
+  <span id="foot-status">Ready</span>
+</footer>
+
+<!-- setup guide -->
+<div class="scrim" id="setup-modal">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Connect Figma</h2><div class="spacer"></div>
+      <button class="icon-btn" data-close="setup-modal" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <ol class="steps">
+        <li class="step"><h4>Build the plugin</h4><p>In a terminal, from the project folder:</p>
+          <div class="code-row"><code>cd figma_plugin &amp;&amp; npm install &amp;&amp; npm run build</code></div></li>
+        <li class="step"><h4>Import it into Figma Desktop</h4>
+          <p>Plugins are desktop-only. Go to <strong>Plugins → Development → Import plugin from manifest…</strong> and pick:</p>
+          <div class="code-row"><code id="out-manifest">—</code><button class="btn ghost sm" data-copy="out-manifest">Copy</button></div></li>
+        <li class="step"><h4>Open a design file and run it</h4>
+          <p>Use the <strong>design editor</strong> — Dev Mode is read-only, so edits fail there. Then <strong>Plugins → Development → Figma Designer Agent</strong>. Keep its window open.</p></li>
+        <li class="step" id="step-connected"><h4>Confirm</h4>
+          <p>The plugin connects to <code id="out-bridge2">—</code>. Once it does, the file appears in your gallery automatically.</p>
+          <p id="setup-status" style="font-weight:600"></p></li>
+      </ol>
+    </div>
+    <div class="modal-foot"><button class="btn" data-close="setup-modal">Got it</button><span class="test-result" id="setup-hint">Updates live.</span></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  function esc(s) { var d = document.createElement("div"); d.textContent = s == null ? "" : s; return d.innerHTML; }
+  function getJSON(u) { return fetch(u).then(function (r) { return r.json(); }); }
+  function postJSON(u, b) {
+    return fetch(u, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); });
+  }
+  function relTime(iso) {
+    var s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return "just now";
+    var m = Math.floor(s / 60); if (m < 60) return m + (m === 1 ? " min ago" : " mins ago");
+    var h = Math.floor(m / 60); if (h < 24) return h + (h === 1 ? " hour ago" : " hours ago");
+    var d = Math.floor(h / 24); return d + (d === 1 ? " day ago" : " days ago");
+  }
+
+  /* ---------------- theme ---------------- */
+  var SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M6.3 17.7l-1.4 1.4M19.1 4.9l-1.4 1.4"/></svg>';
+  var MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
+  function applyTheme(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    $("btn-theme").innerHTML = t === "dark" ? SUN : MOON;
+    try { localStorage.setItem("fda-theme", t); } catch (e) {}
+  }
+  var saved; try { saved = localStorage.getItem("fda-theme"); } catch (e) {}
+  applyTheme(saved || (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"));
+  $("btn-theme").onclick = function () {
+    applyTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark");
+  };
+
+  /* ---------------- tabs ---------------- */
+  var activeTab = "design";
+  function showTab(name) {
+    activeTab = name;
+    document.querySelectorAll(".panel").forEach(function (p) { p.classList.toggle("active", p.id === "panel-" + name); });
+    document.querySelectorAll(".tab").forEach(function (t) { t.classList.toggle("active", t.dataset.tab === name); });
+    document.querySelectorAll(".side-item[data-tab]").forEach(function (s) { s.classList.toggle("active", s.dataset.tab === name); });
+    $("tabs").classList.remove("mobile-open");
+    if (name === "history") refreshHistory();
+    if (name === "settings") refreshSetup();
+  }
+  document.querySelectorAll("[data-tab]").forEach(function (el) {
+    el.addEventListener("click", function () { showTab(el.dataset.tab); });
+  });
+  $("btn-menu").onclick = function () { $("tabs").classList.toggle("mobile-open"); };
+  $("side-new").onclick = function () { showTab("design"); $("instruction").focus(); };
+
+  /* ---------------- templates ---------------- */
+  var TEMPLATES = [
+    { name: "Landing Page", desc: "Hero + features",
+      icon: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/>',
+      prompt: "Build a desktop landing page (1440px wide). Clean modern style, one accent colour, generous spacing. Sections top to bottom: nav bar with logo left and 3 links plus a primary button right; hero with headline, one-line subheadline, primary CTA and a placeholder image block beside it; three feature columns each with an icon, short title and one line of text; a CTA band on the accent colour; and a footer with logo, 3 link columns and a small copyright line." },
+    { name: "Mobile App", desc: "iOS / Android",
+      icon: '<rect x="6" y="2" width="12" height="20" rx="2"/><path d="M11 18h2"/>',
+      prompt: "Build a 375px wide mobile app home screen. Clean modern style, one accent colour. Top to bottom: a status-bar-height spacer and a header with a greeting and an avatar circle on the right; a search field; a horizontal row of 4 category chips; a section title with a 'See all' link; a vertical list of 4 content cards each with a thumbnail block, title and one line of subtitle; and a bottom tab bar with 4 icons." },
+    { name: "Dashboard", desc: "Analytics UI",
+      icon: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+      prompt: "Build a 1440px wide analytics dashboard screen. Clean modern style, one accent colour, generous spacing. Top to bottom: a header with the page title left and two action buttons right; a row of 4 metric cards each with a label, a large number and a small change indicator; a large chart placeholder block with a title and legend row; and a data table section with a title and 5 rows of placeholder text columns." },
+    { name: "Auth Screen", desc: "Sign in / up",
+      icon: '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/>',
+      prompt: "Build a 1440px wide centred sign-in screen. Clean modern style, one accent colour, generous white space. A centred card roughly 420px wide containing: a logo mark, a 'Welcome back' heading, a one-line subheading, an email field with label, a password field with label, a primary full-width 'Sign in' button, a divider with the word 'or', a secondary full-width 'Continue with Google' button, and a small 'Don't have an account? Sign up' line at the bottom." }
+  ];
+  $("templates").innerHTML = TEMPLATES.map(function (t, i) {
+    return '<div class="template" data-i="' + i + '">' +
+      '<div class="template-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">' + t.icon + "</svg></div>" +
+      '<div class="template-name">' + esc(t.name) + "</div>" +
+      '<div class="template-desc">' + esc(t.desc) + "</div></div>";
+  }).join("");
+  $("templates").querySelectorAll(".template").forEach(function (el) {
+    el.onclick = function () {
+      $("instruction").value = TEMPLATES[+el.dataset.i].prompt;
+      $("instruction").focus();
+      updateHint();
+    };
+  });
+
+  /* ---------------- state ---------------- */
+  var selectedKey = null, filesByKey = {}, settings = null, lastFiles = "", busy = false;
+
+  /* ---------------- files ---------------- */
+  function renderFiles(files) {
+    filesByKey = {};
+    files.forEach(function (f) { filesByKey[f.file_key] = f; });
+    $("count-files").textContent = files.length;
+
+    if (selectedKey && !filesByKey[selectedKey]) selectedKey = null;
+    var autoSelect = !settings || !settings.prefs || settings.prefs.auto_select !== false;
+    if (!selectedKey && autoSelect) {
+      var live = files.filter(function (f) { return f.connected; })[0];
+      if (live) selectedKey = live.file_key;
+    }
+
+    $("side-files").innerHTML = files.slice(0, 5).map(function (f) {
+      var hue = 0; for (var i = 0; i < f.file_key.length; i++) hue = (hue * 31 + f.file_key.charCodeAt(i)) % 360;
+      return '<button class="side-item" data-key="' + esc(f.file_key) + '">' +
+        '<span class="swatch" style="background:hsl(' + hue + ',65%,58%)"></span>' +
+        '<span class="truncate">' + esc(f.file_name) + "</span></button>";
+    }).join("") || '<p style="padding:0 10px;font-size:12px;color:var(--text-4)">None yet</p>';
+    $("side-files").querySelectorAll("[data-key]").forEach(function (b) {
+      b.onclick = function () { selectedKey = b.dataset.key; showTab("design"); renderFiles(files); };
+    });
+
+    if (!files.length) {
+      $("gallery").innerHTML = '<div class="empty"><h3>No files yet</h3>' +
+        "<p>Open a file in Figma Desktop with the plugin running — it appears here automatically.</p>" +
+        '<button class="btn" id="empty-setup">Show me how</button></div>';
+      $("empty-setup").onclick = function () { openModal("setup-modal"); };
+      updateHint(); return;
+    }
+
+    $("gallery").innerHTML = files.map(function (f) {
+      var thumb = f.thumbnail_base64
+        ? '<img src="data:image/png;base64,' + f.thumbnail_base64 + '" alt="">' : "No preview yet";
+      return '<div class="card' + (f.file_key === selectedKey ? " selected" : "") + '" data-key="' + esc(f.file_key) + '">' +
+        '<div class="thumb">' + thumb +
+          '<div class="card-actions">' +
+            '<button class="mini-btn" data-act="use" title="Build in this file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>' +
+          "</div></div>" +
+        '<div class="card-body"><div class="card-info">' +
+          '<div class="card-name">' + esc(f.file_name) + "</div>" +
+          '<div class="card-meta">Edited ' + relTime(f.last_seen) + "</div></div>" +
+          (f.connected ? '<span class="dot on" title="Open with the plugin running"></span>' : "") +
+        "</div></div>";
+    }).join("");
+
+    $("gallery").querySelectorAll(".card").forEach(function (card) {
+      card.onclick = function (e) {
+        selectedKey = card.dataset.key;
+        $("gallery").querySelectorAll(".card").forEach(function (c) { c.classList.remove("selected"); });
+        card.classList.add("selected");
+        updateHint();
+        if (e.target.closest('[data-act="use"]')) showTab("design");
+      };
+    });
+    updateHint();
+  }
+
+  function updateHint() {
+    var sel = filesByKey[selectedKey];
+    if (!settings || !settings.configured) $("hint").textContent = "Add your model credentials in Settings to get started.";
+    else if (!sel) $("hint").textContent = "Select a file in the Files tab, then describe what to build.";
+    else if (sel.connected) $("hint").textContent = "Ready — “" + sel.file_name + "” is open with the plugin running.";
+    else $("hint").textContent = "“" + sel.file_name + "” isn’t connected. Running will wait until you open it.";
+    $("run-btn").disabled = busy || !selectedKey || !settings || !settings.configured;
+  }
+
+  /* ---------------- history ---------------- */
+  function refreshHistory() {
+    getJSON("/api/history").then(function (rows) {
+      $("count-history").textContent = rows.length;
+      if (!rows.length) {
+        $("history-list").innerHTML = '<div class="empty"><h3>No runs yet</h3><p>Generations you run will be listed here.</p></div>';
+        return;
+      }
+      $("history-list").innerHTML = rows.map(function (r) {
+        var cls = r.status === "error" ? "bad" : (r.success ? "ok" : "warn");
+        var label = r.status === "error" ? "Failed" : (r.success ? "Success" : "Issues");
+        var thumb = r.thumbnail_base64 ? '<img src="data:image/png;base64,' + r.thumbnail_base64 + '" alt="">' : "no image";
+        return '<div class="hist-item">' +
+          '<div class="hist-thumb">' + thumb + "</div>" +
+          '<div class="hist-body"><div class="hist-prompt">' + esc(r.instruction) + "</div>" +
+          '<div class="hist-meta">' + esc(r.file_name) + " · " + relTime(r.finished_at) +
+            " · " + r.created_node_count + " nodes" +
+            (r.failed_step_count ? " · " + r.failed_step_count + " failed step(s)" : "") + "</div></div>" +
+          '<span class="status-badge ' + cls + '">' + label + "</span></div>";
+      }).join("");
+    });
+  }
+  $("btn-clear-history").onclick = function () {
+    postJSON("/api/history/clear", {}).then(refreshHistory);
+  };
+
+  /* ---------------- settings ---------------- */
+  function renderSettings(s) {
+    settings = s;
+    $("dot-model").className = "dot " + (s.configured ? "info" : "off");
+    $("txt-model").textContent = s.configured ? (s.model_name || "Model ready") : "Model not set";
+
+    $("in-base").value = s.model_base_url || "";
+    $("in-model").value = s.model_name || "";
+    $("in-key").value = "";
+    $("in-key").placeholder = s.has_api_key ? s.model_api_key_masked : "sk-...";
+    $("key-help").textContent = s.has_api_key
+      ? "A key is already saved. Leave blank to keep it, or type a new one to replace it."
+      : "Stored on this machine only, sent nowhere but your endpoint.";
+
+    var labels = { env: "from .env", ui: "saved here", unset: "unset" };
+    [["tag-base", "model_base_url"], ["tag-key", "model_api_key"], ["tag-model", "model_name"]].forEach(function (p) {
+      var src = (s.sources || {})[p[1]] || "unset";
+      $(p[0]).className = "tag " + (src === "unset" ? "" : src);
+      $(p[0]).textContent = labels[src];
+    });
+
+    var prefs = s.prefs || {};
+    ["visual_gate", "auto_select"].forEach(function (k) {
+      var el = $("pref-" + k); if (el) el.setAttribute("aria-checked", prefs[k] !== false);
+    });
+    ["max_retries", "max_steps"].forEach(function (k) {
+      var el = $("pref-" + k); if (el) el.value = prefs[k];
+    });
+
+    $("out-bridge").textContent = s.bridge_url;
+    $("out-bridge2").textContent = s.bridge_url;
+    updateHint();
+  }
+
+  document.querySelectorAll(".toggle").forEach(function (t) {
+    t.onclick = function () {
+      var next = t.getAttribute("aria-checked") !== "true";
+      t.setAttribute("aria-checked", next);
+      var patch = {}; patch[t.id.replace("pref-", "")] = next;
+      postJSON("/api/prefs", patch).then(function (r) { renderSettings(r.body); });
+    };
+  });
+  ["max_retries", "max_steps"].forEach(function (k) {
+    $("pref-" + k).onchange = function () {
+      var patch = {}; patch[k] = $("pref-" + k).value;
+      postJSON("/api/prefs", patch).then(function (r) { renderSettings(r.body); });
+    };
+  });
+
+  $("btn-save").onclick = function () {
+    var payload = { model_base_url: $("in-base").value.trim(), model_name: $("in-model").value.trim() };
+    var key = $("in-key").value.trim();
+    if (key) payload.model_api_key = key;
+    $("btn-save").disabled = true; $("test-result").textContent = "";
+    postJSON("/api/settings", payload).then(function (r) {
+      renderSettings(r.body); renderBanner(null);
+      $("test-result").className = "test-result ok"; $("test-result").textContent = "Saved";
+      $("btn-save").disabled = false;
+    });
+  };
+  $("btn-test").onclick = function () {
+    $("btn-test").disabled = true;
+    $("test-result").className = "test-result"; $("test-result").textContent = "Testing…";
+    postJSON("/api/settings/test", {}).then(function (r) {
+      $("test-result").className = "test-result " + (r.body.ok ? "ok" : "bad");
+      $("test-result").textContent = r.body.ok ? "Connection works" : r.body.error;
+      $("btn-test").disabled = false;
+    });
+  };
+  $("pill-model").onclick = function () { showTab("settings"); };
+
+  /* ---------------- banner + status ---------------- */
+  function renderBanner(status) {
+    var b = $("banner");
+    if (settings && !settings.configured) {
+      b.className = "banner warn show";
+      $("banner-title").textContent = "No model configured";
+      $("banner-text").textContent = "Add an API base URL, key and model name so the agent can start planning.";
+      $("banner-action").textContent = "Open Settings";
+      $("banner-action").onclick = function () { showTab("settings"); };
+    } else if (status && !status.plugin_connected) {
+      b.className = "banner warn show";
+      $("banner-title").textContent = "Figma plugin not connected";
+      $("banner-text").textContent = "Open a file in Figma Desktop and run the plugin to start designing.";
+      $("banner-action").textContent = "Setup guide";
+      $("banner-action").onclick = function () { openModal("setup-modal"); };
+    } else b.className = "banner";
+  }
+
+  function renderStatus(s) {
+    $("dot-plugin").className = "dot " + (s.plugin_connected ? "on" : "off");
+    $("txt-plugin").textContent = s.plugin_connected
+      ? (s.connected_file ? s.connected_file.file_name : "Connected") : "Offline";
+    $("plugin-state").textContent = s.plugin_connected
+      ? "Connected" + (s.connected_file ? " — " + s.connected_file.file_name : "") : "Not connected";
+
+    var panel = $("run-panel");
+    busy = s.status === "waiting_for_file" || s.status === "running";
+    $("foot-status").textContent = busy ? "Running…" : "Ready";
+    if (s.status === "idle") { panel.classList.remove("show"); updateHint(); return; }
+    panel.classList.add("show");
+
+    $("status-badge").className = "badge " + s.status;
+    $("status-badge").innerHTML = (busy ? '<span class="spin"></span>' : "") + s.status.replace(/_/g, " ");
+    $("status-file").textContent = s.connected_file ? s.connected_file.file_name : "";
+
+    var log = $("log");
+    var pinned = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
+    log.textContent = s.log.join("\n");
+    if (pinned) log.scrollTop = log.scrollHeight;
+
+    var r = s.result;
+    if (r) {
+      var h = '<div class="result-row">' + (r.success ? "✅ Completed" : "⚠️ Finished with issues") +
+        ' <span style="font-weight:400;color:var(--text-3)">· ' + r.created_node_count + " node(s)</span></div>";
+      if (r.failed_steps && r.failed_steps.length)
+        h += '<div class="issue bad">' + r.failed_steps.length + " step(s) failed: " + esc(r.failed_steps.join(" · ")) + "</div>";
+      (r.layout_defects || []).slice(0, 6).forEach(function (d) { h += '<div class="issue">' + esc(d) + "</div>"; });
+      (r.warnings || []).forEach(function (w) { h += '<div class="issue">' + esc(w) + "</div>"; });
+      if (r.final_screenshot_base64)
+        h += '<img src="data:image/png;base64,' + r.final_screenshot_base64 + '" alt="Result">';
+      $("result").innerHTML = h;
+    } else $("result").innerHTML = "";
+    updateHint();
+  }
+
+  /* ---------------- modal + setup ---------------- */
+  function openModal(id) { $(id).classList.add("show"); refreshSetup(); }
+  document.querySelectorAll("[data-close]").forEach(function (el) {
+    el.onclick = function () { $(el.dataset.close).classList.remove("show"); };
+  });
+  document.querySelectorAll(".scrim").forEach(function (s) {
+    s.onclick = function (e) { if (e.target === s) s.classList.remove("show"); };
+  });
+  document.querySelectorAll("[data-copy]").forEach(function (b) {
+    b.onclick = function () {
+      var t = $(b.dataset.copy).textContent;
+      if (navigator.clipboard) navigator.clipboard.writeText(t);
+      var old = b.textContent; b.textContent = "Copied"; setTimeout(function () { b.textContent = old; }, 1200);
+    };
+  });
+  $("btn-setup").onclick = function () { openModal("setup-modal"); };
+  $("btn-setup2").onclick = function () { openModal("setup-modal"); };
+
+  function refreshSetup() {
+    getJSON("/api/setup").then(function (s) {
+      $("out-manifest").textContent = s.manifest_path;
+      $("out-bridge2").textContent = s.bridge_url;
+      $("step-connected").classList.toggle("done", !!s.plugin_connected);
+      $("setup-status").textContent = s.plugin_connected
+        ? "Connected" + (s.connected_file ? " — " + s.connected_file : "") + "."
+        : "Waiting for the plugin to connect…";
+      $("setup-status").style.color = s.plugin_connected ? "var(--success)" : "var(--text-3)";
+    });
+  }
+
+  /* ---------------- run ---------------- */
+  $("run-btn").onclick = function () {
+    var text = $("instruction").value.trim();
+    if (!selectedKey || !text) return;
+    $("run-btn").disabled = true;
+    postJSON("/api/run", { file_key: selectedKey, instruction: text }).then(function (r) {
+      if (!r.body.ok) { $("hint").textContent = r.body.message || "Could not start the run."; updateHint(); }
+    });
+  };
+  $("instruction").addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!$("run-btn").disabled) $("run-btn").click(); }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") document.querySelectorAll(".scrim.show").forEach(function (m) { m.classList.remove("show"); });
+    var typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
+    if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === "n" || e.key === "N") { e.preventDefault(); showTab("design"); $("instruction").focus(); }
+    if (e.key === "i" || e.key === "I") { e.preventDefault(); showTab("files"); }
+  });
+
+  /* ---------------- polling ---------------- */
+  function refreshFiles() {
+    getJSON("/api/files").then(function (f) {
+      var j = JSON.stringify(f); if (j !== lastFiles) { lastFiles = j; renderFiles(f); }
+    });
+  }
+  function refreshStatus() {
+    getJSON("/api/status").then(function (s) {
+      renderStatus(s); renderBanner(s);
+      if ($("setup-modal").classList.contains("show")) refreshSetup();
+      if (s.status === "done" || s.status === "error") getJSON("/api/history").then(function (r) { $("count-history").textContent = r.length; });
+    });
+  }
+  getJSON("/api/settings").then(function (s) {
+    renderSettings(s); renderBanner(null); refreshFiles(); refreshStatus(); refreshHistory();
+  });
+  setInterval(refreshFiles, 3000);
+  setInterval(refreshStatus, 1500);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+openai>=1.30.0
+websockets>=12.0
+python-dotenv>=1.0.1
+
+# testing (tests/ -- no Figma or network needed, see section 13 of CLAUDE.md)
+pytest>=8.0.0

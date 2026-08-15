@@ -1,0 +1,17 @@
+{
+  "task_id": "dashboard",
+  "page_type": "app dashboard",
+  "viewport": 1440,
+  "instruction": "an analytics dashboard for a delivery company called Northgate, with a top navigation bar, four summary metric cards, a revenue chart area, and a recent-orders table",
+  "criteria": [
+    {"label": "the product name appears", "any_text": "(?i)northgate"},
+    {"label": "metric cards exist", "any_name": "(?i)card|metric|stat|kpi"},
+    {"label": "a chart area exists", "any_name": "(?i)chart|graph|revenue"},
+    {"label": "a table or order list exists", "any_name": "(?i)table|order|row|list"},
+    {"label": "navigation exists", "any_name": "(?i)nav|header|top.?bar|sidebar"},
+    {"label": "at least 4 sections on the page", "min_sections": 4},
+    {"label": "at least 14 text elements", "min_nodes": {"type": "TEXT", "n": 14}},
+    {"label": "at least 12 frames", "min_nodes": {"type": "FRAME", "n": 12}}
+  ],
+  "notes": "Data-dense. Tests repeated-element construction and whether density survives."
+}

@@ -1,0 +1,17 @@
+{
+  "task_id": "signup",
+  "page_type": "auth form",
+  "viewport": 1440,
+  "instruction": "a sign-up screen for a fitness app called Ridgeline, with full name, email and password fields, a password strength hint, a terms-and-conditions checkbox, and a create-account button",
+  "criteria": [
+    {"label": "name field", "any_text": "(?i)name"},
+    {"label": "email field", "any_text": "(?i)e-?mail"},
+    {"label": "password field", "any_text": "(?i)password"},
+    {"label": "terms and conditions", "any_text": "(?i)terms|conditions|agree"},
+    {"label": "create-account action", "any_text": "(?i)create|sign.?up|get started"},
+    {"label": "the product name appears", "any_text": "(?i)ridgeline"},
+    {"label": "at least 2 sections on the page", "min_sections": 2},
+    {"label": "at least 8 text elements", "min_nodes": {"type": "TEXT", "n": 8}}
+  ],
+  "notes": "Like login but with more required fields -- catches silent requirement drop."
+}

@@ -1,0 +1,17 @@
+{
+  "task_id": "landing",
+  "page_type": "marketing landing page",
+  "viewport": 1440,
+  "instruction": "a marketing landing page for a scheduling tool called Cadence, with a nav bar, a hero with headline and call-to-action, a three-column feature section, a pricing section with three tiers, and a footer",
+  "criteria": [
+    {"label": "the product name appears", "any_text": "(?i)cadence"},
+    {"label": "a hero section", "any_name": "(?i)hero|banner"},
+    {"label": "a features section", "any_name": "(?i)feature|benefit"},
+    {"label": "a pricing section", "any_name": "(?i)pricing|plan|tier"},
+    {"label": "a footer", "any_name": "(?i)footer"},
+    {"label": "a call to action", "any_text": "(?i)start|try|get started|sign up|book"},
+    {"label": "at least 5 sections on the page", "min_sections": 5},
+    {"label": "at least 20 text elements", "min_nodes": {"type": "TEXT", "n": 20}}
+  ],
+  "notes": "The longest page. Tests whether quality holds up across many steps."
+}

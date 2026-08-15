@@ -1,0 +1,16 @@
+{
+  "task_id": "product",
+  "page_type": "e-commerce product page",
+  "viewport": 1440,
+  "instruction": "an e-commerce product page for a ceramic pour-over coffee dripper by a brand called Kiln, with a product image area, title, price, size selector, add-to-cart button, and a short description",
+  "criteria": [
+    {"label": "the brand name appears", "any_text": "(?i)kiln"},
+    {"label": "a price is shown", "any_text": "[$£€][ ]?[0-9]|[0-9]+[.][0-9][0-9]"},
+    {"label": "add-to-cart action", "any_text": "(?i)add to (cart|bag)|buy"},
+    {"label": "size or variant selector", "any_text": "(?i)size|variant|option|small|medium|large"},
+    {"label": "an image placeholder area", "any_name": "(?i)image|photo|gallery|product"},
+    {"label": "at least 3 sections on the page", "min_sections": 3},
+    {"label": "at least 8 text elements", "min_nodes": {"type": "TEXT", "n": 8}}
+  ],
+  "notes": "Mixed media + commerce affordances. Tests non-text node creation."
+}

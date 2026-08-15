@@ -1,0 +1,16 @@
+{
+  "task_id": "settings",
+  "page_type": "settings page",
+  "viewport": 1440,
+  "instruction": "an account settings page with a left sidebar of setting categories, a profile section with name and email, a notification preferences section with toggles, and a danger zone with a delete-account button",
+  "criteria": [
+    {"label": "sidebar navigation", "any_name": "(?i)sidebar|nav|menu|categor"},
+    {"label": "profile section", "any_text": "(?i)profile|account"},
+    {"label": "notification preferences", "any_text": "(?i)notification"},
+    {"label": "a destructive action", "any_text": "(?i)delete|danger|remove"},
+    {"label": "toggle-like controls", "any_name": "(?i)toggle|switch|checkbox|control"},
+    {"label": "at least 3 sections on the page", "min_sections": 3},
+    {"label": "at least 12 text elements", "min_nodes": {"type": "TEXT", "n": 12}}
+  ],
+  "notes": "Two-column layout. Tests horizontal auto-layout, which vertical-only plans miss."
+}

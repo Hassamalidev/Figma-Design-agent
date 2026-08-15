@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Config
+.env
+
+# Local file-gallery history (screenshots of your own designs -- not shared)
+web/known_files.json
+
+# Credentials + preferences entered in the dashboard's Settings panel
+web/runtime_settings.json
+
+# Run history shown in the dashboard's History tab
+web/history.json
+
+# Node (figma_plugin/ has its own, but be safe if tooling runs from root)
+node_modules/
+bench/results/

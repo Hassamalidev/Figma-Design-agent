@@ -1,0 +1,17 @@
+{
+  "task_id": "login",
+  "page_type": "auth form",
+  "viewport": 1440,
+  "instruction": "a sign-in screen for a project management tool called Beacon, with email and password fields, a primary sign-in button, a Google sign-in option, and a forgot-password link",
+  "criteria": [
+    {"label": "email field is present", "any_text": "(?i)e-?mail"},
+    {"label": "password field is present", "any_text": "(?i)password"},
+    {"label": "Google sign-in is offered", "any_text": "(?i)google"},
+    {"label": "forgot-password link", "any_text": "(?i)forgot"},
+    {"label": "the product name appears", "any_text": "(?i)beacon"},
+    {"label": "a button-like node exists", "any_name": "(?i)button|cta|submit|sign.?in"},
+    {"label": "at least 2 sections on the page", "min_sections": 2},
+    {"label": "at least 6 text elements", "min_nodes": {"type": "TEXT", "n": 6}}
+  ],
+  "notes": "Form-heavy and small. Tests whether required fields survive planning."
+}

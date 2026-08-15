@@ -1,0 +1,17 @@
+{
+  "name": "Figma Designer Agent",
+  "id": "1669726900957446436",
+  "api": "1.0.0",
+  "main": "code.js",
+  "capabilities": [],
+  "enableProposedApi": false,
+  "enablePrivatePluginApi": true,
+  "documentAccess": "dynamic-page",
+  "editorType": ["figma"],
+  "ui": "ui.html",
+  "networkAccess": {
+    "allowedDomains": ["ws://localhost:9223", "http://localhost:9223"],
+    "devAllowedDomains": ["ws://localhost:9223", "http://localhost:9223"],
+    "reasoning": "Connects to the local Python agent bridge (this project's own WebSocket server on localhost) to receive scripts to run and report results back. Never talks to any other host."
+  }
+}

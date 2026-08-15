@@ -1,0 +1,178 @@
+"""The ONLY place a model provider is configured.
+
+This is the swap point: hosted free API today, local model tomorrow, changed
+via .env only -- no code edits anywhere else. Never import a vendor SDK
+outside this file.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+import uuid
+from types import SimpleNamespace
+from typing import Any
+
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
+from openai.types.chat import ChatCompletionMessage
+
+logger = logging.getLogger(__name__)
+
+# A hosted endpoint blipping is not a bug in the design agent. A single 500 from
+# Ollama Cloud killed a six-task benchmark sweep mid-run and lost every result
+# with it, so transient failures are absorbed here -- provider quirk handling,
+# which is exactly what this file is for (CLAUDE.md golden rule 1).
+TRANSIENT_ERRORS = (InternalServerError, RateLimitError, APIConnectionError, APITimeoutError)
+MAX_TRANSIENT_RETRIES = 4
+BACKOFF_SECONDS = 2.0
+
+
+class ModelClient:
+    """Wraps any OpenAI-compatible chat endpoint."""
+
+    def __init__(self, base_url: str, api_key: str, model: str):
+        self._client = OpenAI(base_url=base_url, api_key=api_key)
+        self._model = model
+
+    def complete(self, messages: list[dict], tools: list[dict] | None = None) -> Any:
+        """Return the assistant message (which may contain tool calls)."""
+        resp = self._create_with_retry(messages, tools)
+        message: ChatCompletionMessage = resp.choices[0].message
+        if tools and not message.tool_calls:
+            message = _recover_tool_call_from_content(message, tools)
+        return message
+
+    def _create_with_retry(self, messages: list[dict], tools: list[dict] | None):
+        """Absorb transient endpoint failures with exponential backoff.
+
+        Only retries errors that are actually worth retrying: a 400 (bad
+        request -- e.g. an image sent to a text-only model) is a real answer and
+        must surface immediately rather than being retried four times.
+        """
+        for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+            try:
+                return self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    tools=tools or None,
+                    temperature=0.2,  # low: reliable code + tool calls, not creativity
+                )
+            except TRANSIENT_ERRORS as exc:
+                if attempt >= MAX_TRANSIENT_RETRIES:
+                    logger.info(
+                        "Model endpoint still failing after %d retries: %s",
+                        MAX_TRANSIENT_RETRIES,
+                        type(exc).__name__,
+                    )
+                    raise
+                delay = BACKOFF_SECONDS * (2**attempt)
+                logger.info(
+                    "Model endpoint returned %s; retrying in %.0fs (%d/%d).",
+                    type(exc).__name__,
+                    delay,
+                    attempt + 1,
+                    MAX_TRANSIENT_RETRIES,
+                )
+                time.sleep(delay)
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+
+def build_critic_client(settings) -> "ModelClient | None":
+    """The vision critic, or None when no critic model is configured.
+
+    Kept here because it is model wiring, and every entry point (CLI, dashboard,
+    benchmark) needs the same answer. Returning None is a first-class outcome:
+    the run then skips screenshot critique entirely rather than sending images
+    to a text-only endpoint and eating a 400 per step to find out.
+    """
+    if not getattr(settings, "has_vision_critic", False):
+        return None
+    base_url, api_key, model = settings.critic_settings()
+    return ModelClient(base_url, api_key, model)
+
+
+def _recover_tool_call_from_content(message: ChatCompletionMessage, tools: list[dict]) -> Any:
+    """Fallback for local models with unreliable tool-calling (CLAUDE.md section 5:
+    "tool-call reliability drops on small models... this is the single biggest
+    reliability lever for local models"). Some servers/models emit a perfectly
+    valid tool call as plain JSON *text* in `content` instead of populating the
+    API's real `tool_calls` field. If that's what happened, parse it out into
+    the same shape a real tool call would have, so agent/loop.py never has to
+    know the difference. Returns `message` unchanged if `content` isn't a
+    recognizable tool call.
+    """
+    if not message.content:
+        return message
+
+    known_names = {t["function"]["name"] for t in tools}
+    calls = []
+    for block in _json_candidates(message.content):
+        calls.extend(_calls_from(block, known_names))
+    if not calls:
+        return message
+    return SimpleNamespace(content=None, tool_calls=calls)
+
+
+def _calls_from(parsed: Any, known_names: set[str]) -> list[Any]:
+    """Pull tool calls out of one parsed JSON block.
+
+    Handles both the bare `{"name": ..., "arguments": {...}}` shape and the
+    invented `{"calls": [{"name": ..., "arguments": {...}}, ...]}` wrapper
+    that models sometimes produce when batching several calls into one reply.
+    """
+    if not isinstance(parsed, dict):
+        return []
+
+    if isinstance(parsed.get("calls"), list):
+        found: list[Any] = []
+        for entry in parsed["calls"]:
+            found.extend(_calls_from(entry, known_names))
+        return found
+
+    name = parsed.get("name")
+    arguments = parsed.get("arguments")
+    if name not in known_names or not isinstance(arguments, dict):
+        return []
+    return [
+        SimpleNamespace(
+            id=uuid.uuid4().hex,
+            function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+        )
+    ]
+
+
+def _json_candidates(content: str) -> list[Any]:
+    """Parse the whole message as JSON, else every ```-fenced JSON block in it.
+
+    Models that narrate ("Below are three calls: ```json ... ``` ```json ...
+    ```") bury real calls inside prose, so a whole-string parse alone misses
+    them.
+    """
+    blocks: list[Any] = []
+    try:
+        return [json.loads(_strip_code_fence(content))]
+    except json.JSONDecodeError:
+        pass
+
+    for match in re.finditer(r"```(?:json)?\s*\n(.*?)```", content, re.DOTALL):
+        try:
+            blocks.append(json.loads(match.group(1).strip()))
+        except json.JSONDecodeError:
+            continue
+    return blocks
+
+
+def _strip_code_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+    return text.strip()

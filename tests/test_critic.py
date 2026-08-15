@@ -1,0 +1,331 @@
+"""The visual gate's deterministic half.
+
+These are the defects a text-only model cannot see and metadata alone doesn't
+announce: collapsed text, overflow, overlap, blank regions. Pure geometry, so
+it is exactly testable -- and it must never invent a defect in a clean tree.
+"""
+from __future__ import annotations
+
+import json
+
+from agent import critic
+
+
+def frame(**kw):
+    base = {
+        "id": "1:1", "name": "Frame", "type": "FRAME", "x": 0, "y": 0,
+        "width": 100, "height": 100, "visible": True, "layoutMode": None, "children": [],
+    }
+    base.update(kw)
+    return base
+
+
+def text(**kw):
+    base = {
+        "id": "1:2", "name": "Text", "type": "TEXT", "x": 0, "y": 0,
+        "width": 100, "height": 20, "visible": True, "layoutMode": None,
+        "children": [], "characters": "Hello", "fontSize": 16,
+    }
+    base.update(kw)
+    return base
+
+
+def kinds(tree):
+    return sorted({d.kind for d in critic.find_layout_defects(tree)})
+
+
+def test_a_clean_layout_reports_nothing():
+    tree = frame(
+        name="Root", width=1440, height=400, layoutMode="VERTICAL",
+        children=[
+            frame(id="2:1", name="Nav", width=1440, height=80, children=[text(id="2:2", width=200)]),
+            frame(id="2:3", name="Hero", y=80, width=1440, height=320,
+                  children=[text(id="2:4", width=600, height=48, fontSize=40)]),
+        ],
+    )
+
+    assert critic.find_layout_defects(tree) == []
+
+
+def test_collapsed_text_is_caught():
+    """The classic Figma trap: a TEXT node collapses to ~0px and vanishes."""
+    tree = frame(children=[text(id="3:1", name="Headline", width=0, height=0)])
+
+    assert "collapsed" in kinds(tree)
+
+
+def test_a_sliver_wide_text_node_is_caught():
+    tree = frame(children=[text(id="3:2", name="Label", width=3, height=20)])
+
+    assert "collapsed-text" in kinds(tree)
+
+
+def test_text_shorter_than_its_font_is_clipped():
+    tree = frame(children=[text(id="3:3", name="Title", width=300, height=10, fontSize=32)])
+
+    assert "clipped-text" in kinds(tree)
+
+
+def test_children_escaping_their_parent_are_caught():
+    tree = frame(
+        name="Card", width=200, height=100,
+        children=[frame(id="4:1", name="Overflowing", x=150, y=0, width=200, height=50)],
+    )
+
+    defects = critic.find_layout_defects(tree)
+    assert any(d.kind == "overflow" for d in defects)
+    assert "Overflowing" in str(defects[0])
+
+
+def test_stacked_autolayout_content_is_one_defect_not_one_per_child():
+    """A live run reported the SAME clipping problem 28 times, once per stacked
+    section. In auto-layout Figma owns child positions, so this is one bug: the
+    frame is FIXED and no longer hugging."""
+    tree = frame(
+        name="Generated Page", width=1440, height=2233, layoutMode="VERTICAL",
+        children=[
+            frame(id="a", name="Modal A", y=2235, width=1440, height=1),
+            frame(id="b", name="Modal B", y=2236, width=1440, height=1),
+            frame(id="c", name="Modal C", y=2237, width=375, height=812),
+        ],
+    )
+
+    defects = critic.find_layout_defects(tree)
+    clipped = [d for d in defects if d.kind == "clipped-content"]
+    assert len(clipped) == 1
+    assert "overflow" not in kinds(tree)          # not blamed on the children
+    assert "primaryAxisSizingMode" in clipped[0].detail   # says how to fix it
+
+
+def test_an_autolayout_frame_that_fits_its_content_is_clean():
+    tree = frame(
+        name="Root", width=1440, height=400, layoutMode="VERTICAL",
+        children=[
+            frame(id="a", name="Nav", y=0, width=1440, height=80, children=[text(id="t", width=200)]),
+            frame(id="b", name="Hero", y=80, width=1440, height=320, children=[text(id="t2", width=400)]),
+        ],
+    )
+
+    assert "clipped-content" not in kinds(tree)
+
+
+def test_defects_are_deduplicated_and_capped():
+    """Twelve identically-broken siblings should not produce twelve lines."""
+    tree = frame(
+        name="Root", width=800, height=600, layoutMode="NONE",
+        children=[text(id=f"t{i}", name="Label", width=0, height=0) for i in range(12)],
+    )
+
+    defects = critic.find_layout_defects(tree)
+    assert len(defects) <= critic.MAX_DEFECTS
+    assert len([d for d in defects if d.kind == "collapsed"]) <= critic.MAX_PER_KIND
+
+
+def test_overlapping_siblings_are_caught_only_without_auto_layout():
+    overlapping = [
+        frame(id="5:1", name="A", x=0, y=0, width=100, height=50),
+        frame(id="5:2", name="B", x=0, y=10, width=100, height=50),
+    ]
+    loose = frame(name="Root", width=200, height=200, layoutMode="NONE", children=overlapping)
+    assert "overlap" in kinds(loose)
+
+    # Auto layout positions children itself -- reporting overlap there would be
+    # a false positive, since the coordinates are managed by Figma.
+    managed = frame(name="Root", width=200, height=200, layoutMode="VERTICAL", children=overlapping)
+    assert "overlap" not in kinds(managed)
+
+
+def test_a_two_pixel_nudge_is_not_reported():
+    """Rounding shouldn't produce noise -- only real visual overlap counts."""
+    tree = frame(
+        name="Root", width=300, height=200, layoutMode="NONE",
+        children=[
+            frame(id="6:1", name="A", x=0, y=0, width=100, height=50),
+            frame(id="6:2", name="B", x=98, y=0, width=100, height=50),
+        ],
+    )
+
+    assert "overlap" not in kinds(tree)
+
+
+def test_empty_and_hidden_regions_are_caught():
+    assert "empty-frame" in kinds(frame(children=[frame(id="7:1", name="Blank", width=300, height=200)]))
+    assert "invisible" in kinds(frame(children=[text(id="7:2", name="Ghost", visible=False)]))
+    assert "empty-text" in kinds(frame(children=[text(id="7:3", name="Blank label", characters="  ")]))
+
+
+def test_tiny_empty_frames_are_ignored():
+    """A 24x24 empty frame is an icon placeholder, not a blank region."""
+    tree = frame(children=[frame(id="8:1", name="Icon", width=24, height=24)])
+
+    assert "empty-frame" not in kinds(tree)
+
+
+# ---- model critique plumbing -------------------------------------------
+
+
+def test_clean_reply_means_no_defects():
+    assert critic.parse_critique("CLEAN") == []
+    assert critic.parse_critique("  clean  ") == []
+    assert critic.parse_critique("") == []
+
+
+def test_defect_list_is_parsed_and_capped():
+    reply = json.dumps([
+        {"severity": "blocking", "element": "Headline", "problem": "overlaps the nav"},
+        {"severity": "blocking", "element": "Footer text", "problem": "is unreadable"},
+        {"severity": "minor", "element": "Cards", "problem": "are uneven"},
+    ])
+    defects = critic.parse_critique(reply)
+
+    assert [d.element for d in defects] == ["Headline", "Footer text", "Cards"]
+    assert [d.severity for d in defects] == ["blocking", "blocking", "minor"]
+
+    many = json.dumps([{"severity": "minor", "element": f"e{i}", "problem": "x"} for i in range(20)])
+    assert len(critic.parse_critique(many)) == critic.MAX_VISUAL_DEFECTS
+
+
+def test_only_blocking_defects_can_fail_a_step():
+    """The old parser treated every line as blocking, so a vision model -- which
+    always finds something to say about a work in progress -- would have failed
+    essentially every step and left the page full of TODO placeholders.
+    """
+    reply = json.dumps([
+        {"severity": "blocking", "element": "Email label", "problem": "is unreadable on the navy fill"},
+        {"severity": "minor", "element": "Card", "problem": "could use more breathing room"},
+        {"severity": "minor", "element": "Heading", "problem": "hierarchy could be stronger"},
+    ])
+    blocking = critic.blocking_only(critic.parse_critique(reply))
+
+    assert blocking == ["[visual] Email label: is unreadable on the navy fill"]
+
+
+def test_an_unknown_severity_is_treated_as_minor():
+    """Ambiguity must never block -- the safe default is 'record it, keep going'."""
+    reply = json.dumps([{"severity": "critical!!", "element": "x", "problem": "y"}])
+    assert critic.parse_critique(reply)[0].severity == "minor"
+    assert critic.blocking_only(critic.parse_critique(reply)) == []
+
+
+def test_unparseable_critique_blocks_nothing():
+    """A critic that rambles instead of answering must not fail the step."""
+    assert critic.parse_critique("I think the design looks quite nice overall!") == []
+    assert critic.parse_critique("") == []
+
+
+def test_a_fenced_json_reply_is_still_parsed():
+    reply = '```json\n[{"severity":"blocking","element":"Hero","problem":"text is clipped"}]\n```'
+    assert len(critic.parse_critique(reply)) == 1
+
+
+def test_critique_message_carries_both_signals():
+    """Metadata is structural truth, the screenshot is visual truth -- send both."""
+    messages = critic.build_critique_messages('{"a":1}', "BASE64PNG")
+
+    content = messages[-1]["content"]
+    assert any(c.get("type") == "image_url" for c in content)
+    assert any("metadata" in str(c.get("text", "")) for c in content)
+
+
+def test_critique_message_without_a_screenshot_omits_the_image():
+    messages = critic.build_critique_messages('{"a":1}', None)
+
+    assert all(c.get("type") != "image_url" for c in messages[-1]["content"])
+
+
+# ---- scoping the gate to one step's own nodes -----------------------------
+
+def _page_with_a_broken_earlier_section() -> dict:
+    """A page where section A is broken (collapsed text) and section B is fine."""
+    return {
+        "id": "0:root", "name": "Root", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 800, "visible": True, "layoutMode": "VERTICAL",
+        "children": [
+            {
+                "id": "sec:a", "name": "Broken Hero", "type": "FRAME", "x": 0, "y": 0,
+                "width": 1440, "height": 400, "visible": True, "layoutMode": "VERTICAL",
+                "children": [
+                    {
+                        "id": "t:a", "name": "Collapsed", "type": "TEXT", "x": 0, "y": 0,
+                        "width": 0, "height": 0, "visible": True, "layoutMode": None,
+                        "children": [], "characters": "Invisible", "fontSize": 32,
+                    }
+                ],
+            },
+            {
+                "id": "sec:b", "name": "Good Footer", "type": "FRAME", "x": 0, "y": 400,
+                "width": 1440, "height": 400, "visible": True, "layoutMode": "VERTICAL",
+                "children": [
+                    {
+                        "id": "t:b", "name": "Fine", "type": "TEXT", "x": 0, "y": 0,
+                        "width": 600, "height": 40, "visible": True, "layoutMode": None,
+                        "children": [], "characters": "Hello", "fontSize": 32,
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def test_scoped_gate_ignores_a_defect_in_another_section():
+    """The whole point: step B must not fail because step A left a defect."""
+    tree = _page_with_a_broken_earlier_section()
+
+    assert critic.find_layout_defects(tree)  # unscoped: the page is dirty
+    assert critic.find_layout_defects(tree, scope_ids=["sec:b"]) == []
+
+
+def test_scoped_gate_still_catches_a_defect_inside_its_own_subtree():
+    tree = _page_with_a_broken_earlier_section()
+    defects = critic.find_layout_defects(tree, scope_ids=["sec:a"])
+    assert [d.kind for d in defects] == ["collapsed"]
+    assert defects[0].node_name == "Collapsed"
+
+
+def test_unknown_scope_ids_report_nothing_rather_than_the_whole_page():
+    """An id that isn't in the tree must not silently fall back to page scope."""
+    tree = _page_with_a_broken_earlier_section()
+    assert critic.find_layout_defects(tree, scope_ids=["nope:1"]) == []
+
+
+def test_a_node_and_its_own_child_are_not_walked_twice():
+    tree = _page_with_a_broken_earlier_section()
+    defects = critic.find_layout_defects(tree, scope_ids=["sec:a", "t:a"])
+    assert len(defects) == 1
+
+
+def test_text_wrapping_one_character_per_line_is_caught():
+    """From a real canvas: "Recent Transactions" rendered as a vertical column
+    of letters. Unmissable to a human, invisible to every check -- 20px is not
+    "collapsed", and the node's height was large rather than small.
+    """
+    tree = frame(
+        name="Table Card", width=1376, height=400,
+        children=[text(id="9:1", name="Recent Transactions", characters="Recent Transactions",
+                       width=20, height=260, fontSize=18)],
+    )
+
+    defects = critic.find_layout_defects(tree)
+    assert "vertical-text" in {d.kind for d in defects}
+    assert "one character per line" in str(defects[0])
+
+
+def test_normal_wrapped_paragraphs_are_not_flagged():
+    """A wide paragraph is tall too -- it must not look like the same bug."""
+    tree = frame(
+        name="Card", width=600, height=200,
+        children=[text(id="9:2", name="Body", characters="A" * 200,
+                       width=520, height=120, fontSize=16)],
+    )
+
+    assert "vertical-text" not in {d.kind for d in critic.find_layout_defects(tree)}
+
+
+def test_a_short_narrow_label_is_not_flagged():
+    """A one-word label in a narrow column is legitimate."""
+    tree = frame(
+        name="Card", width=200, height=100,
+        children=[text(id="9:3", name="Qty", characters="Qty", width=30, height=20, fontSize=13)],
+    )
+
+    assert "vertical-text" not in {d.kind for d in critic.find_layout_defects(tree)}

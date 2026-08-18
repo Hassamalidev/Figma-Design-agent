@@ -28,6 +28,15 @@ class HistoryEntry:
     started_at: str  # ISO 8601
     finished_at: str
     thumbnail_base64: str | None = None
+    # Everything below is optional so a history file written by an older build
+    # still loads. A row is only useful if it says what actually happened --
+    # "Success · 0 nodes" told the user nothing they could act on.
+    duration_seconds: float = 0.0
+    section_count: int = 0
+    requirements_met: int = 0
+    requirements_total: int = 0
+    layout_defect_count: int = 0
+    error: str = ""  # why it failed, when it did
 
     def summary(self) -> dict:
         """What the UI needs; the thumbnail is included only if still retained."""
@@ -41,7 +50,19 @@ class History:
         self._path = path
 
     def list_entries(self) -> list[HistoryEntry]:
-        return [HistoryEntry(**row) for row in self._read()]
+        """Newest first, ignoring anything a different build may have written.
+
+        Unknown keys are dropped rather than raising: a history file is a log,
+        and one unreadable row must never take the whole tab down.
+        """
+        known = set(HistoryEntry.__dataclass_fields__)
+        entries = []
+        for row in self._read():
+            try:
+                entries.append(HistoryEntry(**{k: v for k, v in row.items() if k in known}))
+            except TypeError:
+                continue  # missing a required field -- skip that row, keep the rest
+        return entries
 
     def add(self, entry: HistoryEntry) -> None:
         rows = self._read()

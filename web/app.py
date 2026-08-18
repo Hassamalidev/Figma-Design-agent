@@ -18,13 +18,15 @@ from pathlib import Path
 
 import uuid
 
-from agent import loop
+from agent import loop, scaffold
 from agent.llm import ModelClient, build_critic_client
+from agent.metrics import RunMetrics
 from bridge.server import Bridge
+from tools.figma_exec import execute_figma_js
 from tools.figma_read import get_screenshot
 from web.history import History, HistoryEntry
 from web.registry import FileEntry, Registry
-from web.settings_store import SettingsStore, mask
+from web.settings_store import EDITABLE, SettingsStore, mask
 
 STATIC_DIR = Path(__file__).parent / "static"
 CONNECT_POLL_INTERVAL = 1.0
@@ -70,6 +72,10 @@ class DashboardServer:
         self._run_status = "idle"  # idle | waiting_for_file | running | done | error
         self._run_log: list[str] = []
         self._run_result: dict | None = None
+        # The live recorder for the run in progress. The dashboard polls it for
+        # step progress, so the UI shows "step 4 of 9" instead of asking the
+        # user to read a scrolling log.
+        self._run_metrics: RunMetrics | None = None
         self._last_captured_generation = -1
 
     # -- connection watcher: builds the gallery over time, unattended -------
@@ -77,21 +83,60 @@ class DashboardServer:
     def watch_connections(self) -> None:
         """Whenever a new plugin connection reports a file, snapshot it into
         the registry. Runs for the process's lifetime on its own thread.
+
+        Nothing in here may be allowed to escape. A screenshot that fails --
+        the plugin closed between connecting and being asked, Figma is in Dev
+        Mode -- used to kill this thread outright, after which the gallery
+        silently stopped updating for the rest of the process with no error
+        anywhere the user could see.
         """
         while True:
-            generation = self.bridge.connection_generation
-            identity = self.bridge.current_file
-            if generation != self._last_captured_generation and identity and identity.file_key:
-                self._capture(identity.file_key, identity.file_name)
-                self._last_captured_generation = generation
+            try:
+                generation = self.bridge.connection_generation
+                identity = self.bridge.current_file
+                if generation != self._last_captured_generation and identity and identity.file_key:
+                    self._capture(identity.file_key, identity.file_name)
+                    # Only mark it done once it actually worked, so a transient
+                    # failure is retried on the next tick rather than skipped.
+                    self._last_captured_generation = generation
+            except Exception as exc:
+                logging.getLogger(__name__).info("Could not snapshot the connected file: %s", exc)
             time.sleep(CONNECT_POLL_INTERVAL)
 
     def _capture(self, file_key: str, file_name: str) -> None:
+        """Store a screenshot of the connected canvas as `file_key`'s thumbnail.
+
+        The screenshot always comes from whichever file the plugin is in RIGHT
+        NOW, while `file_key` is the file we are about to file it under. Those
+        are usually the same and occasionally not: the user switches file in
+        Figma during a run, or the plugin reconnects between the caller reading
+        the identity and this call. Filing it regardless is how one design's
+        picture ended up on another design's card, so the identity is checked
+        again AFTER the render and a mismatch is thrown away.
+        """
+        if not self._connected_to(file_key):
+            return
         shot = get_screenshot(self.bridge)
+        if not self._connected_to(file_key):
+            return  # the plugin moved to another file while we were rendering
         thumbnail = shot["image_base64"] if shot["ok"] else None
+        previous = self.registry.get(file_key)
         self.registry.upsert(
-            FileEntry(file_key=file_key, file_name=file_name, thumbnail_base64=thumbnail, last_seen=_now())
+            FileEntry(
+                file_key=file_key,
+                file_name=file_name,
+                # A failed screenshot is not evidence the design is gone. Keep
+                # the last good picture rather than blanking the card -- upsert
+                # replaces the whole entry, so writing None here erased it.
+                thumbnail_base64=thumbnail or (previous.thumbnail_base64 if previous else None),
+                last_seen=_now(),
+            )
         )
+
+    def _connected_to(self, file_key: str) -> bool:
+        """Is the plugin, right now, in the file we think it is?"""
+        identity = self.bridge.current_file
+        return identity is not None and identity.file_key == file_key
 
     # -- run orchestration ---------------------------------------------------
 
@@ -117,11 +162,23 @@ class DashboardServer:
 
     def _run_worker(self, file_key: str, file_name: str, instruction: str) -> None:
         started_at = _now()
-        if not self._wait_for_file(file_key):
+        run_metrics = RunMetrics()
+        with self._lock:
+            self._run_metrics = run_metrics
+
+        # Time spent waiting for Figma is not the agent being slow, but it
+        # dominates wall clock and gets blamed on the agent without this.
+        waiting_since = time.monotonic()
+        connected = self._wait_for_file(file_key)
+        run_metrics.plugin_wait_seconds = time.monotonic() - waiting_since
+        if not connected:
+            timeout_message = f"Timed out waiting for '{file_name}' to connect."
             with self._lock:
                 self._run_status = "error"
-                self._run_log.append(f"Timed out waiting for '{file_name}' to connect.")
-            self._record_history(file_key, file_name, instruction, started_at, None)
+                self._run_log.append(timeout_message)
+            self._record_history(
+                file_key, file_name, instruction, started_at, None, error=timeout_message
+            )
             return
 
         with self._lock:
@@ -150,6 +207,7 @@ class DashboardServer:
                 int(prefs["max_steps"]),
                 visual_gate=bool(prefs["visual_gate"]),
                 critic_llm=build_critic_client(settings),
+                run_metrics=run_metrics,
             )
             # Best-effort: the design is already built, so a failed thumbnail
             # refresh must not report the whole run as crashed and throw the
@@ -160,27 +218,35 @@ class DashboardServer:
                 logger.info("Could not refresh the file thumbnail: %s", exc)
             with self._lock:
                 self._run_status = "done"
-                self._run_result = {
-                    "success": result.success,
-                    "created_node_count": len(result.created_node_ids),
-                    "failed_steps": result.failed_steps,
-                    "warnings": result.warnings,
-                    "layout_defects": result.layout_defects,
-                    "final_screenshot_base64": result.final_screenshot_base64,
-                }
+                self._run_result = _result_payload(result)
             self._record_history(file_key, file_name, instruction, started_at, result)
         except Exception as exc:  # the UI must hear about this, not spin forever
             with self._lock:
                 self._run_status = "error"
                 self._run_log.append(f"Run crashed: {exc}")
-            self._record_history(file_key, file_name, instruction, started_at, None)
+            self._record_history(
+                file_key, file_name, instruction, started_at, None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         finally:
             logger.removeHandler(handler)
             logger.setLevel(previous_level)
 
-    def _record_history(self, file_key, file_name, instruction, started_at, result) -> None:
-        """A run that failed is still worth remembering -- that's the point of a log."""
+    def _record_history(
+        self, file_key, file_name, instruction, started_at, result, error: str = ""
+    ) -> None:
+        """A run that failed is still worth remembering -- that's the point of a log.
+
+        Records what the run DID, not just that it happened: how long it took,
+        how much of the instruction it satisfied, what was left wrong. A row
+        reading "Success - 0 nodes" is a log entry nobody can act on.
+        """
         try:
+            metrics = getattr(result, "metrics", None) or {} if result is not None else {}
+            requirements_met = len(getattr(result, "requirements_met", []) or []) if result else 0
+            requirements_missing = (
+                len(getattr(result, "requirements_missing", []) or []) if result else 0
+            )
             self.history.add(
                 HistoryEntry(
                     id=uuid.uuid4().hex[:12],
@@ -194,6 +260,12 @@ class DashboardServer:
                     started_at=started_at,
                     finished_at=_now(),
                     thumbnail_base64=(result.final_screenshot_base64 if result is not None else None),
+                    duration_seconds=float(metrics.get("elapsed_seconds") or 0.0),
+                    section_count=int(metrics.get("steps_completed") or 0),
+                    requirements_met=requirements_met,
+                    requirements_total=requirements_met + requirements_missing,
+                    layout_defect_count=len(getattr(result, "layout_defects", []) or []) if result else 0,
+                    error=error,
                 )
             )
         except Exception as exc:  # history must never break a run
@@ -207,6 +279,55 @@ class DashboardServer:
                 return True
             time.sleep(CONNECT_POLL_INTERVAL)
         return False
+
+    # -- removing a file from the gallery -------------------------------------
+
+    def forget_file(self, file_key: str, clear_canvas: bool = False) -> tuple[bool, str]:
+        """Drop a file from the gallery, optionally emptying its canvas first.
+
+        There is deliberately no "delete the Figma file" here, because no such
+        operation exists: a plugin runs INSIDE a file and the Plugin API has no
+        `deleteFile` (checked against the real typings, and `figma.fileKey` is
+        read-only). Figma's REST API has no delete-file endpoint either. The two
+        things that ARE possible are offered instead, and named honestly.
+        """
+        with self._lock:
+            if self._run_status in ("waiting_for_file", "running"):
+                return False, "A run is in progress. Wait for it to finish first."
+
+        entry = self.registry.get(file_key)
+        if entry is None:
+            return False, "That file is not in the gallery."
+
+        message = f"Removed '{entry.file_name}' from the gallery."
+        if clear_canvas:
+            ok, detail = self.clear_canvas(file_key)
+            if not ok:
+                return False, detail
+            message = f"{detail} {message}"
+
+        self.registry.remove(file_key)
+        return True, message
+
+    def clear_canvas(self, file_key: str) -> tuple[bool, str]:
+        """Empty the current page of the connected file. Destructive.
+
+        Guarded by the same identity check the thumbnail capture uses: the
+        script always runs in whichever file the plugin is in RIGHT NOW, so
+        without re-checking, clicking delete on one card could wipe a different
+        design entirely.
+        """
+        if not self._connected_to(file_key):
+            return False, (
+                "That file is not open with the plugin running, so its canvas cannot "
+                "be touched. Open it in Figma Desktop and try again."
+            )
+        result = execute_figma_js(self.bridge, scaffold.build_clear_page_script())
+        if not result["ok"]:
+            return False, f"Could not clear the canvas: {result['error']}"
+        payload = result.get("result") or {}
+        removed = int(payload.get("removed") or 0)
+        return True, f"Deleted {removed} top-level layer(s) from the canvas."
 
     # -- read-only snapshots for the API --------------------------------------
 
@@ -235,7 +356,23 @@ class DashboardServer:
                 ),
                 "plugin_connected": self.bridge.is_connected,
                 "model_configured": self.settings_store.effective().is_model_configured,
+                "metrics": self._live_metrics(),
             }
+
+    def _live_metrics(self) -> dict | None:
+        """A snapshot of the run in progress, for the progress display.
+
+        Read from the HTTP thread while the run thread is writing, so a torn
+        read is possible in principle -- and a status endpoint that 500s
+        because a counter moved would be a far worse bug than a progress bar
+        that skips a frame.
+        """
+        if self._run_metrics is None:
+            return None
+        try:
+            return self._run_metrics.snapshot()
+        except Exception:
+            return None
 
     # -- settings + setup ------------------------------------------------------
 
@@ -251,22 +388,62 @@ class DashboardServer:
             "configured": s.is_model_configured,
             "bridge_url": f"ws://{s.bridge_host}:{s.bridge_port}",
             "prefs": self.settings_store.prefs(),
+            # The UI renders its inputs from this rather than hardcoding bounds
+            # in HTML, so the limits it enforces are the ones the store applies.
+            "prefs_schema": self.settings_store.schema(),
         }
 
     def history_snapshot(self) -> list[dict]:
-        return [e.summary() for e in self.history.list_entries()]
+        rows = [e.summary() for e in self.history.list_entries()]
+        return self._fill_missing_thumbnails(rows)
+
+    # Only the newest few runs keep their own screenshot (web/history.py caps it,
+    # because a full-page PNG dwarfs the record it belongs to). Borrowing the
+    # file's gallery thumbnail for the rest is bounded by the same reasoning:
+    # enough rows to look like a log of real designs, not so many that opening
+    # the tab ships megabytes of duplicated images.
+    THUMBNAIL_FALLBACK_LIMIT = 6
+
+    def _fill_missing_thumbnails(self, rows: list[dict]) -> list[dict]:
+        """Show the file a run built in, when the run kept no screenshot itself.
+
+        Flagged with `thumbnail_is_file` so the UI can be honest about it: this
+        is the file as it looks NOW, not a picture of that particular run.
+        """
+        borrowed = 0
+        by_key: dict[str, str | None] = {}
+        for row in rows:
+            if row.get("thumbnail_base64") or borrowed >= self.THUMBNAIL_FALLBACK_LIMIT:
+                continue
+            key = row.get("file_key")
+            if key not in by_key:
+                entry = self.registry.get(key) if key else None
+                by_key[key] = entry.thumbnail_base64 if entry else None
+            if by_key[key]:
+                row["thumbnail_base64"] = by_key[key]
+                row["thumbnail_is_file"] = True
+                borrowed += 1
+        return rows
 
     def update_prefs(self, values: dict) -> dict:
-        self.settings_store.update_prefs(values)
-        return self.settings_snapshot()
+        """Apply preferences and report anything we would not accept.
+
+        The errors ride back on the normal snapshot so the panel can show them
+        next to the field, instead of silently reverting the input."""
+        update = self.settings_store.update_prefs(values)
+        snapshot = self.settings_snapshot()
+        snapshot["pref_errors"] = update.errors
+        return snapshot
 
     def update_settings(self, values: dict) -> dict:
         # An ABSENT field means "leave it alone"; an explicit empty string
         # means "clear it". Without that distinction a partial update (the UI
         # omits the API key when the user leaves it blank) would silently wipe
         # the fields it didn't mention.
-        editable = ("model_base_url", "model_api_key", "model_name")
-        self.settings_store.update({k: values[k] for k in editable if k in values})
+        #
+        # The editable set is imported, not restated: two copies of this tuple
+        # meant adding a field to the store left the API quietly refusing it.
+        self.settings_store.update({k: values[k] for k in EDITABLE if k in values})
         return self.settings_snapshot()
 
     def test_model_connection(self) -> dict:
@@ -298,6 +475,31 @@ class DashboardServer:
                 self.bridge.current_file.file_name if self.bridge.current_file else None
             ),
         }
+
+
+def _result_payload(result) -> dict:
+    """The finished run, as the dashboard's JSON.
+
+    The reporting fields are read defensively. They are all real attributes of
+    RunResult, but this dict is built AFTER the design exists on the canvas, and
+    it sits inside the worker's `except Exception` -- so one missing attribute
+    here used to turn a completed design into "Run crashed" and throw the whole
+    result away. Losing real work to a missing statistic is not a trade worth
+    making.
+    """
+    optional = (
+        "layout_defects", "design_notes", "requirements_met", "requirements_missing", "screens",
+    )
+    payload = {
+        "success": result.success,
+        "created_node_count": len(result.created_node_ids),
+        "failed_steps": result.failed_steps,
+        "warnings": result.warnings,
+        "metrics": getattr(result, "metrics", {}) or {},
+        "final_screenshot_base64": result.final_screenshot_base64,
+    }
+    payload.update({name: list(getattr(result, name, []) or []) for name in optional})
+    return payload
 
 
 def _make_handler(dashboard: DashboardServer) -> type[BaseHTTPRequestHandler]:
@@ -359,6 +561,8 @@ def _make_handler(dashboard: DashboardServer) -> type[BaseHTTPRequestHandler]:
                 payload = self._read_json()
                 if payload is not None:
                     self._send_json(200, dashboard.update_prefs(payload))
+            elif self.path == "/api/files/delete":
+                self._handle_delete_file()
             elif self.path == "/api/history/clear":
                 dashboard.history.clear()
                 self._send_json(200, {"ok": True})
@@ -376,6 +580,17 @@ def _make_handler(dashboard: DashboardServer) -> type[BaseHTTPRequestHandler]:
                 return
             ok, message = dashboard.start_run(file_key, instruction)
             self._send_json(202 if ok else 409, {"ok": ok, "message": message})
+
+        def _handle_delete_file(self) -> None:
+            payload = self._read_json()
+            if payload is None:
+                return
+            file_key = payload.get("file_key")
+            if not file_key:
+                self._send_json(400, {"error": "file_key is required"})
+                return
+            ok, message = dashboard.forget_file(file_key, bool(payload.get("clear_canvas")))
+            self._send_json(200 if ok else 409, {"ok": ok, "message": message})
 
         def _handle_settings(self) -> None:
             payload = self._read_json()

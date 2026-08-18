@@ -4,6 +4,40 @@ These are the traps that cause most generated-script failures. Each section is
 a standalone chunk `knowledge/index.py` can retrieve by keyword match against
 the current step, so keep headings and keywords literal and specific.
 
+## A PAGE is a workspace, a FRAME is a screen
+
+This is Figma's structure, and getting it wrong produces designs that overlap.
+
+- A **page** (`figma.currentPage`) is a workspace for a project. You do not
+  create one per screen, and you should not create pages at all.
+- A **frame** is a screen. Several screens live SIDE BY SIDE as sibling frames
+  on the same page.
+- A **section inside a screen** (nav bar, hero, sidebar, footer) is a child
+  frame of that screen's frame -- not a top-level frame of its own.
+
+```
+PAGE: Website Design          <- one workspace
+├── FRAME: Login              <- a screen
+├── FRAME: Sign Up            <- a screen, beside it
+└── FRAME: Dashboard          <- a screen, beside that
+      ├── FRAME: Sidebar      <- a SECTION inside the dashboard
+      └── FRAME: Content      <- another section
+```
+
+The harness has already created one frame per screen and hands you the id of
+the one you are building. So:
+
+- **Never create a top-level frame.** Anything you create is appended into the
+  frame id you were given, or into a node you created inside it.
+- **Never touch another screen's frame.** They are siblings on the same page;
+  appending to the wrong one puts a sign-in form inside a dashboard.
+- **Never call `figma.createPage()`** or switch pages. Everything belongs on
+  the current page.
+
+A loose frame that is never appended to a parent lands at (0, 0) and sits on
+top of whatever is already there -- which is how a run ends up with two
+designs overlapping.
+
 ## Colors are 0-1, not 0-255
 
 `{r: 1, g: 0, b: 0}` is red. `SolidPaint.color` takes only `{r, g, b}` --

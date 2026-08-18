@@ -45,6 +45,20 @@ class Registry:
         data = self._read().get(file_key)
         return FileEntry(**data) if data else None
 
+    def remove(self, file_key: str) -> bool:
+        """Forget a file. Returns False if it was not there.
+
+        Local bookkeeping only -- this gallery is built from files the plugin
+        has connected to, so a removed file reappears the next time you open it
+        with the plugin running. Nothing in Figma is touched.
+        """
+        data = self._read()
+        if file_key not in data:
+            return False
+        del data[file_key]
+        self._write(data)
+        return True
+
     def upsert(self, entry: FileEntry) -> None:
         data = self._read()
         data[entry.file_key] = asdict(entry)

@@ -23,6 +23,8 @@ from openai import (
 )
 from openai.types.chat import ChatCompletionMessage
 
+from agent import metrics
+
 logger = logging.getLogger(__name__)
 
 # A hosted endpoint blipping is not a bug in the design agent. A single 500 from
@@ -42,8 +44,22 @@ class ModelClient:
         self._model = model
 
     def complete(self, messages: list[dict], tools: list[dict] | None = None) -> Any:
-        """Return the assistant message (which may contain tool calls)."""
-        resp = self._create_with_retry(messages, tools)
+        """Return the assistant message (which may contain tool calls).
+
+        Timed and counted: model calls are the single most expensive thing a run
+        does (~50 per design), so "did that change help" is unanswerable without
+        this number. Recording here rather than at the call sites means every
+        caller -- loop, planner, critic -- is measured by construction.
+        """
+        started = time.monotonic()
+        try:
+            resp = self._create_with_retry(messages, tools)
+        except Exception:
+            metrics.current().observe_model(time.monotonic() - started, ok=False)
+            raise
+        metrics.current().observe_model(time.monotonic() - started)
+        _record_usage(resp)
+
         message: ChatCompletionMessage = resp.choices[0].message
         if tools and not message.tool_calls:
             message = _recover_tool_call_from_content(message, tools)
@@ -72,6 +88,7 @@ class ModelClient:
                         type(exc).__name__,
                     )
                     raise
+                metrics.current().model_transient_retries += 1
                 delay = BACKOFF_SECONDS * (2**attempt)
                 logger.info(
                     "Model endpoint returned %s; retrying in %.0fs (%d/%d).",
@@ -82,6 +99,22 @@ class ModelClient:
                 )
                 time.sleep(delay)
         raise RuntimeError("unreachable")  # pragma: no cover
+
+
+def _record_usage(response) -> None:
+    """Token counts, when the endpoint reports them.
+
+    Not every OpenAI-compatible server fills `usage` in, so this is
+    best-effort by design -- a missing field must never take a run down over a
+    statistic.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    metrics.current().observe_tokens(
+        int(getattr(usage, "prompt_tokens", 0) or 0),
+        int(getattr(usage, "completion_tokens", 0) or 0),
+    )
 
 
 def build_critic_client(settings) -> "ModelClient | None":

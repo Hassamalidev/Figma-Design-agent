@@ -8,10 +8,15 @@ overrides live in their own git-ignored file so a shared .env stays clean.
 from __future__ import annotations
 
 import json
+import logging
+import os
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 
 from config import Settings, env_configured_keys, load_settings
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_RUNTIME_PATH = Path(__file__).parent / "runtime_settings.json"
 
@@ -21,15 +26,105 @@ EDITABLE = ("model_base_url", "model_api_key", "model_name")
 
 # Run preferences, also editable from the UI. Each one changes real behaviour --
 # nothing here is a decorative switch.
-PREF_DEFAULTS: dict[str, object] = {
-    "max_retries": 3,      # attempts per plan step
-    "max_steps": 40,       # hard cap on plan length
-    "visual_gate": True,   # run the layout gate after each visual step
-    "auto_select": True,   # preselect whichever file is currently connected
+#
+# Every preference is declared ONCE, here, with its type, its bounds and where
+# its default comes from. The dashboard renders its inputs from this same
+# declaration (`schema()` below), so the UI's min/max, the value the storage
+# layer will accept, and the value the run actually uses cannot drift apart.
+# They previously could, and did: the numeric inputs advertised max="100" while
+# the store accepted any integer at all.
+
+
+class PrefError(ValueError):
+    """A preference value the UI sent that we will not store. The message is
+    shown to the user -- silently dropping it left them staring at an input
+    that would not keep what they typed."""
+
+
+@dataclass(frozen=True)
+class BoolPref:
+    """A toggle. `default` applies until the user changes it."""
+
+    default: bool
+
+    kind = "bool"
+
+    def coerce(self, key: str, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("true", "1", "yes", "on"):
+                return True
+            if lowered in ("false", "0", "no", "off", ""):
+                return False
+        raise PrefError(f"{key}: expected true or false, got {value!r}")
+
+
+@dataclass(frozen=True)
+class IntPref:
+    """A bounded whole number whose default comes from the .env `Settings`.
+
+    Taking the default from Settings is the point: `.env` MAX_RETRIES=5 used to
+    apply to the CLI and be ignored by the dashboard, which ran 3 and displayed
+    3, from the same configuration file.
+    """
+
+    settings_field: str
+    minimum: int
+    maximum: int
+
+    kind = "int"
+
+    def coerce(self, key: str, value: object) -> int:
+        # bool is a subclass of int in Python, so `int(True)` is a silent 1 --
+        # a toggle posted to a numeric field became "1 retry" with no complaint.
+        if isinstance(value, bool):
+            raise PrefError(f"{key}: expected a number, got a true/false value")
+        try:
+            number = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise PrefError(f"{key}: expected a whole number, got {value!r}") from None
+        if not self.minimum <= number <= self.maximum:
+            raise PrefError(
+                f"{key}: must be between {self.minimum} and {self.maximum} "
+                f"(got {number}, using {min(max(number, self.minimum), self.maximum)})"
+            )
+        return number
+
+    def clamp(self, number: int) -> int:
+        return min(max(number, self.minimum), self.maximum)
+
+
+PREF_SPECS: dict[str, BoolPref | IntPref] = {
+    # attempts per plan step -- the upper bound matches the dashboard input
+    "max_retries": IntPref(settings_field="max_retries", minimum=1, maximum=10),
+    # hard cap on plan length
+    "max_steps": IntPref(settings_field="max_steps", minimum=1, maximum=100),
+    # run the layout gate after each visual step
+    "visual_gate": BoolPref(default=True),
+    # preselect whichever file is currently connected
+    "auto_select": BoolPref(default=True),
 }
-INT_PREFS = ("max_retries", "max_steps")
-BOOL_PREFS = ("visual_gate", "auto_select")
-PREFS = tuple(PREF_DEFAULTS)
+PREFS = tuple(PREF_SPECS)
+INT_PREFS = tuple(k for k, s in PREF_SPECS.items() if isinstance(s, IntPref))
+BOOL_PREFS = tuple(k for k, s in PREF_SPECS.items() if isinstance(s, BoolPref))
+
+
+@dataclass
+class PrefUpdate:
+    """The effective preferences after an update, plus anything we refused.
+
+    Errors are returned rather than swallowed so the dashboard can say why a
+    value did not stick. An out-of-range number is still applied (clamped) --
+    refusing it outright would leave the user with no way to fix it from a
+    number input that had already accepted their keystrokes.
+    """
+
+    prefs: dict[str, object]
+    errors: list[str] = dc_field(default_factory=list)
 
 
 @dataclass
@@ -83,37 +178,98 @@ class SettingsStore:
 
     # -- run preferences -------------------------------------------------
 
+    def defaults(self) -> dict[str, object]:
+        """What each preference is before the user touches it.
+
+        Numeric defaults come from `.env` via Settings, so MAX_RETRIES=5 means
+        five retries in the CLI *and* in the dashboard, and the dashboard shows
+        5. Previously the dashboard hardcoded 3 and quietly ignored the file.
+        """
+        settings = self.effective()
+        return {
+            key: (
+                getattr(settings, spec.settings_field)
+                if isinstance(spec, IntPref)
+                else spec.default
+            )
+            for key, spec in PREF_SPECS.items()
+        }
+
     def prefs(self) -> dict[str, object]:
-        """Effective preferences: stored values over defaults, type-coerced."""
+        """Effective preferences: stored values over defaults, type-coerced.
+
+        Read and write use the SAME coercion, so a value can only round-trip to
+        itself. They used to differ -- writes went through `bool(value)` and
+        reads through `str(value).lower() == "true"` -- which meant a stored `1`
+        was written as True and read back as False.
+        """
+        result = self.defaults()
         stored = self._raw()
-        result = dict(PREF_DEFAULTS)
-        for key in PREFS:
+        for key, spec in PREF_SPECS.items():
             if key not in stored:
                 continue
-            value = stored[key]
-            if key in INT_PREFS:
-                try:
-                    result[key] = max(1, int(value))
-                except (TypeError, ValueError):
-                    continue
-            elif key in BOOL_PREFS:
-                result[key] = value if isinstance(value, bool) else str(value).lower() == "true"
+            try:
+                result[key] = spec.coerce(key, stored[key])
+            except PrefError as exc:
+                # A corrupt or hand-edited file must not break the dashboard.
+                logger.info("Ignoring stored preference (%s); using the default.", exc)
+                if isinstance(spec, IntPref):
+                    # Out of range is still the user's intent, so clamp it.
+                    # Unparseable is not, so leave the default in place --
+                    # writing the None back would blank the preference.
+                    clamped = self._clamped_or_default(key, spec, stored[key])
+                    if clamped is not None:
+                        result[key] = clamped
         return result
 
-    def update_prefs(self, values: dict) -> dict[str, object]:
+    @staticmethod
+    def _clamped_or_default(key: str, spec: "IntPref", value: object) -> object | None:
+        """An out-of-range stored number is still the user's intent -- clamp it."""
+        try:
+            return spec.clamp(int(str(value).strip()))
+        except (TypeError, ValueError):
+            return None
+
+    def update_prefs(self, values: dict) -> PrefUpdate:
+        """Validate, store and report. Nothing is dropped in silence.
+
+        Returns the effective preferences plus the reason for anything we would
+        not take at face value, so the dashboard can show it instead of leaving
+        the user to wonder why their input reverted.
+        """
         raw = self._raw()
-        for key in PREFS:
+        errors: list[str] = []
+        for key, spec in PREF_SPECS.items():
             if key not in values:
-                continue
-            if key in INT_PREFS:
-                try:
-                    raw[key] = max(1, int(values[key]))
-                except (TypeError, ValueError):
-                    continue
-            elif key in BOOL_PREFS:
-                raw[key] = bool(values[key])
+                continue  # absent means "leave it alone"
+            try:
+                raw[key] = spec.coerce(key, values[key])
+            except PrefError as exc:
+                errors.append(str(exc))
+                # Out of range is a bounds problem, not a type problem: keep the
+                # user's intent by clamping. Anything unparseable is discarded.
+                if isinstance(spec, IntPref):
+                    clamped = self._clamped_or_default(key, spec, values[key])
+                    if clamped is not None:
+                        raw[key] = clamped
         self._write_raw(raw)
-        return self.prefs()
+        return PrefUpdate(prefs=self.prefs(), errors=errors)
+
+    def schema(self) -> list[dict]:
+        """How the UI should render each preference. One declaration, one truth.
+
+        The dashboard previously hardcoded its own min/max in HTML attributes,
+        which is a second place for the bounds to live and a second place for
+        them to be wrong.
+        """
+        defaults = self.defaults()
+        rows = []
+        for key, spec in PREF_SPECS.items():
+            row = {"key": key, "kind": spec.kind, "default": defaults[key]}
+            if isinstance(spec, IntPref):
+                row["minimum"], row["maximum"] = spec.minimum, spec.maximum
+            rows.append(row)
+        return rows
 
     # -- storage ---------------------------------------------------------
 
@@ -140,8 +296,13 @@ class SettingsStore:
         self._write_raw(raw)
 
     def _write_raw(self, raw: dict) -> None:
+        """Write via a temp file + rename, so an interrupted save cannot leave
+        a half-written JSON file that reads back as "no settings at all" and
+        loses the user's API key."""
         self._runtime_path.parent.mkdir(parents=True, exist_ok=True)
-        self._runtime_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        temp_path = self._runtime_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        os.replace(temp_path, self._runtime_path)  # atomic on POSIX and Windows
 
 
 def mask(secret: str) -> str:

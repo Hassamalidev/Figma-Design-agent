@@ -108,6 +108,44 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
 ]
+# ---- which tools a step may use -------------------------------------------
+#
+# A section step gets `render_ui` and the read-only tools -- and NOT
+# `execute_figma_js`. This is CLAUDE.md rule 7 ("if it is mechanical, the
+# harness writes it") taken to its conclusion.
+#
+# The renderer already handles font loading, creation order, resize-before-
+# sizing-mode, append-before-FILL, style lookup and token colours. Yet in a
+# real 29-step run the model reached for `execute_figma_js` every single time
+# and lost steps to exactly those things:
+#
+#   in set_layoutSizingVertical: HUG can only be set on auto-layout frames
+#   in set_layoutSizingHorizontal: FILL can only be set on children of ...
+#   in appendChild: Reparenting would create a component inside a component
+#   counterAxisAlignItems ... received 'END'
+#   findAll callback crashed: TypeError: not a function
+#
+# Every one of those is impossible to express through `render_ui`. Telling the
+# model to prefer it did not work; removing the alternative does. Steps that
+# are not building a section keep the escape hatch.
+
+_READ_TOOLS = [t for t in TOOL_SCHEMAS if t["function"]["name"] in ("get_metadata", "get_screenshot")]
+_RENDER_TOOL = [t for t in TOOL_SCHEMAS if t["function"]["name"] == "render_ui"]
+_EXEC_TOOL = [t for t in TOOL_SCHEMAS if t["function"]["name"] == "execute_figma_js"]
+
+SECTION_TOOLS: list[dict[str, Any]] = _RENDER_TOOL + _READ_TOOLS
+ALL_TOOLS: list[dict[str, Any]] = TOOL_SCHEMAS
+
+
+def tools_for(section_step: bool) -> list[dict[str, Any]]:
+    """The tools this step is allowed to call.
+
+    Narrowing the toolset is a harness decision, so it lives here rather than
+    in the loop: the loop asks "is this a section?" and gets back a list.
+    """
+    return SECTION_TOOLS if section_step else ALL_TOOLS
+
+
 # `query_docs` is deliberately NOT offered as a tool. The whole gotchas corpus
 # is ~4k tokens and is inlined in the system prompt instead, and the loop
 # retrieves type signatures for each step automatically. As a tool it cost two
@@ -161,7 +199,12 @@ def _render_ui(arguments: dict[str, Any], bridge: Bridge, context: dict[str, Any
     if not parent_id:
         return _bad_spec("No parent frame is available for render_ui.")
     try:
-        code, _ = renderer.compile_spec(spec, parent_id, context.get("color_roles") or {})
+        code, _ = renderer.compile_spec(
+            spec,
+            parent_id,
+            context.get("color_roles") or {},
+            replace_ids=context.get("replace_ids"),
+        )
     except renderer.SpecError as exc:
         return _bad_spec(f"Invalid UI spec: {exc}")
     return execute_figma_js(bridge, code)

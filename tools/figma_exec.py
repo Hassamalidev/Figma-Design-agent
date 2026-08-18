@@ -12,6 +12,7 @@ from typing import Any
 
 from bridge.protocol import Request
 from bridge.server import Bridge, new_request_id
+from tools import bridge_io
 
 
 def execute_figma_js(bridge: Bridge, code: str, timeout: float = 30.0) -> dict[str, Any]:
@@ -23,5 +24,5 @@ def execute_figma_js(bridge: Bridge, code: str, timeout: float = 30.0) -> dict[s
     enough to fix the script.
     """
     request = Request(id=new_request_id(), type="exec", code=code)
-    response = bridge.send(request, timeout=timeout)
+    response = bridge_io.send(bridge, request, timeout)
     return {"ok": response.ok, "result": response.result, "error": response.error}

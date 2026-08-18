@@ -329,3 +329,150 @@ def test_a_short_narrow_label_is_not_flagged():
     )
 
     assert "vertical-text" not in {d.kind for d in critic.find_layout_defects(tree)}
+
+
+# ---- contrast: the defect geometry is structurally blind to ----------------
+
+
+def fill(hex_value: str) -> dict:
+    """A solid fill in the 0-1 form the Plugin API stores and the read returns."""
+    h = hex_value.lstrip("#")
+    return {c: int(h[i : i + 2], 16) / 255 for c, i in (("r", 0), ("g", 2), ("b", 4))}
+
+
+def test_invisible_text_is_caught_even_though_the_geometry_is_perfect():
+    """The exact failure CLAUDE.md 6a describes: right size, right place, unreadable.
+
+    Every existing check passes this tree -- the node has area, fits its parent,
+    overlaps nothing and holds real characters.
+    """
+    tree = frame(
+        name="Card", width=400, height=200, fill=fill("#FFFFFF"),
+        children=[text(id="9:1", name="Body", width=300, height=24, fill=fill("#F2F2F2"))],
+    )
+
+    assert "contrast" in kinds(tree)
+    assert critic.find_layout_defects(tree) != []
+
+
+def test_readable_text_reports_nothing():
+    tree = frame(
+        name="Card", width=400, height=200, fill=fill("#FFFFFF"), tokenBacked=True,
+        children=[text(id="9:2", width=300, height=24, fill=fill("#101828"),
+                       tokenBacked=True)],
+    )
+
+    assert critic.find_layout_defects(tree) == []
+    assert critic.find_design_defects(tree) == []
+
+
+def test_a_near_miss_on_AA_is_advisory_not_blocking():
+    """Legible but non-compliant must not burn a step's retries -- and must not
+    end up replacing a working section with a TODO placeholder."""
+    # ~3.9:1 against white: below AA (4.5) but far above unreadable (3.0).
+    tree = frame(
+        name="Card", width=400, height=200, fill=fill("#FFFFFF"),
+        children=[text(id="9:3", width=300, height=24, fill=fill("#949494"))],
+    )
+
+    assert "contrast" not in kinds(tree)
+    assert "contrast-aa" in {d.kind for d in critic.find_design_defects(tree)}
+
+
+def test_large_text_is_held_to_the_lower_wcag_bar():
+    """3.4:1 fails AA for body copy but passes it for a 48px display heading."""
+    grey = fill("#949494")
+    heading = frame(
+        name="Card", width=400, height=200, fill=fill("#FFFFFF"),
+        children=[text(id="9:4", width=300, height=56, fontSize=48, fill=grey)],
+    )
+    body = frame(
+        name="Card", width=400, height=200, fill=fill("#FFFFFF"),
+        children=[text(id="9:5", width=300, height=24, fontSize=16, fill=grey)],
+    )
+
+    assert "contrast-aa" not in {d.kind for d in critic.find_design_defects(heading)}
+    assert "contrast-aa" in {d.kind for d in critic.find_design_defects(body)}
+
+
+def test_background_is_inherited_from_the_nearest_filled_ancestor():
+    """A transparent wrapper between the text and the fill must not hide the defect."""
+    tree = frame(
+        name="Section", width=400, height=200, fill=fill("#101828"),
+        children=[
+            frame(id="9:6", name="Wrapper", width=400, height=100, fill=None,
+                  children=[text(id="9:7", width=300, height=24, fill=fill("#1A2438"))]),
+        ],
+    )
+
+    assert "contrast" in kinds(tree)
+
+
+def test_text_with_no_resolvable_background_is_left_alone():
+    """Over an image or an unfilled page there is no single background colour.
+    Inventing one would produce confident nonsense."""
+    tree = frame(
+        name="Section", width=400, height=200, fill=None,
+        children=[text(id="9:8", width=300, height=24, fill=fill("#FFFFFF"))],
+    )
+
+    assert "contrast" not in kinds(tree)
+    assert "contrast-aa" not in {d.kind for d in critic.find_design_defects(tree)}
+
+
+# ---- design-system adherence (advisory, never gating) ---------------------
+
+
+def test_off_scale_spacing_is_reported_but_never_blocks():
+    tree = frame(
+        name="Section", layoutMode="VERTICAL", itemSpacing=17, padding=[13, 13, 13, 13],
+        children=[text(id="8:1", width=200), text(id="8:2", y=40, width=200)],
+    )
+
+    assert "off-scale-spacing" in {d.kind for d in critic.find_design_defects(tree)}
+    assert "off-scale-spacing" not in kinds(tree)
+    assert all(d.advisory for d in critic.find_design_defects(tree))
+
+
+def test_on_scale_spacing_is_clean():
+    tree = frame(
+        name="Section", layoutMode="VERTICAL", itemSpacing=24, padding=[32, 80, 32, 80],
+        children=[text(id="8:3", width=200), text(id="8:4", y=40, width=200)],
+    )
+
+    assert "off-scale-spacing" not in {d.kind for d in critic.find_design_defects(tree)}
+
+
+def test_a_font_size_off_the_ramp_is_reported():
+    tree = frame(children=[text(id="8:5", fontSize=17, width=200)])
+
+    assert "off-ramp-type" in {d.kind for d in critic.find_design_defects(tree)}
+
+
+def test_a_font_size_on_the_ramp_is_clean():
+    tree = frame(children=[text(id="8:6", fontSize=16, width=200)])
+
+    assert "off-ramp-type" not in {d.kind for d in critic.find_design_defects(tree)}
+
+
+def test_a_hardcoded_fill_is_reported_and_a_token_backed_one_is_not():
+    hardcoded = frame(id="8:7", name="Band", width=200, height=80, fill=fill("#123456"))
+    tokenised = frame(id="8:8", name="Band", width=200, height=80,
+                      fill=fill("#123456"), tokenBacked=True)
+
+    assert "untokenised-fill" in {d.kind for d in critic.find_design_defects(hardcoded)}
+    assert "untokenised-fill" not in {d.kind for d in critic.find_design_defects(tokenised)}
+
+
+def test_tiny_nodes_are_exempt_from_the_token_audit():
+    """An icon or a divider with a one-off colour is normal, not a violation."""
+    tree = frame(id="8:9", name="Dot", width=8, height=8, fill=fill("#123456"))
+
+    assert "untokenised-fill" not in {d.kind for d in critic.find_design_defects(tree)}
+
+
+def test_the_layout_script_compiles_as_the_plugin_evaluates_it():
+    """It grew fill/token/spacing readers; a syntax slip must fail here, not mid-run."""
+    from tests.test_scaffold import compiles_as_async_body
+
+    assert compiles_as_async_body(critic.layout_script("1:23"))

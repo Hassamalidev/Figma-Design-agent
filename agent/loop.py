@@ -8,16 +8,17 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from agent import critic, planner, renderer, scaffold
+from agent import critic, metrics, planner, renderer, requirements, scaffold
 from agent.llm import ModelClient
+from agent.metrics import RunMetrics
 from agent.prompts import step_user_message, system_prompt
-from agent.state import RunResult, RunState, StepResult
+from agent.state import PlanStep, RunResult, RunState, Screen, StepResult
 from bridge.server import Bridge
 from knowledge import index as knowledge_index
 from tools.docs import query_docs
 from tools.figma_exec import execute_figma_js
 from tools.figma_read import get_metadata, get_screenshot
-from tools.registry import TOOL_SCHEMAS, dispatch
+from tools.registry import dispatch, tools_for
 
 logger = logging.getLogger(__name__)
 
@@ -54,29 +55,6 @@ for (const f of fonts) {
 return { createdNodeIds: [], interStyles: styles };
 """
 
-# The root frame is written by the harness, not the model. It is the same
-# script every time, it is the single point every later step depends on, and
-# getting it wrong cascades: in one live run the model failed it three times
-# (trying to set FILL on a child of the PAGE, which is never legal), and all
-# six "append into root frame" steps then had no parent to append to.
-#
-# Note it deliberately uses primaryAxisSizingMode/counterAxisSizingMode rather
-# than layoutSizing*: those are the properties that work on a frame whose
-# parent (the page) is not auto-layout.
-ROOT_FRAME_SCRIPT = """\
-const frame = figma.createFrame();
-frame.name = {name};
-frame.resize({width}, 900);
-figma.currentPage.appendChild(frame);
-frame.x = {x}; frame.y = {y};
-frame.layoutMode = 'VERTICAL';
-frame.counterAxisSizingMode = 'FIXED';
-frame.primaryAxisSizingMode = 'AUTO';
-frame.itemSpacing = 0;
-frame.fills = [{{ type: 'SOLID', color: {{ r: 1, g: 1, b: 1 }} }}];
-return {{ createdNodeIds: [frame.id] }};
-"""
-
 # Gap left between an existing design and a newly created one, so a second run
 # never lands on top of the first.
 NEW_FRAME_GAP = 200
@@ -99,6 +77,29 @@ def run(
     max_steps: int,
     visual_gate: bool = True,
     critic_llm: ModelClient | None = None,
+    run_metrics: RunMetrics | None = None,
+) -> RunResult:
+    """Build the design, measuring what it cost.
+
+    `run_metrics` is optional and exists so a CALLER can hold the same recorder
+    the run writes into -- the dashboard polls it live for step progress. When
+    it is omitted a fresh one is created, so metrics are never conditional.
+    """
+    with metrics.recording(run_metrics) as measured:
+        result = _run(instruction, bridge, llm, max_retries, max_steps, visual_gate, critic_llm)
+    result.metrics = measured.snapshot()
+    logger.info("Run cost: %s", measured.summary())
+    return result
+
+
+def _run(
+    instruction: str,
+    bridge: Bridge,
+    llm: ModelClient,
+    max_retries: int,
+    max_steps: int,
+    visual_gate: bool,
+    critic_llm: ModelClient | None,
 ) -> RunResult:
     state = RunState(instruction=instruction)
     state.visual_gate_enabled = visual_gate
@@ -115,14 +116,21 @@ def run(
 
     state.enhanced_brief = planner.enhance_instruction(instruction, llm)  # fill in what's unspecified
 
-    create_root_frame(state, bridge)  # deterministic: every section needs this parent
+    # WHICH SCREENS, before anything is drawn. In Figma a page is a workspace
+    # and a frame is a screen, so "login and a dashboard" is two sibling frames
+    # side by side -- not two sections stacked into one frame.
+    state.screens = planner.plan_screens(instruction, state.enhanced_brief, llm)
+
+    create_screens(state, bridge)     # deterministic: every section needs this parent
     bootstrap_tokens(state, bridge)   # deterministic: the model never has to write these
 
-    state.plan = planner.make_plan(state.enhanced_brief, state, llm)[:max_steps]  # components -> composition
+    state.plan = plan_all_screens(state, llm, max_steps)  # components -> composition
 
     total = len(state.plan)
+    metrics.current().steps_planned = total
     for index, step in enumerate(state.plan, start=1):  # 3. one step at a time
-        logger.info("Step %d/%d: %s", index, total, step)
+        logger.info("Step %d/%d [%s]: %s", index, total, _screen_label(state, step), step.description)
+        metrics.current().start_step(step.description, index, total)
         run_step(step, state, bridge, llm, max_retries, index, total)
 
     logger.info("Final validation: screenshot + variable-binding audit...")
@@ -156,48 +164,137 @@ def discover_fonts(state: RunState, bridge: Bridge) -> None:
         logger.info("Inter styles available: %s", ", ".join(state.font_styles))
 
 
-def create_root_frame(state: RunState, bridge: Bridge) -> None:
-    """Reuse the page's existing root frame, or build a fresh one beside it.
+SCREEN_Y = 200  # every screen sits on the same baseline, so they read as a row
+
+# Below this a screen has no room for a real plan.
+MIN_STEPS_PER_SCREEN = 1
+# A screen is built by ONE render_ui call by default. More than this means the
+# plan has split one layout into overlapping parts -- which is how a dashboard
+# ended up with its sidebar built twice, once alone and once inside the shell.
+MAX_STEPS_PER_SCREEN = 3
+
+
+def create_screens(state: RunState, bridge: Bridge) -> None:
+    """Give every screen its own top-level FRAME, laid out left to right.
 
     Deterministic on purpose (CLAUDE.md: the harness is where quality comes
-    from). Every section step then has a guaranteed-valid auto-layout parent
+    from). Each section step then has a guaranteed-valid auto-layout parent
     whose id we hand it, which also makes FILL legal on its children.
 
-    Reuse matters as much as creation: re-running on a file you already
-    designed must CONTINUE that work, not stamp a second copy on top of it.
+    Two things this fixes that one shared root frame could not:
+
+    - **Screens stop landing on top of each other.** Positions are computed in
+      Python from what is already on the page, so a new screen is always clear
+      of existing work and of its siblings.
+    - **Re-running continues the right screen.** A screen is matched to an
+      existing frame BY NAME, so a second run extends "Login" rather than
+      stamping a fresh copy over whatever happened to be biggest.
     """
     width = _root_width(state.instruction)
-    existing = _find_reusable_root(state.existing_nodes, width)
+    x = _free_x(state.existing_nodes)
+    pending: list[dict] = []
 
-    if existing is not None:
-        state.root_frame_id = existing["id"]
-        state.root_is_existing = True
-        state.existing_sections = [c.get("name", "?") for c in existing.get("children") or []]
-        logger.info(
-            "Continuing in the existing frame %s (%s) with %d section(s): %s",
-            existing.get("name"),
-            existing["id"],
-            len(state.existing_sections),
-            ", ".join(state.existing_sections) or "none yet",
-        )
-        return
+    for screen in state.screens:
+        screen.width = width
+        existing = _match_existing_screen(state.existing_nodes, screen.name)
+        # With a single screen, fall back to the old "continue whatever design
+        # is here" behaviour -- a lone frame from an earlier run rarely happens
+        # to carry this run's screen name, and duplicating it is the worse error.
+        if existing is None and len(state.screens) == 1:
+            existing = _find_reusable_root(state.existing_nodes, width)
+        if existing is not None:
+            _adopt_existing(state, screen, existing)
+            continue
+        pending.append({"name": screen.name, "x": x, "y": SCREEN_Y, "width": width})
+        x += width + scaffold.SCREEN_GAP
 
-    script = ROOT_FRAME_SCRIPT.format(
-        name=json.dumps(_root_name(state.instruction)),
-        width=width,
-        x=_free_x(state.existing_nodes),  # never stack on top of existing work
-        y=200,
+    if pending:
+        _create_pending_screens(state, bridge, pending)
+
+    built = [s for s in state.screens if s.frame_id]
+    state.root_frame_id = built[0].frame_id if built else None
+    state.root_is_existing = bool(built and built[0].is_existing)
+    if not built:
+        state.warnings.append("No screen frame could be created, so nothing can be built.")
+
+
+def _adopt_existing(state: RunState, screen: Screen, node: dict) -> None:
+    """Continue an existing frame instead of stamping a second copy on it."""
+    screen.frame_id = node["id"]
+    screen.is_existing = True
+    for child in node.get("children") or []:
+        screen.record_section(str(child.get("name", "?")))
+    for name in screen.sections:
+        if name not in state.existing_sections:
+            state.existing_sections.append(name)
+    logger.info(
+        "Continuing '%s' in the existing frame %s with %d section(s): %s",
+        screen.name, node["id"], len(screen.sections),
+        ", ".join(screen.sections) or "none yet",
     )
-    result = execute_figma_js(bridge, script)
+
+
+def _create_pending_screens(state: RunState, bridge: Bridge, pending: list[dict]) -> None:
+    """One atomic script for every screen that still needs a frame."""
+    result = execute_figma_js(bridge, scaffold.build_screen_frames_script(pending))
     if not result["ok"]:
-        state.warnings.append(f"Could not create the root frame: {result['error']}")
-        logger.info("Root frame creation FAILED: %s", result["error"])
+        state.warnings.append(f"Could not create the screen frames: {result['error']}")
+        logger.info("Screen frame creation FAILED: %s", result["error"])
         return
-    ids = _normalize_node_ids((result.get("result") or {}).get("createdNodeIds"))
-    if ids:
-        state.root_frame_id = ids[0]
-        state.add_node_ids(ids)
-        logger.info("New root frame: %s (%dpx wide)", state.root_frame_id, width)
+
+    payload = result.get("result") or {}
+    by_name = {
+        str(made.get("name")): str(made.get("id"))
+        for made in payload.get("screens") or []
+        if isinstance(made, dict) and made.get("id")
+    }
+    for screen in state.screens:
+        if screen.frame_id is None and screen.name in by_name:
+            screen.frame_id = by_name[screen.name]
+            state.add_node_ids([screen.frame_id])
+            logger.info("Screen '%s': new frame %s (%dpx wide)", screen.name, screen.frame_id, screen.width)
+    for failure in payload.get("failedScreens") or []:
+        logger.info("Screen frame skipped -- %s", failure)
+        state.warnings.append(f"Screen frame could not be created: {failure}")
+
+
+def plan_all_screens(state: RunState, llm: ModelClient, max_steps: int) -> list[PlanStep]:
+    """One plan per screen, concatenated, each step tagged with its screen.
+
+    The step budget is SHARED OUT rather than applied to one combined plan:
+    truncating a single list to `max_steps` cut whole screens off the end, so
+    the last screen in a flow would exist as an empty frame and nothing else.
+    """
+    buildable = [i for i, screen in enumerate(state.screens) if screen.frame_id]
+    if not buildable:
+        return []
+
+    per_screen = min(
+        MAX_STEPS_PER_SCREEN, max(MIN_STEPS_PER_SCREEN, max_steps // len(buildable))
+    )
+    multi = len(buildable) > 1
+    steps: list[PlanStep] = []
+    for index in buildable:
+        screen = state.screens[index]
+        others = [s.name for j, s in enumerate(state.screens) if j != index]
+        described = planner.make_plan(
+            state.enhanced_brief,
+            state,
+            llm,
+            screen=screen.name if multi else "",
+            other_screens=others if multi else None,
+            existing_sections=screen.sections,
+        )[:per_screen]
+        steps.extend(PlanStep(description=text, screen_index=index) for text in described)
+
+    if len(steps) > max_steps:
+        logger.info("Plan trimmed from %d to the %d-step cap.", len(steps), max_steps)
+    return steps[:max_steps]
+
+
+def _screen_label(state: RunState, step: PlanStep) -> str:
+    screen = state.screen_at(step.screen_index)
+    return screen.name if screen else "design"
 
 
 def bootstrap_tokens(state: RunState, bridge: Bridge) -> None:
@@ -265,6 +362,24 @@ def describe_usable_palette(state: RunState, palette: list[tuple[str, str]]) -> 
         )
 
 
+def _match_existing_screen(nodes: list[dict], name: str) -> dict | None:
+    """The frame that already holds this screen, matched by NAME.
+
+    Name is the only identifier a screen has across runs, and it is what makes
+    a re-run extend "Login" instead of overwriting whichever frame happened to
+    be largest.
+    """
+    target = (name or "").strip().lower()
+    if not target:
+        return None
+    for node in nodes:
+        if node.get("type") != "FRAME" or node.get("layoutMode") not in ("VERTICAL", "HORIZONTAL"):
+            continue
+        if str(node.get("name", "")).strip().lower() == target:
+            return node
+    return None
+
+
 def _find_reusable_root(nodes: list[dict], width: int) -> dict | None:
     """Pick the frame a previous run built, so we extend it instead of duplicating.
 
@@ -295,24 +410,35 @@ def _free_x(nodes: list[dict]) -> int:
     return int(right_edge) + NEW_FRAME_GAP
 
 
+# "1440 x 1024", "1440 × 1024px", "1440 by 1024" -- the FIRST number is width.
+_DIMENSIONS = re.compile(r"(\d{3,4})\s*(?:x|\u00d7|\u2715|by)\s*(\d{3,4})", re.IGNORECASE)
+_WIDTH_PX = re.compile(r"(\d{3,4})\s*px", re.IGNORECASE)
+
+
 def _root_width(instruction: str) -> int:
-    """Honour an explicit pixel width in the instruction (e.g. "1440px wide")."""
-    match = re.search(r"(\d{3,4})\s*px", instruction, re.IGNORECASE)
+    """Honour an explicit frame width in the instruction.
+
+    A "WIDTHxHEIGHT" spelling is checked FIRST. "Desktop frame: 1440 x 1024px"
+    used to be read by a bare pixel pattern, which matched `1024px` -- the
+    HEIGHT -- and every screen came out 1024 wide instead of 1440.
+    """
+    match = _DIMENSIONS.search(instruction or "")
     if match:
         width = int(match.group(1))
-        if 200 <= width <= 4000:  # ignore incidental numbers like a 48px icon
+        if 200 <= width <= 4000:
             return width
-    return DEFAULT_ROOT_WIDTH
 
-
-def _root_name(instruction: str) -> str:
-    """Name the frame after a quoted product name if the instruction has one."""
-    match = re.search(r"[\"'“]([^\"'”]{2,40})[\"'”]", instruction)
-    return f"{match.group(1)} — Page" if match else "Generated Page"
+    # No explicit pair: take the LARGEST plausible pixel value rather than the
+    # first, so "border radius: 8px ... 1440px wide" is not read as an 8px page.
+    candidates = [
+        int(value) for value in _WIDTH_PX.findall(instruction or "")
+        if 200 <= int(value) <= 4000
+    ]
+    return max(candidates) if candidates else DEFAULT_ROOT_WIDTH
 
 
 def run_step(
-    step: str,
+    step: PlanStep,
     state: RunState,
     bridge: Bridge,
     llm: ModelClient,
@@ -323,9 +449,14 @@ def run_step(
     """Bounded retry loop for one plan step. Both gates must pass before we advance:
     the structural gate (do the nodes really exist as intended) and, for visual
     steps, the visual gate (does it actually look right) -- CLAUDE.md section 6.
+
+    Every step builds into ONE screen's frame, resolved here from the step's own
+    `screen_index`. Nothing downstream reads a global "the root frame" any more,
+    which is what let a step append a section to whichever frame came first.
     """
     label = f"Step {index}/{total}" if total else "Step"
-    docs = query_docs(step, sources=STEP_DOC_SOURCES)
+    frame_id = state.frame_for(step.screen_index)
+    docs = query_docs(step.description, sources=STEP_DOC_SOURCES)
     # Anything a previous attempt put on the canvas. Scripts are atomic, so an
     # attempt that threw may still have landed earlier scripts -- those nodes
     # are real, and the retry must continue from them rather than build a
@@ -339,6 +470,7 @@ def run_step(
     seen_calls: set[tuple[str, str]] = set()
 
     for attempt in range(max_retries):
+        metrics.current().start_attempt()
         if attempt:
             logger.info(
                 "%s: %s (attempt %d/%d)...",
@@ -353,15 +485,21 @@ def run_step(
             prior_defects=prior_defects,
             prior_error=prior_error,
             seen_calls=seen_calls,
+            frame_id=frame_id,
         )
         _remember(landed_ids, outcome.created_node_ids)
 
         if outcome.ok:
-            gate = visual_gate(step, state, bridge, llm, label, outcome.created_node_ids)
+            gate = visual_gate(step, state, bridge, llm, label, outcome.created_node_ids, frame_id)
             if not gate:
                 logger.info("%s: done -- %s", label, outcome.summary or "no summary")
+                metrics.current().steps_completed += 1
                 _accept(step, state, outcome)
                 return
+            for _ in gate.geometry:
+                metrics.current().record_gate_failure("geometry")
+            for _ in gate.vision:
+                metrics.current().record_gate_failure("vision")
 
             # Last attempt, and only the vision critic is unhappy: keep the
             # section. Geometry defects are facts, but "it could look better"
@@ -369,8 +507,9 @@ def run_step(
             # trades a slightly imperfect section for a visibly empty one.
             if attempt == max_retries - 1 and not gate.geometry:
                 logger.info("%s: accepted with %d visual note(s)", label, len(gate.vision))
+                metrics.current().steps_completed += 1
                 state.warnings.append(
-                    f"'{_section_label(step)}' kept with unresolved visual notes: "
+                    f"'{_section_label(step.description)}' kept with unresolved visual notes: "
                     + "; ".join(gate.vision[:3])
                 )
                 _accept(step, state, outcome)
@@ -386,22 +525,40 @@ def run_step(
         # A script threw. Whatever ran before it still landed, so the next
         # attempt repairs from there; only the error goes into the docs.
         state.add_node_ids(outcome.created_node_ids)
+        metrics.current().record_failure(_failure_reason(outcome.summary))
         docs = augment_with_error(docs, outcome.summary)
         prior_defects, prior_error = [], outcome.summary
         logger.info(
             "%s failed (attempt %d/%d): %s", label, attempt + 1, max_retries, outcome.summary
         )
     state.mark_failed(step)
-    recovered = fallback_for_step(step, state, bridge, label)
+    metrics.current().steps_failed += 1
+    metrics.current().record_failure("exhausted-retries")
+    recovered = fallback_for_step(step, state, bridge, label, frame_id)
     state.record_step_result(
-        step,
+        step.description,
         StepResult(
-            step_description=step,
+            step_description=step.description,
             ok=False,
             created_node_ids=recovered,
             summary="exhausted retries" + (" (placeholder added)" if recovered else ""),
         ),
     )
+
+
+def _failure_reason(summary: str) -> str:
+    """Bucket a failed attempt so the causes can be counted, not just read.
+
+    "The model printed a script instead of calling the tool" and "the Plugin
+    API threw" look identical in the log and call for completely different
+    fixes -- one is a prompt problem, the other belongs in ERROR_HINTS.
+    """
+    text = (summary or "").lower()
+    if "replied with text instead of calling the tool" in text:
+        return "no-script-run"
+    if "did not conclude within the tool-call budget" in text:
+        return "tool-budget-exhausted"
+    return "script-error"
 
 
 _SYSTEM_PROMPT: str | None = None
@@ -415,13 +572,17 @@ def build_system_prompt() -> str:
     return _SYSTEM_PROMPT
 
 
-def _accept(step: str, state: RunState, outcome: StepResult) -> None:
+def _accept(step: PlanStep, state: RunState, outcome: StepResult) -> None:
     """Record a step as done, and register its section so later steps know."""
-    state.record_step_result(step, outcome)
-    if _is_section_step(step):
+    state.record_step_result(step.description, outcome)
+    if _is_section_step(step.description):
         # Later steps are told this is FINISHED, so they add what's missing
-        # instead of building a second copy of it.
-        state.record_section(outcome.section_name or _section_label(step))
+        # instead of building a second copy of it. Recorded against this step's
+        # OWN screen -- a header on the dashboard does not mean the sign-in
+        # screen has one.
+        state.record_section(
+            outcome.section_name or _section_label(step.description), step.screen_index
+        )
 
 
 def _remember(known: list[str], new_ids: list[str]) -> None:
@@ -451,12 +612,13 @@ class GateResult:
 
 
 def visual_gate(
-    step: str,
+    step: PlanStep,
     state: RunState,
     bridge: Bridge,
     llm: ModelClient,
     label: str,
     created_node_ids: list[str] | None = None,
+    frame_id: str | None = None,
 ) -> GateResult:
     """Checkpoint check after a visual step: does the result actually look right?
 
@@ -468,14 +630,16 @@ def visual_gate(
     then spent its full retry budget on someone else's problem. The whole page
     is still reviewed once, at the end, by `final_layout_review`.
     """
-    if not state.visual_gate_enabled or not state.root_frame_id or not _is_section_step(step):
-        return []
+    if not state.visual_gate_enabled or not frame_id or not _is_section_step(step.description):
+        return GateResult()
 
     scope = [i for i in (created_node_ids or []) if not _is_style_id(i)]
     if not scope:
         return GateResult()  # nothing of this step's own to judge
 
-    tree = read_layout(state.root_frame_id, bridge)
+    # This screen's tree, not the whole page: a defect on another screen is
+    # someone else's problem and must not fail this step.
+    tree = read_layout(frame_id, bridge)
     if tree is None:
         return GateResult()
 
@@ -541,7 +705,9 @@ def critique_with_model(
     return critic.blocking_only(defects)
 
 
-def fallback_for_step(step: str, state: RunState, bridge: Bridge, label: str) -> list[str]:
+def fallback_for_step(
+    step: PlanStep, state: RunState, bridge: Bridge, label: str, frame_id: str | None = None
+) -> list[str]:
     """Last resort after every retry failed: keep the page coherent.
 
     For a step that was meant to add a section, drop a labelled placeholder in
@@ -550,9 +716,9 @@ def fallback_for_step(step: str, state: RunState, bridge: Bridge, label: str) ->
     a fake component is worse than none, and tokens already exist from
     `bootstrap_tokens`.
     """
-    if not state.root_frame_id or not _is_section_step(step):
+    if not frame_id or not _is_section_step(step.description):
         return []
-    script = scaffold.build_placeholder_section_script(state.root_frame_id, _section_label(step))
+    script = scaffold.build_placeholder_section_script(frame_id, _section_label(step.description))
     result = execute_figma_js(bridge, script)
     if not result["ok"]:
         logger.info("%s: placeholder fallback also failed -- %s", label, result["error"])
@@ -561,7 +727,7 @@ def fallback_for_step(step: str, state: RunState, bridge: Bridge, label: str) ->
     if ids:
         state.add_node_ids(ids)
         # It occupies the slot, so later steps must know it is there.
-        state.record_section(f"TODO — {_section_label(step)}")
+        state.record_section(f"TODO — {_section_label(step.description)}", step.screen_index)
         logger.info("%s: added a TODO placeholder so the page keeps its structure", label)
     return ids
 
@@ -588,7 +754,7 @@ def _section_label(step: str) -> str:
 
 
 def converse_step(
-    step: str,
+    step: PlanStep,
     docs: str,
     state: RunState,
     bridge: Bridge,
@@ -599,6 +765,7 @@ def converse_step(
     prior_defects: list[str] | None = None,
     prior_error: str = "",
     seen_calls: set[tuple[str, str]] | None = None,
+    frame_id: str | None = None,
 ) -> StepResult:
     """Run one step's tool-calling conversation until the model finishes or a script fails.
 
@@ -610,16 +777,24 @@ def converse_step(
     build, and `seen_calls` is owned by the caller so the repeat guard survives
     across attempts at the same step.
     """
+    screen = state.screen_at(step.screen_index)
+    other_screens = [s.name for i, s in enumerate(state.screens) if i != step.screen_index]
+    # A section step may only use render_ui, so it must not be shown JavaScript
+    # exemplars or told to "call execute_figma_js" -- the surest way to make a
+    # model reach for a tool is to demonstrate it.
+    render_only = _is_section_step(step.description)
     messages = [
         {"role": "system", "content": build_system_prompt()},
         {
             "role": "user",
             "content": step_user_message(
-                step,
+                step.description,
                 docs,
                 state.recent_summary(),
-                state.root_frame_id,
-                state.existing_sections,
+                frame_id,
+                # This SCREEN's sections. A shared list told the sign-in screen
+                # it already had a header because the dashboard did.
+                screen.sections if screen else state.existing_sections,
                 state.token_names,
                 state.text_style_names,
                 state.font_styles,
@@ -632,6 +807,9 @@ def converse_step(
                 prior_error=prior_error,
                 palette_info=state.palette_info,
                 pairings=state.readable_pairings,
+                screen_name=screen.name if (screen and len(state.screens) > 1) else "",
+                other_screens=other_screens or None,
+                render_only=render_only,
             ),
         },
     ]
@@ -645,10 +823,19 @@ def converse_step(
     # built the nav bar three times inside a single attempt -- three near-identical
     # scripts, each slightly reworded so the identical-call guard let them through.
     # In repair mode the section already exists, so the budget starts used up.
-    root_appends = 1 if prior_node_ids else 0
+    #
+    # A render_ui repair is exempt, because it REPLACES rather than appends: it
+    # removes the nodes the previous attempt made and rebuilds the section in
+    # their place. Spending the budget on it would leave a failed section with
+    # no way to be corrected at all, so every visual-gate failure would end as
+    # a TODO placeholder.
+    root_appends = 1 if (prior_node_ids and not render_only) else 0
+    # A section step may only use `render_ui`; raw JS is not on the menu.
+    tools = tools_for(render_only)
+    allowed = {t["function"]["name"] for t in tools}
     for turn in range(1, MAX_TOOL_TURNS_PER_STEP + 1):
         logger.info("%s: thinking (turn %d/%d)...", label, turn, MAX_TOOL_TURNS_PER_STEP)
-        message = llm.complete(messages, tools=TOOL_SCHEMAS)
+        message = llm.complete(messages, tools=tools)
         messages.append(_assistant_message_dict(message))
 
         tool_calls = getattr(message, "tool_calls", None)
@@ -659,7 +846,7 @@ def converse_step(
                 # Nothing reached the canvas, so this is NOT a completed step.
                 logger.info("%s: stopped without running any script", label)
                 return StepResult(
-                    step,
+                    step.description,
                     ok=False,
                     created_node_ids=created_ids,
                     summary=(
@@ -669,7 +856,7 @@ def converse_step(
                 )
             # A script did run -- the model considers the step done.
             return StepResult(
-                step,
+                step.description,
                 ok=True,
                 created_node_ids=created_ids,
                 summary=message.content or "done",
@@ -679,6 +866,16 @@ def converse_step(
         for call in tool_calls:
             args = _safe_json_loads(call.function.arguments)
             logger.info("%s: -> %s", label, _describe_call(call.function.name, args))
+
+            # A small model will happily call a tool it was not offered. Running
+            # it anyway would put raw Plugin API JS back into section steps,
+            # which is the whole thing this narrowing exists to prevent.
+            if call.function.name not in allowed:
+                logger.info("%s: refused %s -- not available for this step", label, call.function.name)
+                messages.append(
+                    _tool_result_message(call.id, {"ok": False, "error": _WRONG_TOOL_REFUSAL})
+                )
+                continue
 
             # Identical repeated calls are always a stuck loop, never intent:
             # one live step ran the same createPaintStyle script 8 times, and
@@ -706,7 +903,7 @@ def converse_step(
             # One section per step. Reworded near-duplicates slip past the
             # identical-call guard, so cap the thing that actually matters:
             # how many times this step appends a new block to the page.
-            appends_to_root = _appends_to_root(call.function.name, args, state.root_frame_id)
+            appends_to_root = _appends_to_root(call.function.name, args, frame_id)
             if appends_to_root and root_appends >= 1:
                 logger.info("%s: refused a second append into the root frame", label)
                 messages.append(
@@ -718,8 +915,11 @@ def converse_step(
                 result = dispatch(
                     call.function.name, args, bridge,
                     render_context={
-                        "parent_id": state.root_frame_id,
+                        "parent_id": frame_id,
                         "color_roles": renderer.role_map(state.palette_info),
+                        # On a repair, the section this step already built is
+                        # replaced by the corrected one.
+                        "replace_ids": list(prior_node_ids or []),
                     },
                 )
             except Exception as exc:
@@ -742,7 +942,10 @@ def converse_step(
                 # A script failed: the document is unchanged (scripts are atomic).
                 # Bubble the error up so the retry loop can feed it back as docs.
                 logger.info("%s: script failed -- %s", label, result["error"])
-                return StepResult(step, ok=False, created_node_ids=created_ids, summary=str(result["error"]))
+                return StepResult(
+                    step.description, ok=False, created_node_ids=created_ids,
+                    summary=str(result["error"]),
+                )
 
             ran_a_script = True
             # Only a call that actually landed spends the one-section budget.
@@ -766,9 +969,17 @@ def converse_step(
             messages.append(_tool_result_message(call.id, result))
 
     return StepResult(
-        step, ok=False, created_node_ids=created_ids, summary="step did not conclude within the tool-call budget"
+        step.description, ok=False, created_node_ids=created_ids,
+        summary="step did not conclude within the tool-call budget",
     )
 
+
+_WRONG_TOOL_REFUSAL = (
+    "REFUSED: that tool is not available for this step. Build this section with "
+    "`render_ui`, passing ONE spec describing the whole section. It handles font "
+    "loading, auto-layout, sizing modes, spacing and token colours for you, so "
+    "none of the Plugin API errors you are trying to avoid can happen."
+)
 
 _SECOND_APPEND_REFUSAL = (
     "REFUSED: this step has already appended its section to the root frame, and that "
@@ -951,11 +1162,14 @@ def augment_with_error(docs: str, error: str) -> str:
 
 
 def final_validation(state: RunState, bridge: Bridge) -> None:
-    """Whole-screen review. Fix what is mechanically fixable, then report the rest."""
+    """Whole-design review. Fix what is mechanically fixable, then report the rest."""
     enforce_root_hug(state, bridge)          # fix clipping BEFORE judging the layout
     audit_variable_bindings(state, bridge)   # rebind hardcoded colours to tokens
 
-    shot = get_screenshot(bridge, state.root_frame_id)
+    # With several screens the interesting picture is the PAGE -- all the frames
+    # side by side. Rendering only the first would hide most of the design.
+    target = state.root_frame_id if len(_built_screens(state)) <= 1 else None
+    shot = get_screenshot(bridge, target)
     if shot["ok"]:
         state.final_screenshot_base64 = shot["image_base64"]
     else:
@@ -964,15 +1178,32 @@ def final_validation(state: RunState, bridge: Bridge) -> None:
     final_layout_review(state, bridge)
 
 
+def _built_screens(state: RunState) -> list:
+    return [s for s in state.screens if s.frame_id]
+
+
 def final_layout_review(state: RunState, bridge: Bridge) -> None:
     """Report what's visibly wrong with the finished screen, rather than
-    leaving the user to spot it. Deterministic, so it works with any model."""
-    if not state.root_frame_id:
+    leaving the user to spot it. Deterministic, so it works with any model.
+
+    One read, three reviews: geometry (blocking-grade facts), design-system
+    adherence (advisory), and whether the instruction was actually satisfied.
+    They share the tree because re-reading it three times would triple the
+    round trips for data that cannot change in between.
+    """
+    screens = _built_screens(state)
+    if not screens:
         return
-    tree = read_layout(state.root_frame_id, bridge)
-    if tree is None:
+    trees = [t for t in (read_layout(s.frame_id, bridge) for s in screens) if t is not None]
+    if not trees:
         return
-    defects = critic.find_layout_defects(tree)
+
+    # Reviewed per screen and reported together: a design of three screens has
+    # three layouts, and judging them as one tree invents defects between
+    # frames that are simply sitting next to each other.
+    review_design_system(state, trees)
+    review_requirements(state, trees)
+    defects = [d for tree in trees for d in critic.find_layout_defects(tree)]
     state.layout_defects = [str(d) for d in defects]
     if defects:
         logger.info("Final review found %d layout issue(s).", len(defects))
@@ -985,6 +1216,54 @@ def final_layout_review(state: RunState, bridge: Bridge) -> None:
         )
     else:
         logger.info("Final review: layout is CLEAN.")
+
+
+def review_design_system(state: RunState, trees: list[dict]) -> None:
+    """Record contrast/spacing/type/token adherence for the finished screen.
+
+    Advisory on purpose. These rules were previously prose in the system prompt
+    with nothing checking them; measuring them makes "is the design system
+    actually being followed" a number instead of an opinion, without letting a
+    polish note demote a working section to a placeholder.
+    """
+    notes = [n for tree in trees for n in critic.find_design_defects(tree)]
+    state.design_notes = [str(d) for d in notes]
+    if not notes:
+        logger.info("Design-system review: on-scale, on-ramp and token-backed.")
+        return
+    logger.info("Design-system review found %d advisory issue(s).", len(notes))
+    for note in notes[:6]:
+        logger.info("  %s", note)
+
+
+def review_requirements(state: RunState, trees: list[dict]) -> None:
+    """Check the finished design against what the INSTRUCTION actually asked for.
+
+    Across ALL screens: a password field on the sign-in screen satisfies the
+    instruction whether or not the dashboard beside it has one.
+    """
+    coverage = requirements.check_coverage(state.instruction, trees)
+    if not coverage.expected:
+        return  # nothing checkable was named; silence beats a made-up score
+
+    state.requirements_met = list(coverage.met)
+    state.requirements_missing = list(coverage.missing)
+    state.satisfied_no_requirements = coverage.satisfied_nothing
+    logger.info("Requirement coverage: %s", coverage.summary())
+
+    if coverage.satisfied_nothing:
+        logger.info("None of the requested elements are on the canvas.")
+        state.warnings.append(
+            "This design matches NONE of the instruction: none of "
+            + ", ".join(coverage.missing[:6])
+            + " could be found on the canvas."
+        )
+    elif coverage.missing:
+        state.warnings.append(
+            f"{len(coverage.missing)} requested item(s) are missing from the design: "
+            + ", ".join(coverage.missing[:6])
+            + ("; ..." if len(coverage.missing) > 6 else "")
+        )
 
 
 def audit_variable_bindings(state: RunState, bridge: Bridge) -> None:
@@ -1027,14 +1306,13 @@ def enforce_root_hug(state: RunState, bridge: Bridge) -> None:
     `resize()` resets sizing to FIXED, after which the frame clips everything
     below the fold and every stacked section reads as an overflow defect.
     """
-    if not state.root_frame_id:
-        return
-    result = execute_figma_js(bridge, scaffold.build_hug_fix_script(state.root_frame_id))
-    if result["ok"] and (result.get("result") or {}).get("changed"):
-        logger.info(
-            "Root frame was clipping its content; restored hug sizing (now %spx tall).",
-            (result.get("result") or {}).get("height"),
-        )
+    for screen in _built_screens(state):
+        result = execute_figma_js(bridge, scaffold.build_hug_fix_script(screen.frame_id))
+        if result["ok"] and (result.get("result") or {}).get("changed"):
+            logger.info(
+                "Screen '%s' was clipping its content; restored hug sizing (now %spx tall).",
+                screen.name, (result.get("result") or {}).get("height"),
+            )
 
 
 _BINDING_AUDIT_SCRIPT = """\

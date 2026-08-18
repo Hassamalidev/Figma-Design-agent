@@ -120,7 +120,14 @@ class _Compiler:
         # Stretch to the parent's width unless the node opts out (buttons and
         # badges hug their label). `setFill` re-checks at runtime that the
         # parent really is auto-layout, so this can never throw.
-        if node.get("fill", True):
+        # A FIXED width is what a sidebar is: 240px beside a filling content
+        # column. It must not also stretch, so it opts out of FILL.
+        if node.get("width"):
+            width = int(node["width"])
+            axis = "primaryAxisSizingMode" if direction == "row" else "counterAxisSizingMode"
+            self.lines.append(f"  {var}.{axis} = 'FIXED';")
+            self.lines.append(f"  {var}.resize({width}, {var}.height);")
+        elif node.get("fill", True):
             self.lines.append(f"  setFill({var});")
         if node.get("height"):
             self.lines.append(
@@ -286,6 +293,13 @@ class _Compiler:
 PREAMBLE = """\
 const root0 = await figma.getNodeByIdAsync({parent_id});
 if (!root0) {{ throw new Error('parent frame not found'); }}
+// A repair REPLACES the section a previous attempt built. Without this, the
+// only way to correct a section would be to append a second copy of it beside
+// the broken one -- and `render_ui` cannot edit nodes in place.
+for (const _oldId of {replace_ids}) {{
+  const _old = await figma.getNodeByIdAsync(_oldId);
+  if (_old && !_old.removed) {{ try {{ _old.remove(); }} catch (e) {{}} }}
+}}
 {fonts}
 const _paint = await figma.getLocalPaintStylesAsync();
 const _paintByName = {{}};
@@ -315,12 +329,22 @@ const created = [];
 """
 
 
-def compile_spec(spec: dict, parent_id: str, color_roles: dict[str, str]) -> tuple[str, list[str]]:
+def compile_spec(
+    spec: dict,
+    parent_id: str,
+    color_roles: dict[str, str],
+    replace_ids: list[str] | None = None,
+) -> tuple[str, list[str]]:
     """Turn one UI tree into an atomic Figma script. Returns (js, node_var_names).
 
     `color_roles` maps a role the model can name ("text", "accent") to the real
     paint style created by bootstrap_tokens ("color/dark-gray"). An unknown
     role is skipped rather than guessed, so a bad role never invents a colour.
+
+    `replace_ids` are nodes a previous attempt at this step created. They are
+    removed before the new section is built, which is what makes a correcting
+    retry a REPLACEMENT rather than a second copy appended beside the first.
+    Scripts are atomic, so a failed repair leaves the original section intact.
     """
     compiler = _Compiler(parent_id, color_roles)
     compiler.node(spec, "root0")
@@ -332,7 +356,9 @@ def compile_spec(spec: dict, parent_id: str, color_roles: dict[str, str]) -> tup
     body = "\n".join(compiler.lines)
     pushes = "\n".join(f"  created.push({v}.id);" for v in compiler.created)
     return (
-        PREAMBLE.format(parent_id=_js(parent_id), fonts=fonts)
+        PREAMBLE.format(
+            parent_id=_js(parent_id), fonts=fonts, replace_ids=_js(list(replace_ids or []))
+        )
         + body
         + "\n"
         + pushes

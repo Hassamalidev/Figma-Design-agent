@@ -163,3 +163,110 @@ def test_a_bad_request_is_not_retried(monkeypatch):
     with pytest.raises(BadRequestError):
         client.complete([{"role": "user", "content": "hi"}])
     assert fake.calls == 1
+
+
+# ---- measurement at the swap point ----------------------------------------
+#
+# Model calls are the most expensive thing a run does (~50 per design). They are
+# instrumented HERE rather than at each call site because CLAUDE.md's first
+# golden rule is that all model access goes through this file -- so measuring it
+# here measures the loop, the planner and the critic by construction.
+
+
+class _StubCompletions:
+    """A transport that hands back canned outcomes. No SDK call, no network."""
+
+    def __init__(self, outcomes):
+        self._outcomes = list(outcomes)
+        self.calls = 0
+
+    def create(self, **kwargs):
+        self.calls += 1
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _client_returning(*outcomes):
+    from agent.llm import ModelClient
+
+    client = ModelClient.__new__(ModelClient)  # skip OpenAI() construction
+    completions = _StubCompletions(outcomes)
+    client._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    client._model = "stub"
+    return client, completions
+
+
+def _completion(content="ok", prompt_tokens=0, completion_tokens=0):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))],
+        usage=SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+    )
+
+
+def test_every_model_call_is_timed_and_counted():
+    from agent import metrics
+
+    client, _ = _client_returning(_completion(), _completion())
+    with metrics.recording() as measured:
+        client.complete([{"role": "user", "content": "hi"}])
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert measured.model.count == 2
+    assert measured.model.errors == 0
+
+
+def test_token_usage_is_recorded_when_the_endpoint_reports_it():
+    from agent import metrics
+
+    client, _ = _client_returning(_completion(prompt_tokens=1200, completion_tokens=90))
+    with metrics.recording() as measured:
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert measured.prompt_tokens == 1200
+    assert measured.completion_tokens == 90
+
+
+def test_a_missing_usage_field_is_not_an_error():
+    """Not every OpenAI-compatible server fills usage in, and a statistic must
+    never take a run down."""
+    from agent import metrics
+
+    reply = _completion()
+    reply.usage = None
+    client, _ = _client_returning(reply)
+    with metrics.recording() as measured:
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert measured.model.count == 1
+    assert measured.prompt_tokens == 0
+
+
+def test_a_failed_call_is_recorded_as_an_error_and_still_raises():
+    from agent import metrics
+
+    client, _ = _client_returning(ValueError("bad request"))
+    with metrics.recording() as measured:
+        with pytest.raises(ValueError):
+            client.complete([{"role": "user", "content": "hi"}])
+
+    assert measured.model.count == 1
+    assert measured.model.errors == 1
+
+
+def test_absorbed_endpoint_blips_are_counted_separately_from_calls(monkeypatch):
+    """A run that 'felt slow' is often this number, not the model itself -- and
+    a retry inside the client is still ONE logical call to the loop."""
+    from agent import llm as llm_mod
+    from agent import metrics
+
+    monkeypatch.setattr(llm_mod.time, "sleep", lambda _s: None)  # no real backoff
+    client, completions = _client_returning(_server_error(), _completion())
+
+    with metrics.recording() as measured:
+        client.complete([{"role": "user", "content": "hi"}])
+
+    assert completions.calls == 2                   # retried once at the transport
+    assert measured.model.count == 1                # one logical call
+    assert measured.model_transient_retries == 1    # with the blip made visible

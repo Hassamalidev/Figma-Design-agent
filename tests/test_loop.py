@@ -5,6 +5,7 @@ termination -- no network or a running Figma required.
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 
 from agent import loop
@@ -21,19 +22,84 @@ def tool_call(call_id: str, name: str, arguments: dict):
 
 
 class FakeModelClient:
-    """Returns canned messages in call order, regardless of the messages/tools passed in."""
+    """Returns canned messages in call order, regardless of the messages/tools passed in.
 
-    def __init__(self, responses: list):
+    Screen decomposition is answered AUTOMATICALLY with a single screen, the
+    same way FakeBridge auto-serves harness-authored scripts: almost every test
+    here is about one screen, and making each of them script an extra response
+    would mean editing forty tests to add a line none of them care about. A
+    test that IS about several screens passes `screens=[...]`.
+    """
+
+    def __init__(self, responses: list, screens: list[str] | None = None):
         self._responses = list(responses)
+        self._screens = screens or ["Screen"]
         self.calls: list[dict] = []
 
     def complete(self, messages, tools=None):
         self.calls.append({"messages": messages, "tools": tools})
+        if self._is_screens_question(messages):
+            return message(content=json.dumps(self._screens))
         assert self._responses, "FakeModelClient ran out of scripted responses"
         return self._responses.pop(0)
 
+    @staticmethod
+    def _is_screens_question(messages) -> bool:
+        system = (messages[0].get("content") or "") if messages else ""
+        return "how many separate SCREENS" in system
+
 
 ROOT_ID = "0:root"
+
+
+def render_call(call_id: str, name: str = "Section", value: str = "Hello"):
+    """A render_ui call building one small section.
+
+    Section steps are only given `render_ui` -- `execute_figma_js` is not on
+    their menu, because a real run reached for raw JS every single time and
+    lost steps to FILL/HUG ordering, font loading and enum values that the
+    renderer handles for free. Tests build the way the product builds.
+    """
+    return tool_call(
+        call_id,
+        "render_ui",
+        {"spec": {"kind": "section", "name": name,
+                  "children": [{"kind": "text", "value": value}]}},
+    )
+
+
+
+
+# Indexing into llm.calls[N] breaks the moment the loop gains a stage -- adding
+# screen decomposition shifted every one of them by one. Find calls by the job
+# they are doing instead.
+def _calls_with(llm, marker: str) -> list[str]:
+    """The user message of every model call whose SYSTEM prompt contains `marker`."""
+    found = []
+    for call in llm.calls:
+        system = (call["messages"][0].get("content") or "") if call["messages"] else ""
+        if marker in system:
+            found.append(next(m["content"] for m in call["messages"] if m["role"] == "user"))
+    return found
+
+
+def planning_prompts(llm) -> list[str]:
+    return _calls_with(llm, "ordered list of build steps")
+
+
+def step_prompts(llm) -> list[str]:
+    """One entry per build ATTEMPT, not per model turn.
+
+    A step's tool-calling conversation makes several calls that all share the
+    same user message (converse_step appends assistant/tool turns to the same
+    list), so consecutive duplicates are collapsed. A retry builds a fresh
+    conversation with different framing, so it is correctly kept.
+    """
+    prompts = []
+    for content in _calls_with(llm, "You are the design agent"):
+        if not prompts or prompts[-1] != content:
+            prompts.append(content)
+    return prompts
 
 
 class FakeBridge:
@@ -96,6 +162,25 @@ class FakeBridge:
         return "unboundFillNodeIds" in code
 
     @staticmethod
+    def _is_screen_script(code: str) -> bool:
+        return "failedScreens" in code
+
+    @staticmethod
+    def _screen_frames_response(request, code: str) -> Response:
+        """Hand back one id per requested screen, named as the script asked."""
+        match = re.search(r"const specs = (\[.*?\]);", code, re.DOTALL)
+        specs = json.loads(match.group(1)) if match else []
+        made = [
+            {"name": spec["name"], "id": ROOT_ID if i == 0 else f"screen:{i + 1}"}
+            for i, spec in enumerate(specs)
+        ]
+        return Response(
+            id=request.id,
+            ok=True,
+            result={"createdNodeIds": [m["id"] for m in made], "screens": made, "failedScreens": []},
+        )
+
+    @staticmethod
     def _is_token_script(code: str) -> bool:
         return "createVariableCollection('Tokens')" in code
 
@@ -131,6 +216,11 @@ class FakeBridge:
                 ok=True,
                 result={"createdNodeIds": [], "topLevelNodes": self._existing_nodes},
             )
+        # The harness creates ONE FRAME PER SCREEN in a single script. Answer it
+        # with real ids so each screen has somewhere to build; the first keeps
+        # ROOT_ID so single-screen tests read exactly as they always did.
+        if FakeBridge._is_screen_script(code):
+            return FakeBridge._screen_frames_response(request, code)
         # Match the root-frame script precisely. Matching loosely on
         # "counterAxisSizingMode + createFrame" also swallowed every render_ui
         # script, so section builds silently never reached the bridge.
@@ -174,7 +264,7 @@ def test_successful_single_step_run():
             message(content='["Create a red rectangle"]'),  # planner
             message(
                 tool_calls=[
-                    tool_call("call-1", "execute_figma_js", {"code": "return {createdNodeIds: ['1:2']}"})
+                    render_call("call-1")
                 ]
             ),  # step: asks to run a script
             message(content="done"),  # step: no more tool calls -> step complete
@@ -207,7 +297,7 @@ def _one_step_run(bridge):
             message(content='["Create a red rectangle"]'),  # planner
             message(
                 tool_calls=[
-                    tool_call("call-1", "execute_figma_js", {"code": "return {createdNodeIds: ['1:2']}"})
+                    render_call("call-1")
                 ]
             ),
             message(content="done"),
@@ -294,7 +384,7 @@ def test_planner_falls_back_when_model_returns_unparseable_json():
         [
             message(content="A clean red rectangle on a white background."),  # enhance_instruction
             message(content="I refuse to write JSON today."),  # planner: unparseable
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "return {createdNodeIds:['1:2']}"})]),
+            message(tool_calls=[render_call("c1")]),
             message(content="done"),
         ]
     )
@@ -334,7 +424,7 @@ def test_enhanced_brief_feeds_into_planning_not_the_raw_instruction():
 
     loop.run("a red rectangle", bridge, llm, max_retries=1, max_steps=10)
 
-    planning_prompt = llm.calls[1]["messages"][-1]["content"]  # calls[0] was enhance_instruction
+    planning_prompt = planning_prompts(llm)[0]
     assert "EXPANDED BRIEF TEXT" in planning_prompt
 
 
@@ -345,7 +435,7 @@ def test_step_that_never_runs_a_script_is_not_counted_as_done():
     llm = FakeModelClient(
         [
             message(content="brief"),  # enhance_instruction
-            message(content='["Create a button component"]'),  # planner
+            message(content='["Add the button section into the frame"]'),  # planner
             message(content="Here is the code you should run: ```js ... ```"),  # attempt 1: text only
             message(content="Here it is again as text"),  # attempt 2 (max_retries=2)
         ]
@@ -360,15 +450,15 @@ def test_step_that_never_runs_a_script_is_not_counted_as_done():
     result = loop.run("a button", bridge, llm, max_retries=2, max_steps=10)
 
     assert result.success is False
-    assert result.failed_steps == ["Create a button component"]
+    assert result.failed_steps == ["Add the button section into the frame"]
 
 
 def test_step_is_done_once_a_script_actually_ran():
     llm = FakeModelClient(
         [
             message(content="brief"),  # enhance_instruction
-            message(content='["Create a button component"]'),  # planner
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "return {createdNodeIds:['1:2']}"})]),
+            message(content='["Add the button section into the frame"]'),  # planner
+            message(tool_calls=[render_call("c1")]),
             message(content="All done."),  # no tool calls, but a script DID run
         ]
     )
@@ -468,7 +558,7 @@ def test_existing_root_frame_is_reused_not_duplicated():
     assert [r for r in bridge.sent if r.type == "exec" and "counterAxisSizingMode" in (r.code or "")] == []
 
     # The planner was told what already exists, so it plans only the gap.
-    planning_prompt = llm.calls[1]["messages"][-1]["content"]
+    planning_prompt = planning_prompts(llm)[0]
     assert "CONTINUATION" in planning_prompt
     assert "Nav Bar" in planning_prompt and "Hero" in planning_prompt
 
@@ -494,8 +584,9 @@ def test_a_new_root_frame_is_placed_clear_of_existing_content():
 
     loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
 
-    root_script = [r for r in bridge.sent if r.type == "exec" and "counterAxisSizingMode" in (r.code or "")][0]
-    assert "frame.x = 1000;" in root_script.code  # 800 wide + 200 gap, clear of the sketch
+    screen_script = [r for r in bridge.sent if r.type == "exec" and "failedScreens" in (r.code or "")][0]
+    # 800 wide + 200 gap: the new screen starts clear of the existing sketch.
+    assert '"x": 1000' in screen_script.code
 
 
 def test_a_non_autolayout_frame_is_not_mistaken_for_our_root():
@@ -533,7 +624,7 @@ def test_a_failed_section_step_leaves_a_labelled_placeholder():
         [
             message(content="brief"),
             message(content='["Add Footer section to root frame"]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "boom()"})]),
+            message(tool_calls=[render_call("c1")]),
         ]
     )
     bridge = FakeBridge(
@@ -570,7 +661,7 @@ def test_the_visual_gate_blocks_a_step_that_looks_broken():
         [
             message(content="brief"),
             message(content='["Add Hero section to root frame"]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "one"})]),
+            message(tool_calls=[render_call("c1")]),
             message(content="done"),          # model thinks it finished...
             message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "fix"})]),
             message(content="fixed"),
@@ -619,7 +710,7 @@ def test_visual_gate_can_be_turned_off():
         llm = FakeModelClient([
             message(content="brief"),
             message(content='["Add Hero section to root frame"]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "one"})]),
+            message(tool_calls=[render_call("c1")]),
             message(content="done"),
             message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "fix"})]),
             message(content="fixed"),
@@ -784,13 +875,17 @@ def test_identical_repeated_scripts_run_only_once():
 
 
 def test_different_scripts_in_one_step_all_run():
-    """The repeat guard must not block legitimately different scripts."""
+    """The repeat guard must not block legitimately different scripts.
+
+    Uses a NON-section step, because that is the only kind that runs raw JS now
+    -- a section is exactly one `render_ui` call by construction.
+    """
     llm = FakeModelClient(
         [
             message(content="brief"),
-            message(content='["Build it"]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "one"})]),
-            message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "two"})]),
+            message(content='["Prepare the spacing tokens"]'),
+            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "first"})]),
+            message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "second"})]),
             message(content="done"),
         ]
     )
@@ -828,7 +923,7 @@ def test_enhance_falls_back_to_raw_instruction_when_model_returns_nothing():
 
     loop.run("a red rectangle", bridge, llm, max_retries=1, max_steps=10)
 
-    planning_prompt = llm.calls[1]["messages"][-1]["content"]
+    planning_prompt = planning_prompts(llm)[0]
     assert "a red rectangle" in planning_prompt
 
 
@@ -842,9 +937,9 @@ def test_build_step_prompt_receives_the_brief_and_the_plan_outline():
             message(content=brief),  # enhance_instruction
             message(content='["Add the hero section into the root frame.", '
                             '"Add the footer section into the root frame."]'),  # planner
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "one"})]),
+            message(tool_calls=[render_call("c1")]),
             message(content="done"),
-            message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "two"})]),
+            message(tool_calls=[render_call("c2")]),
             message(content="done"),
         ]
     )
@@ -865,14 +960,14 @@ def test_build_step_prompt_receives_the_brief_and_the_plan_outline():
     # calls[0] = enhance, calls[1] = plan, calls[2] = first build step.
     # messages[1] is the step's user message -- not [-1], because converse_step
     # keeps appending assistant/tool turns to the same list the fake recorded.
-    first_step_prompt = llm.calls[2]["messages"][1]["content"]
+    first_step_prompt = step_prompts(llm)[0]
     assert "a sailing school landing page" in first_step_prompt   # the raw request
     assert "#0B1F3A" in first_step_prompt                          # the brief's palette
     assert "nautical" in first_step_prompt                         # the brief's tone
     assert ">>> THIS STEP: Add the hero" in first_step_prompt      # where this step sits
 
     # The second step must know the first one is already on the page.
-    second_step_prompt = llm.calls[4]["messages"][1]["content"]
+    second_step_prompt = step_prompts(llm)[1]
     assert "[already built] Add the hero" in second_step_prompt
     assert ">>> THIS STEP: Add the footer" in second_step_prompt
 
@@ -910,9 +1005,9 @@ def test_a_defect_in_an_earlier_section_does_not_fail_a_later_step():
             message(content="brief"),
             message(content='["Add the hero section into the root frame.", '
                             '"Add the footer section into the root frame."]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "hero"})]),
+            message(tool_calls=[render_call("c1")]),
             message(content="done"),
-            message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "footer"})]),
+            message(tool_calls=[render_call("c2")]),
             message(content="done"),
         ]
     )
@@ -954,16 +1049,15 @@ def test_repeat_guard_survives_across_retries():
             }
         ],
     }
-    same_script = {"code": "build the footer"}
     llm = FakeModelClient(
         [
             message(content="brief"),
             message(content='["Add the footer section into the root frame."]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", same_script)]),
+            message(tool_calls=[render_call("c1", "Footer")]),
             message(content="done"),
-            message(tool_calls=[tool_call("c2", "execute_figma_js", same_script)]),  # identical
+            message(tool_calls=[render_call("c2", "Footer")]),  # identical spec
             message(content="done"),
-            message(tool_calls=[tool_call("c3", "execute_figma_js", same_script)]),  # identical
+            message(tool_calls=[render_call("c3", "Footer")]),  # identical spec
             message(content="done"),
         ]
     )
@@ -988,7 +1082,7 @@ def test_a_retry_after_a_failed_script_still_repairs_what_landed():
     llm = FakeModelClient(
         [
             message(content="brief"),
-            message(content='["Add the hero section into the root frame."]'),
+            message(content='["Prepare the hero text tokens"]'),
             message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "frame"})]),
             message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "text"})]),
             message(tool_calls=[tool_call("c3", "execute_figma_js", {"code": "fixed text"})]),
@@ -1010,7 +1104,7 @@ def test_a_retry_after_a_failed_script_still_repairs_what_landed():
 
     loop.run("a landing page", bridge, llm, max_retries=2, max_steps=10)
 
-    retry_prompt = llm.calls[4]["messages"][1]["content"]
+    retry_prompt = step_prompts(llm)[-1]
     assert "CORRECTING THE PREVIOUS ATTEMPT" in retry_prompt
     assert "1:1" in retry_prompt                        # the frame that survived
     assert "lineHeight" in retry_prompt                 # why the attempt stopped
@@ -1022,7 +1116,7 @@ def test_a_first_attempt_is_never_framed_as_a_repair():
         [
             message(content="brief"),
             message(content='["Add the hero section into the root frame."]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "one"})]),
+            message(tool_calls=[render_call("c1")]),
             message(content="done"),
         ]
     )
@@ -1039,9 +1133,9 @@ def test_a_first_attempt_is_never_framed_as_a_repair():
 
     loop.run("a landing page", bridge, llm, max_retries=2, max_steps=10)
 
-    first_prompt = llm.calls[2]["messages"][1]["content"]
+    first_prompt = step_prompts(llm)[0]
     assert "CORRECTING THE PREVIOUS ATTEMPT" not in first_prompt
-    assert "accomplishes this step" in first_prompt
+    assert "Call `render_ui` ONCE" in first_prompt
 
 
 def test_sections_built_in_this_run_are_reported_to_later_steps():
@@ -1054,9 +1148,9 @@ def test_sections_built_in_this_run_are_reported_to_later_steps():
             message(content="brief"),
             message(content='["Add the hero section into the root frame.", '
                             '"Add the footer section into the root frame."]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "hero"})]),
+            message(tool_calls=[render_call("c1")]),
             message(content="done"),
-            message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "footer"})]),
+            message(tool_calls=[render_call("c2")]),
             message(content="done"),
         ]
     )
@@ -1078,8 +1172,8 @@ def test_sections_built_in_this_run_are_reported_to_later_steps():
 
     loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
 
-    first_prompt = llm.calls[2]["messages"][1]["content"]
-    second_prompt = llm.calls[4]["messages"][1]["content"]
+    first_prompt = step_prompts(llm)[0]
+    second_prompt = step_prompts(llm)[1]
 
     assert "already contains these sections" not in first_prompt  # nothing built yet
     assert "already contains these sections" in second_prompt
@@ -1095,7 +1189,7 @@ def test_a_placeholder_counts_as_an_occupied_section():
             message(content='["Add the hero section into the root frame.", '
                             '"Add the footer section into the root frame."]'),
             message(content="I cannot do this"),   # step 1: never runs a script -> fails
-            message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "footer"})]),
+            message(tool_calls=[render_call("c2")]),
             message(content="done"),
         ]
     )
@@ -1112,7 +1206,7 @@ def test_a_placeholder_counts_as_an_occupied_section():
 
     loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
 
-    second_prompt = llm.calls[3]["messages"][1]["content"]
+    second_prompt = step_prompts(llm)[1]
     assert "TODO — hero" in second_prompt
 
 
@@ -1157,17 +1251,13 @@ def test_a_step_may_only_append_one_section_to_the_root():
     slightly differently, so the identical-call guard let all three through and
     the page ended up with three stacked nav bars.
     """
-    first = {"code": f'const root = await figma.getNodeByIdAsync("{ROOT_ID}");\nroot.appendChild(nav);'}
-    reworded = {"code": f'const root = await figma.getNodeByIdAsync("{ROOT_ID}");\n// nav bar\nroot.appendChild(navBar);'}
-    third = {"code": f'const r = await figma.getNodeByIdAsync("{ROOT_ID}");\nr.appendChild(bar);'}
-
     llm = FakeModelClient(
         [
             message(content="brief"),
             message(content='["Add the top navigation bar section into the root frame."]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", first)]),
-            message(tool_calls=[tool_call("c2", "execute_figma_js", reworded)]),
-            message(tool_calls=[tool_call("c3", "execute_figma_js", third)]),
+            message(tool_calls=[render_call("c1", "Nav Bar")]),
+            message(tool_calls=[render_call("c2", "Navigation")]),   # reworded, same job
+            message(tool_calls=[render_call("c3", "Top Nav")]),      # reworded again
             message(content="done"),
         ]
     )
@@ -1209,8 +1299,13 @@ def test_building_inside_your_own_section_is_not_blocked():
     )
 
 
-def test_a_repair_attempt_may_not_append_to_the_root_at_all():
-    """In repair mode the section already exists, so any root append is a duplicate."""
+def test_a_section_repair_replaces_the_broken_section_instead_of_duplicating_it():
+    """`render_ui` cannot edit nodes in place, so a correcting retry removes what
+    the last attempt built and renders the section again in its place.
+
+    Without this the gate would be unable to fix anything: appending would leave
+    two copies, and refusing the append would send every visual-gate failure
+    straight to a TODO placeholder."""
     broken = {
         "id": ROOT_ID, "name": "Root", "type": "FRAME", "x": 0, "y": 0,
         "width": 1440, "height": 400, "visible": True, "layoutMode": "VERTICAL",
@@ -1219,16 +1314,14 @@ def test_a_repair_attempt_may_not_append_to_the_root_at_all():
             "width": 0, "height": 0, "visible": True, "layoutMode": None, "children": [],
         }],
     }
-    append = {"code": f'const r = await figma.getNodeByIdAsync("{ROOT_ID}"); r.appendChild(nav);'}
-
     llm = FakeModelClient(
         [
             message(content="brief"),
             message(content='["Add the nav section into the root frame."]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", append)]),
+            message(tool_calls=[render_call("c1", "Nav")]),
             message(content="done"),
-            # retry: tries to rebuild by appending to the root again
-            message(tool_calls=[tool_call("c2", "execute_figma_js", dict(append, code=append["code"] + " // v2"))]),
+            # retry: tries to rebuild the section from scratch
+            message(tool_calls=[render_call("c2", "Nav v2")]),
             message(content="done"),
         ]
     )
@@ -1242,7 +1335,11 @@ def test_a_repair_attempt_may_not_append_to_the_root_at_all():
 
     loop.run("a dashboard", bridge, llm, max_retries=2, max_steps=10)
 
-    assert len(bridge.model_exec_requests()) == 1
+    execs = bridge.model_exec_requests()
+    assert len(execs) == 2                                  # built, then repaired
+    # The repair removes the previous attempt's node before rebuilding.
+    assert "1:50" in (execs[1].code or "")
+    assert "_old.remove()" in (execs[1].code or "")
 
 
 def test_errors_seen_in_the_dashboard_run_all_map_to_a_targeted_fix():
@@ -1279,11 +1376,11 @@ def _one_section_run(critic_llm, max_retries=2, layout_tree=None):
         [
             message(content="brief"),
             message(content='["Add the hero section into the root frame."]'),
-            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "hero"})]),
+            message(tool_calls=[render_call("c1")]),
             message(content="done"),
-            message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "fix hero"})]),
+            message(tool_calls=[render_call("c2", "Hero fixed")]),
             message(content="fixed"),
-            message(tool_calls=[tool_call("c3", "execute_figma_js", {"code": "fix again"})]),
+            message(tool_calls=[render_call("c3", "Hero fixed again")]),
             message(content="fixed"),
         ]
     )
@@ -1463,3 +1560,529 @@ def test_an_invalid_spec_never_reaches_figma():
 
     # The invalid spec was rejected in Python; only the valid one ran.
     assert len(bridge.model_exec_requests()) == 1
+
+
+# ---- requirement coverage + design-system review at the end of a run -------
+
+
+def _run_with_instruction(instruction: str, bridge):
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the sign-in section into the root frame"]'),
+            message(
+                tool_calls=[
+                    render_call("c1")
+                ]
+            ),
+            message(content="done"),
+        ]
+    )
+    return loop.run(instruction, bridge, llm, max_retries=1, max_steps=10)
+
+
+def _bridge_with_tree(tree):
+    return FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:2"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:2", "name": "Sign in"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        },
+        layout_tree=tree,
+    )
+
+
+def _tree_with(children):
+    return {
+        "id": ROOT_ID, "name": "Root", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 400, "visible": True, "layoutMode": "VERTICAL",
+        "children": children,
+    }
+
+
+def _text_node(node_id, name, characters, **kw):
+    base = {
+        "id": node_id, "name": name, "type": "TEXT", "x": 0, "y": 0,
+        "width": 300, "height": 24, "visible": True, "layoutMode": None,
+        "children": [], "characters": characters, "fontSize": 16,
+    }
+    base.update(kw)
+    return base
+
+
+def test_a_dropped_requirement_is_reported_on_the_finished_run():
+    """A sign-in screen with no password field passed every previous gate."""
+    tree = _tree_with([_text_node("t:1", "Email", "Email address")])
+
+    result = _run_with_instruction("a sign-in screen with email and password", _bridge_with_tree(tree))
+
+    assert "password field" in result.requirements_missing
+    assert "email field" in result.requirements_met
+    assert any("missing from the design" in w for w in result.warnings)
+
+
+def test_a_run_matching_none_of_the_instruction_is_not_a_success():
+    """CLAUDE.md gap #2: 'a run can satisfy none of the instruction and report
+    success'. The steps all pass -- only coverage catches this."""
+    tree = _tree_with([_text_node("t:1", "Blob", "Lorem ipsum")])
+
+    result = _run_with_instruction(
+        "a dashboard with a sidebar, a chart and a data table", _bridge_with_tree(tree)
+    )
+
+    assert result.success is False
+    assert result.failed_steps == []  # every step passed; the DESIGN is wrong
+    assert any("matches NONE of the instruction" in w for w in result.warnings)
+
+
+def test_a_satisfied_instruction_still_succeeds():
+    tree = _tree_with([
+        _text_node("t:1", "Email", "Email address"),
+        _text_node("t:2", "Password", "Password", y=40),
+    ])
+
+    result = _run_with_instruction("a sign-in screen with email and password", _bridge_with_tree(tree))
+
+    assert result.success is True
+    assert result.requirements_missing == []
+
+
+def test_design_system_notes_are_recorded_but_never_fail_the_run():
+    tree = _tree_with([
+        {
+            "id": "sec:1", "name": "Section", "type": "FRAME", "x": 0, "y": 0,
+            "width": 1440, "height": 200, "visible": True, "layoutMode": "VERTICAL",
+            "itemSpacing": 17, "padding": [13, 13, 13, 13],
+            "children": [
+                _text_node("t:1", "Email", "Email", fontSize=17),
+                _text_node("t:2", "Password", "Password", y=40, fontSize=17),
+            ],
+        }
+    ])
+
+    result = _run_with_instruction("a sign-in screen with email and password", _bridge_with_tree(tree))
+
+    kinds = " ".join(result.design_notes)
+    assert "off-scale-spacing" in kinds
+    assert "off-ramp-type" in kinds
+    assert result.success is True          # advisory: it must not fail the run
+    assert result.layout_defects == []     # nor leak into the blocking list
+
+
+# ---- observability over the expensive paths --------------------------------
+
+
+def test_a_run_reports_what_it_cost():
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:2"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:2", "name": "Hero"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        }
+    )
+
+    result = _one_step_run(bridge)
+
+    m = result.metrics
+    # Figma round trips are counted by type, not lumped together. (Model calls
+    # are recorded inside ModelClient -- the swap point every real caller goes
+    # through -- so a FakeModelClient legitimately shows none; see test_llm.py.)
+    assert m["bridge"]["exec"]["count"] > 0
+    assert m["bridge_calls"] == sum(t["count"] for t in m["bridge"].values())
+    assert m["steps_completed"] == 1
+    assert m["step_attempts"] == 1
+    assert m["retry_rate"] == 1.0  # nothing needed a second try
+
+
+def test_failures_are_bucketed_by_cause_not_just_logged():
+    """'The model printed a script instead of calling the tool' and 'the Plugin
+    API threw' read identically in the log but call for different fixes."""
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the root frame"]'),
+            message(content="here is the script you asked for: figma.createFrame()"),  # no tool call
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [],
+            "metadata": [],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        }
+    )
+
+    result = loop.run("a hero section", bridge, llm, max_retries=1, max_steps=10)
+
+    assert result.metrics["failure_reasons"]["no-script-run"] == 1
+    assert result.metrics["failure_reasons"]["exhausted-retries"] == 1
+    assert result.metrics["steps_failed"] == 1
+
+
+def test_retries_show_up_as_a_retry_rate_above_one():
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the root frame"]'),
+            message(tool_calls=[render_call("c1")]),
+            message(tool_calls=[render_call("c2", "Hero retry")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [
+                Response(id="e1", ok=False, error="boom is not a function"),
+                Response(id="e2", ok=True, result={"createdNodeIds": ["1:2"]}),
+            ],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:2", "name": "Hero"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        }
+    )
+
+    result = loop.run("a hero section", bridge, llm, max_retries=3, max_steps=10)
+
+    assert result.metrics["step_attempts"] == 2
+    assert result.metrics["retry_rate"] == 2.0
+    assert result.metrics["failure_reasons"]["script-error"] == 1
+
+
+def test_the_caller_can_hold_the_recorder_the_run_writes_into():
+    """This is how the dashboard shows live progress instead of a scrolling log."""
+    from agent.metrics import RunMetrics
+
+    shared = RunMetrics()
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:2"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:2", "name": "Hero"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        }
+    )
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the root frame"]'),
+            message(tool_calls=[render_call("c1")]),
+            message(content="done"),
+        ]
+    )
+
+    loop.run("a hero", bridge, llm, max_retries=1, max_steps=10, run_metrics=shared)
+
+    assert shared.steps_completed == 1
+    assert shared.bridge_calls > 0
+    assert shared.snapshot()["progress"]["total"] == 1
+
+
+# ---- screens: a page is a workspace, a frame is a screen -------------------
+#
+# The agent used to build every screen into ONE tall frame, so a request for
+# "login and a dashboard" produced a sign-in form stacked on top of a
+# dashboard, and a second run stamped new work over the first. Figma's own
+# model is that a PAGE is a workspace and a FRAME is a screen, with screens
+# sitting side by side as siblings.
+
+
+def _screen_specs(bridge):
+    """The frame specs the harness asked Figma to create."""
+    script = [r for r in bridge.sent if r.type == "exec" and "failedScreens" in (r.code or "")][0]
+    return json.loads(re.search(r"const specs = (\[.*?\]);", script.code, re.DOTALL).group(1))
+
+
+def _multi_screen_run(screens, instruction="a login and a dashboard screen", existing=None):
+    """One planner reply per screen, then one build step each."""
+    responses = [message(content="accent: #0066FF")]
+    for name in screens:
+        responses.append(message(content=json.dumps(["Add the " + name + " content into the frame"])))
+    for _ in screens:
+        responses.append(
+            message(tool_calls=[render_call("c", "Screen body")])
+        )
+        responses.append(message(content="done"))
+
+    llm = FakeModelClient(responses, screens=screens)
+    bridge = FakeBridge(
+        {
+            "exec": [
+                Response(id="e" + str(i), ok=True, result={"createdNodeIds": ["sec:" + str(i)]})
+                for i in range(len(screens))
+            ],
+            "metadata": [
+                Response(id="m" + str(i), ok=True, result={"id": "sec:" + str(i), "name": name + " Body"})
+                for i, name in enumerate(screens)
+            ],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        },
+        existing_nodes=existing or [],
+    )
+    result = loop.run(instruction, bridge, llm, max_retries=1, max_steps=20)
+    return result, bridge, llm
+
+
+def test_each_screen_becomes_its_own_frame_side_by_side():
+    result, bridge, _ = _multi_screen_run(["Login", "Dashboard"])
+
+    specs = _screen_specs(bridge)
+
+    assert [s["name"] for s in specs] == ["Login", "Dashboard"]
+    assert result.screens == ["Login", "Dashboard"]
+    # Side by side on one baseline -- a row of screens, not a stack.
+    assert specs[0]["y"] == specs[1]["y"]
+    # ...and genuinely clear of one another.
+    assert specs[1]["x"] >= specs[0]["x"] + specs[0]["width"]
+
+
+def test_every_step_builds_into_its_own_screens_frame():
+    """The whole point: a dashboard step must not append to the login frame."""
+    _, _, llm = _multi_screen_run(["Login", "Dashboard"])
+
+    login_prompt, dashboard_prompt = step_prompts(llm)[0], step_prompts(llm)[1]
+
+    assert ROOT_ID in login_prompt and "screen:2" not in login_prompt
+    assert "screen:2" in dashboard_prompt and ROOT_ID not in dashboard_prompt
+
+
+def test_a_step_is_told_which_screen_it_is_building_and_what_the_others_are():
+    _, _, llm = _multi_screen_run(["Login", "Dashboard"])
+
+    login_prompt = step_prompts(llm)[0]
+
+    assert 'THE SCREEN YOU ARE BUILDING: "Login"' in login_prompt
+    assert '"Dashboard"' in login_prompt          # named, so it is not built here
+    assert "sit on top of them" in login_prompt
+
+
+def test_sections_are_remembered_per_screen_not_globally():
+    """A header on the dashboard does not mean the sign-in screen has one."""
+    _, _, llm = _multi_screen_run(["Login", "Dashboard"])
+
+    dashboard_prompt = step_prompts(llm)[1]
+
+    # The login screen's finished section must not be listed as the dashboard's.
+    assert "Login Body" not in dashboard_prompt
+
+
+def test_each_screen_is_planned_on_its_own():
+    _, _, llm = _multi_screen_run(["Login", "Dashboard"])
+
+    plans = planning_prompts(llm)
+
+    assert len(plans) == 2
+    assert 'THE SCREEN YOU ARE PLANNING: "Login"' in plans[0]
+    assert 'THE SCREEN YOU ARE PLANNING: "Dashboard"' in plans[1]
+    assert "Dashboard" in plans[0]  # named as a sibling, so its content is not planned here
+
+
+def test_a_rerun_continues_the_screen_with_the_same_name():
+    """Matched by NAME, so a second run extends "Login" instead of stamping a
+    fresh copy over whichever frame happened to be biggest."""
+    existing = [{
+        "id": "9:1", "name": "Login", "type": "FRAME", "x": 200, "y": 200,
+        "width": 1440, "height": 900, "layoutMode": "VERTICAL",
+        "children": [{"id": "9:2", "name": "Sign-in card", "type": "FRAME"}],
+    }]
+
+    _, bridge, llm = _multi_screen_run(["Login", "Dashboard"], existing=existing)
+
+    assert [s["name"] for s in _screen_specs(bridge)] == ["Dashboard"]  # Login reused
+    login_prompt = step_prompts(llm)[0]
+    assert "9:1" in login_prompt
+    assert "Sign-in card" in login_prompt                # and its content is known
+
+
+def test_a_single_screen_run_is_unchanged():
+    """Most requests are one screen; that path must not have moved."""
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:2"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:2", "name": "Hero"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        }
+    )
+
+    result = _one_step_run(bridge)
+
+    assert result.success is True
+    assert result.screens == ["Screen"]
+    assert result.created_node_ids == [ROOT_ID, "1:2"]
+
+
+def test_requirement_coverage_spans_every_screen():
+    """A password field on the sign-in screen satisfies the instruction whether
+    or not the dashboard beside it has one."""
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the sign-in form into the frame"]'),
+            message(content='["Add the metrics into the frame"]'),
+            message(tool_calls=[render_call("c1")]),
+            message(content="done"),
+            message(tool_calls=[render_call("c2")]),
+            message(content="done"),
+        ],
+        screens=["Login", "Dashboard"],
+    )
+
+    def screen_tree(node_id, name, characters):
+        return {
+            "id": node_id, "name": name, "type": "FRAME", "x": 0, "y": 0,
+            "width": 1440, "height": 400, "visible": True, "layoutMode": "VERTICAL",
+            "children": [_text_node(node_id + ":t", name, characters)],
+        }
+
+    bridge = FakeBridge(
+        {
+            "exec": [
+                Response(id="e1", ok=True, result={"createdNodeIds": ["sec:1"]}),
+                Response(id="e2", ok=True, result={"createdNodeIds": ["sec:2"]}),
+            ],
+            "metadata": [
+                Response(id="m1", ok=True, result={"id": "sec:1", "name": "Form"}),
+                Response(id="m2", ok=True, result={"id": "sec:2", "name": "Metrics"}),
+            ],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        },
+    )
+    # Each screen reads back its OWN tree: only the first holds the password.
+    trees = {
+        ROOT_ID: screen_tree(ROOT_ID, "Password", "Password"),
+        "screen:2": screen_tree("screen:2", "Chart", "Revenue"),
+    }
+    original = bridge._harness_response
+
+    def per_screen(request):
+        code = request.code or ""
+        if FakeBridge._is_layout_script(code):
+            for node_id, value in trees.items():
+                if '"' + node_id + '"' in code:
+                    return Response(id=request.id, ok=True, result={"createdNodeIds": [], "tree": value})
+        return original(request)
+
+    bridge._harness_response = per_screen
+
+    result = loop.run(
+        "a login screen with a password and a dashboard with a chart",
+        bridge, llm, max_retries=1, max_steps=20,
+    )
+
+    assert "password field" in result.requirements_met
+    assert "chart" in result.requirements_met
+
+
+# ---- the failures from a real 29-step SaaS-dashboard run -------------------
+#
+# That run used `execute_figma_js` for every single step and lost most of them
+# to Plugin API mistakes the renderer already handles:
+#
+#   in set_layoutSizingVertical: HUG can only be set on auto-layout frames
+#   in set_layoutSizingHorizontal: FILL can only be set on children of ...
+#   in appendChild: Reparenting would create a component inside a component
+#   counterAxisAlignItems ... received 'END'
+#   findAll callback crashed: TypeError: not a function
+#
+# None of those is expressible through `render_ui`, so the fix is to stop
+# offering the tool that can produce them.
+
+
+def test_a_section_step_cannot_reach_for_raw_javascript():
+    from tools.registry import tools_for
+
+    offered = {t["function"]["name"] for t in tools_for(section_step=True)}
+
+    assert "render_ui" in offered
+    assert "execute_figma_js" not in offered
+
+
+def test_a_hallucinated_execute_call_is_refused_and_redirected():
+    """A small model will call a tool it was never given. Running it anyway
+    would put raw Plugin API JS straight back into section steps."""
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the root frame."]'),
+            message(tool_calls=[tool_call("c1", "execute_figma_js", {"code": "figma.createFrame()"})]),
+            message(tool_calls=[render_call("c2", "Hero")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:9"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:9", "name": "Hero"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        }
+    )
+
+    result = loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
+
+    # The model's raw JS never reached Figma; only the compiled render_ui did.
+    assert len(bridge.model_exec_requests()) == 1
+    ran = bridge.model_exec_requests()[0].code or ""
+    assert "const root0 = await figma.getNodeByIdAsync" in ran   # the renderer's preamble
+    assert result.success is True
+
+
+def test_a_section_step_is_never_shown_javascript_examples():
+    """Demonstrating a tool is the surest way to make a model reach for it."""
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the root frame."]'),
+            message(tool_calls=[render_call("c1", "Hero")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:9"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:9", "name": "Hero"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        }
+    )
+
+    loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
+
+    prompt = step_prompts(llm)[0]
+    assert "figma.createFrame()" not in prompt      # no JS exemplars
+    assert '"kind":"section"' in prompt             # spec exemplars instead
+    assert "Call `render_ui` ONCE" in prompt
+
+
+def test_component_steps_never_reach_the_plan():
+    """The real run planned five of them across five screens. Every one either
+    failed or left a loose component cluttering the canvas that nothing used."""
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content=json.dumps([
+                "Create Button component with primary and secondary variants, reusable across screens.",
+                "Create reusable Table Row component with icon, text, action button slots.",
+                "Add the sign-in card into the frame.",
+            ])),
+            message(tool_calls=[render_call("c1", "Sign in")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:9"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:9", "name": "Sign in"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        }
+    )
+
+    result = loop.run("a sign-in screen", bridge, llm, max_retries=1, max_steps=10)
+
+    assert result.metrics["steps_planned"] == 1     # only the one that builds something
+    assert result.success is True
+
+
+def test_the_frame_width_comes_from_the_width_not_the_height():
+    """"Desktop frame: 1440 x 1024px" produced 1024px-wide screens, because a
+    bare pixel pattern matched the HEIGHT."""
+    assert loop._root_width("Desktop frame: 1440 x 1024px") == 1440
+    assert loop._root_width("Desktop frame: 1440 × 1024px") == 1440
+    # An incidental small value must not win either.
+    assert loop._root_width("Border radius: 8px. Card radius: 12px. Frame 1440px wide.") == 1440
+    assert loop._root_width("a 375px wide mobile screen") == 375

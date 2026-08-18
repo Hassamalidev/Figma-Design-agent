@@ -22,12 +22,49 @@ import logging
 import re
 from dataclasses import dataclass
 
+from agent import renderer, scaffold
+
 logger = logging.getLogger(__name__)
 
-# Reads the subtree with the geometry needed to reason about layout.
-LAYOUT_SCRIPT = """\
-const root = await figma.getNodeByIdAsync({node_id});
+# Reads the subtree with the geometry needed to reason about layout, PLUS the
+# properties the design-system checks need: the resolved fill, whether that
+# fill is token-backed, and the auto-layout spacing values. Reading them here
+# costs nothing extra -- it is the same single round trip -- and it is what
+# lets contrast, spacing scale and type ramp be checked as arithmetic instead
+# of being asserted in a prompt and hoped for.
+LAYOUT_SCRIPT = """const root = await figma.getNodeByIdAsync({node_id});
 if (!root) {{ throw new Error('node not found'); }}
+
+// The first opaque SOLID fill, as plain numbers. Figma hands back a read-only
+// array, and `fills` is the `mixed` SYMBOL on a node with differing fills --
+// neither is safe to index without checking.
+function solidFill(node) {{
+  if (!('fills' in node)) {{ return null; }}
+  const fills = node.fills;
+  if (!Array.isArray(fills)) {{ return null; }}
+  for (const paint of fills) {{
+    if (!paint || paint.type !== 'SOLID' || paint.visible === false) {{ continue; }}
+    const opacity = typeof paint.opacity === 'number' ? paint.opacity : 1;
+    if (opacity < 0.9) {{ continue; }}   // see-through: not the effective colour
+    return {{ r: paint.color.r, g: paint.color.g, b: paint.color.b }};
+  }}
+  return null;
+}}
+
+// Token-backed means "changing the token changes this node": either it uses one
+// of our paint styles, or its paint is bound to a variable directly.
+function tokenBacked(node) {{
+  if ('fillStyleId' in node && typeof node.fillStyleId === 'string' && node.fillStyleId) {{
+    return true;
+  }}
+  if (!('fills' in node)) {{ return false; }}
+  const fills = node.fills;
+  if (!Array.isArray(fills)) {{ return false; }}
+  for (const paint of fills) {{
+    if (paint && paint.boundVariables && paint.boundVariables.color) {{ return true; }}
+  }}
+  return false;
+}}
 
 function describe(node, depth) {{
   const info = {{
@@ -36,11 +73,21 @@ function describe(node, depth) {{
     width: Math.round(node.width), height: Math.round(node.height),
     visible: node.visible !== false,
     layoutMode: 'layoutMode' in node ? node.layoutMode : null,
+    fill: solidFill(node),
+    tokenBacked: tokenBacked(node),
     children: []
   }};
+  if (info.layoutMode && info.layoutMode !== 'NONE') {{
+    info.itemSpacing = Math.round(node.itemSpacing);
+    info.padding = [
+      Math.round(node.paddingTop), Math.round(node.paddingRight),
+      Math.round(node.paddingBottom), Math.round(node.paddingLeft)
+    ];
+  }}
   if (node.type === 'TEXT') {{
-    info.characters = String(node.characters).slice(0, 60);
+    info.characters = String(node.characters).slice(0, 120);
     info.fontSize = typeof node.fontSize === 'number' ? node.fontSize : null;
+    info.fontStyle = (node.fontName && node.fontName.style) ? String(node.fontName.style) : '';
   }}
   if ('children' in node && depth < 4) {{
     info.children = node.children.slice(0, 40).map(function (c) {{ return describe(c, depth + 1); }});
@@ -57,6 +104,13 @@ class Defect:
     node_name: str
     kind: str
     detail: str
+    # Advisory defects are REPORTED but never fail a step. The split matters:
+    # a 0x0 node renders nothing (fact, worth a retry), while "this 20px gap is
+    # off the 8px scale" is a polish note. Gating on the latter would burn a
+    # step's whole retry budget on something no user would call broken --
+    # exactly the failure mode CLAUDE.md section 8b warns about for the vision
+    # critic, arrived at from the other direction.
+    advisory: bool = False
 
     def __str__(self) -> str:
         return f"[{self.kind}] {self.node_name}: {self.detail}"
@@ -66,6 +120,40 @@ class Defect:
 # at which it reads as a real visual bug.
 OVERLAP_TOLERANCE = 2
 OVERFLOW_TOLERANCE = 2
+
+# ---- design-system thresholds --------------------------------------------
+#
+# CLAUDE.md computes contrast to build the PROMPT (the "readable pairings"
+# handed to the builder) but never checked the result, so a model that ignored
+# the list produced invisible copy that passed every gate. These are the same
+# numbers, applied to what actually landed on the canvas.
+
+# WCAG AA. Large text is a lower bar because size compensates for contrast.
+NORMAL_TEXT_AA = 4.5
+LARGE_TEXT_AA = 3.0
+LARGE_TEXT_PX = 24            # or 18.66px when bold -- the WCAG definition
+LARGE_TEXT_BOLD_PX = 18.66
+
+# Below AA is a defect; below THIS is unreadable. Only the unreadable band
+# blocks a step. 4.4:1 is a real AA failure and worth reporting, but failing a
+# section over it -- and eventually replacing it with a TODO placeholder --
+# would be a worse design outcome than shipping it.
+NORMAL_TEXT_BROKEN = 3.0
+LARGE_TEXT_BROKEN = 2.0
+
+# The spacing scale the harness itself builds to (agent/renderer.SPACING),
+# widened with the intermediate 8px-grid values a hand-written script may
+# legitimately use. Anything outside this is what makes a generated page feel
+# arrhythmic even when nothing overlaps.
+SPACING_SCALE = frozenset(renderer.SPACING.values()) | {12, 20, 40, 56, 64, 80, 96, 120}
+
+# The type ramp bootstrap_tokens actually creates. A size outside it means the
+# text style was ignored in favour of an ad-hoc fontSize.
+TYPE_RAMP = frozenset(size for _, _, size, _ in scaffold.TEXT_STYLES)
+
+# Below this a frame is an icon/divider, where a one-off colour is normal and
+# flagging it would be pure noise.
+MIN_TOKEN_AUDIT_AREA = 24 * 24
 
 
 # A long defect list is unreadable and, worse, unactionable. Repeats of the
@@ -85,11 +173,31 @@ def find_layout_defects(tree: dict, scope_ids: list[str] | None = None) -> list[
     step 7 -- which then burns its retries on a problem it did not cause and
     cannot see. The whole-tree form (no scope) is what the final review uses.
     """
+    return _condense([d for d in analyze(tree, scope_ids) if not d.advisory])
+
+
+def find_design_defects(tree: dict, scope_ids: list[str] | None = None) -> list[Defect]:
+    """Design-system adherence: contrast, spacing scale, type ramp, tokens.
+
+    Everything here is advisory -- reported in the run summary, never used to
+    fail a step. These are the rules CLAUDE.md states as prose ("tokens ->
+    components -> composition", "never hardcode a colour"), measured against
+    what actually landed rather than asserted in a prompt and hoped for.
+    """
+    return _condense([d for d in analyze(tree, scope_ids) if d.advisory])
+
+
+def analyze(tree: dict, scope_ids: list[str] | None = None) -> list[Defect]:
+    """Every defect in ONE walk, blocking and advisory together.
+
+    One traversal rather than two: the checks share the work of resolving each
+    node's inherited background, which is the only genuinely awkward part.
+    """
     roots = [tree] if not scope_ids else find_subtrees(tree, set(scope_ids))
     found: list[Defect] = []
     for root in roots:
-        _walk(root, found)
-    return _condense(found)
+        _walk(root, found, None)
+    return found
 
 
 def find_subtrees(tree: dict, wanted: set[str]) -> list[dict]:
@@ -127,9 +235,10 @@ def _condense(defects: list[Defect]) -> list[Defect]:
     return result
 
 
-def _walk(node: dict, defects: list[Defect]) -> None:
+def _walk(node: dict, defects: list[Defect], background: tuple | None) -> None:
     children = node.get("children") or []
-    _check_self(node, defects)
+    _check_self(node, defects, background)
+    _check_design(node, defects)
 
     if children:
         _check_children_fit(node, children, defects)
@@ -138,11 +247,26 @@ def _walk(node: dict, defects: list[Defect]) -> None:
         if node.get("layoutMode") in (None, "NONE"):
             _check_overlaps(children, defects)
 
+    # A node with no fill of its own shows whatever is behind it, so the
+    # background a text node sits on is the nearest FILLED ancestor -- not
+    # necessarily its direct parent.
+    inherited = fill_rgb(node) or background
     for child in children:
-        _walk(child, defects)
+        _walk(child, defects, inherited)
 
 
-def _check_self(node: dict, defects: list[Defect]) -> None:
+def fill_rgb(node: dict) -> tuple[float, float, float] | None:
+    """The node's own opaque solid fill as 0-1 RGB, or None if it has none."""
+    fill = node.get("fill")
+    if not isinstance(fill, dict):
+        return None
+    try:
+        return (float(fill["r"]), float(fill["g"]), float(fill["b"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _check_self(node: dict, defects: list[Defect], background: tuple | None = None) -> None:
     name = node.get("name", "?")
     node_id = node.get("id", "?")
     width = node.get("width") or 0
@@ -191,12 +315,128 @@ def _check_self(node: dict, defects: list[Defect]) -> None:
                        f"for the content (or layoutSizingHorizontal='FILL' inside an auto-layout parent)")
             )
 
+        _check_contrast(node, defects, background)
+
     if node.get("type") == "FRAME" and not (node.get("children") or []):
         if width > 40 and height > 40:
             defects.append(
                 Defect(node_id, name, "empty-frame",
                        f"{width}x{height} frame is empty, leaving a blank region")
             )
+
+
+def _check_contrast(node: dict, defects: list[Defect], background: tuple | None) -> None:
+    """Is this text actually readable against what is behind it?
+
+    Geometry cannot see contrast: text bound to the wrong token is the right
+    size, in the right place, and completely invisible -- and every existing
+    check passes it. The palette's legal pairings are already MEASURED for the
+    prompt (scaffold.readable_pairings); this measures the result.
+
+    Silent when either colour is unknown. Text over an image, a gradient or a
+    frame with no fill anywhere above it has no single background colour, and
+    inventing one would produce confident nonsense.
+    """
+    foreground = fill_rgb(node)
+    if foreground is None or background is None:
+        return
+    if not (node.get("characters") or "").strip():
+        return  # empty text is already reported as its own defect
+
+    ratio = scaffold.contrast_ratio_rgb(foreground, background)
+    size = node.get("fontSize") or 0
+    bold = "bold" in str(node.get("fontStyle") or "").lower()
+    large = size >= LARGE_TEXT_PX or (bold and size >= LARGE_TEXT_BOLD_PX)
+
+    required = LARGE_TEXT_AA if large else NORMAL_TEXT_AA
+    if ratio >= required:
+        return
+
+    unreadable = LARGE_TEXT_BROKEN if large else NORMAL_TEXT_BROKEN
+    if ratio < unreadable:
+        defects.append(
+            Defect(
+                node.get("id", "?"), node.get("name", "?"), "contrast",
+                f"text is {ratio}:1 against its background -- effectively invisible "
+                f"(WCAG AA needs {required}:1). Bind its fill to one of the colour "
+                f"pairings listed as readable, not to whichever token sounds right",
+            )
+        )
+    else:
+        defects.append(
+            Defect(
+                node.get("id", "?"), node.get("name", "?"), "contrast-aa",
+                f"text is {ratio}:1 against its background, below the {required}:1 "
+                f"WCAG AA minimum -- legible but not accessible",
+                advisory=True,
+            )
+        )
+
+
+def _check_design(node: dict, defects: list[Defect]) -> None:
+    """Spacing scale, type ramp and token backing -- the rules that were prose.
+
+    All three are arithmetic over values already in the tree, so they cost
+    nothing and cannot hallucinate. All three are advisory: a page that is
+    correct but 4px off the scale is still a working page.
+    """
+    node_id, name = node.get("id", "?"), node.get("name", "?")
+
+    if node.get("layoutMode") in ("VERTICAL", "HORIZONTAL"):
+        off_scale = sorted(
+            {v for v in _spacing_values(node) if v not in SPACING_SCALE}
+        )
+        if off_scale:
+            defects.append(
+                Defect(
+                    node_id, name, "off-scale-spacing",
+                    f"uses spacing {', '.join(f'{v}px' for v in off_scale[:4])} which is "
+                    f"not on the 8px scale -- the layout reads as arrhythmic next to "
+                    f"sections that are",
+                    advisory=True,
+                )
+            )
+
+    if node.get("type") == "TEXT":
+        size = node.get("fontSize")
+        if size and int(size) not in TYPE_RAMP:
+            defects.append(
+                Defect(
+                    node_id, name, "off-ramp-type",
+                    f"{int(size)}px is not on the type ramp "
+                    f"({', '.join(str(s) for s in sorted(TYPE_RAMP))}) -- a text style "
+                    f"was set aside in favour of an ad-hoc size",
+                    advisory=True,
+                )
+            )
+
+    # Golden rule 5: never hardcode a colour into a final node. The harness
+    # rebinds anything close to a token in `audit_variable_bindings`, so what
+    # survives to here is genuinely off-palette.
+    if node.get("fill") and not node.get("tokenBacked"):
+        area = (node.get("width") or 0) * (node.get("height") or 0)
+        if area >= MIN_TOKEN_AUDIT_AREA:
+            defects.append(
+                Defect(
+                    node_id, name, "untokenised-fill",
+                    "has a hardcoded colour that matches no token, so changing the "
+                    "palette will not change it",
+                    advisory=True,
+                )
+            )
+
+
+def _spacing_values(node: dict) -> list[int]:
+    """Auto-layout gaps and paddings, as plain ints. Zero is always on-scale."""
+    values: list[int] = []
+    spacing = node.get("itemSpacing")
+    # Only meaningful once there is a gap to space: a single child never shows it.
+    if isinstance(spacing, (int, float)) and len(node.get("children") or []) > 1:
+        values.append(int(spacing))
+    padding = node.get("padding")
+    if isinstance(padding, list):
+        values.extend(int(v) for v in padding if isinstance(v, (int, float)))
+    return [v for v in values if v]
 
 
 def _check_children_fit(parent: dict, children: list[dict], defects: list[Defect]) -> None:

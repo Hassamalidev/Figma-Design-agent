@@ -20,12 +20,12 @@ from agent import critic, scaffold
 from bench.capture import walk
 from bench.spec import Criterion, Task
 
-# The scale the harness builds to. Padding and gaps off this scale are what
-# makes a generated page feel arrhythmic even when nothing overlaps.
-SPACING_SCALE = {0, 4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64, 80, 96, 120}
-
-# Font sizes from scaffold.TEXT_STYLES -- the ramp the harness actually creates.
-TYPE_RAMP = {size for _, _, size, _ in scaffold.TEXT_STYLES}
+# The scale and ramp the harness builds to, defined once in agent/critic.py so
+# the benchmark cannot drift from the gate that runs during a build. Padding
+# and gaps off this scale are what makes a generated page feel arrhythmic even
+# when nothing overlaps.
+SPACING_SCALE = critic.SPACING_SCALE
+TYPE_RAMP = critic.TYPE_RAMP
 
 # Above this many geometry defects a page reads as broken rather than blemished.
 LAYOUT_DEFECT_FLOOR = 8

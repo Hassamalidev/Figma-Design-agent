@@ -11,6 +11,7 @@ import pytest
 
 from config import Settings, load_settings
 from web.app import DashboardServer
+from web.history import History
 from web.registry import FileEntry, Registry
 from web.settings_store import SettingsStore, mask
 
@@ -131,7 +132,12 @@ def make_dashboard(tmp_path, monkeypatch):
         monkeypatch.delenv(key, raising=False)
     store = SettingsStore(env_path=tmp_path / "absent.env", runtime_path=tmp_path / "runtime.json")
     registry = Registry(tmp_path / "files.json")
-    return DashboardServer(FakeBridge(), store, registry, llm_factory=FakeLLM)
+    # History MUST be redirected too. It defaults to web/history.json -- the
+    # real one -- so every test that drove a run was writing a fake "a dashboard
+    # / Untitled / 5ms" entry into the user's own History tab, 50 of which had
+    # completely buried their actual runs.
+    history = History(tmp_path / "history.json")
+    return DashboardServer(FakeBridge(), store, registry, llm_factory=FakeLLM, history=history)
 
 
 def test_settings_snapshot_never_leaks_the_key(tmp_path, monkeypatch):
@@ -215,6 +221,7 @@ def test_the_dashboard_run_worker_reaches_the_agent(tmp_path, monkeypatch):
         return SimpleNamespace(
             success=True, created_node_ids=[], failed_steps=[], warnings=[],
             layout_defects=[], final_screenshot_base64=None, step_results=[],
+            design_notes=[], requirements_met=[], requirements_missing=[],
         )
 
     monkeypatch.setattr("web.app.loop.run", fake_run)
@@ -246,6 +253,7 @@ def test_no_vision_critic_configured_passes_none_rather_than_failing(tmp_path, m
         lambda *a, **kw: (seen.update(kw), SimpleNamespace(
             success=True, created_node_ids=[], failed_steps=[], warnings=[],
             layout_defects=[], final_screenshot_base64=None, step_results=[],
+            design_notes=[], requirements_met=[], requirements_missing=[],
         ))[1],
     )
     monkeypatch.setattr(dash, "_wait_for_file", lambda _key: True)
@@ -273,6 +281,7 @@ def test_a_failed_thumbnail_refresh_does_not_discard_a_successful_run(tmp_path, 
         lambda *a, **kw: SimpleNamespace(
             success=True, created_node_ids=["1:1"], failed_steps=[], warnings=[],
             layout_defects=[], final_screenshot_base64=None, step_results=[],
+            design_notes=[], requirements_met=[], requirements_missing=[],
         ),
     )
     monkeypatch.setattr(dash, "_wait_for_file", lambda _key: True)
@@ -282,3 +291,258 @@ def test_a_failed_thumbnail_refresh_does_not_discard_a_successful_run(tmp_path, 
 
     assert dash._run_status == "done"
     assert dash._run_result["created_node_count"] == 1
+
+
+# ---- dashboard: preferences, progress and resilience -----------------------
+
+
+def test_the_api_hands_the_ui_the_bounds_it_should_enforce(tmp_path, monkeypatch):
+    """The page renders its number inputs from this, instead of hardcoding
+    min/max in HTML where they can drift from what the store accepts."""
+    dash = make_dashboard(tmp_path, monkeypatch)
+
+    schema = {row["key"]: row for row in dash.settings_snapshot()["prefs_schema"]}
+
+    assert schema["max_steps"]["maximum"] == 100
+    assert schema["visual_gate"]["kind"] == "bool"
+
+
+def test_a_rejected_preference_comes_back_with_its_reason(tmp_path, monkeypatch):
+    """Silently reverting an input leaves the user with no idea why."""
+    dash = make_dashboard(tmp_path, monkeypatch)
+
+    reply = dash.update_prefs({"max_steps": 5000})
+
+    assert reply["prefs"]["max_steps"] == 100
+    assert reply["pref_errors"] and "between 1 and 100" in reply["pref_errors"][0]
+
+
+def test_a_valid_preference_reports_no_errors(tmp_path, monkeypatch):
+    dash = make_dashboard(tmp_path, monkeypatch)
+
+    reply = dash.update_prefs({"visual_gate": "false"})
+
+    assert reply["prefs"]["visual_gate"] is False
+    assert reply["pref_errors"] == []
+
+
+def test_status_carries_live_metrics_for_the_progress_display(tmp_path, monkeypatch):
+    from agent.metrics import RunMetrics
+
+    dash = make_dashboard(tmp_path, monkeypatch)
+    measured = RunMetrics()
+    measured.start_step("Add the hero section", index=3, total=8)
+    dash._run_metrics = measured
+
+    progress = dash.status_snapshot()["metrics"]["progress"]
+
+    assert progress["index"] == 3 and progress["total"] == 8
+    assert progress["step"] == "Add the hero section"
+
+
+def test_a_broken_metrics_read_never_breaks_the_status_endpoint(tmp_path, monkeypatch):
+    """It is read from the HTTP thread while the run thread writes. A status
+    endpoint that 500s because a counter moved is worse than a skipped frame."""
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash._run_metrics = SimpleNamespace(snapshot=lambda: (_ for _ in ()).throw(RuntimeError("torn")))
+
+    assert dash.status_snapshot()["metrics"] is None
+
+
+def test_the_connection_watcher_survives_a_failed_snapshot(tmp_path, monkeypatch):
+    """A screenshot can fail (plugin closed, Dev Mode). That used to kill the
+    watcher thread outright, after which the gallery silently stopped updating
+    for the rest of the process."""
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash.bridge.current_file = SimpleNamespace(file_key="fk", file_name="Untitled")
+    dash.bridge.connection_generation = 1
+    calls = []
+
+    def exploding_capture(*args):
+        calls.append(args)
+        raise RuntimeError("plugin went away")
+
+    monkeypatch.setattr(dash, "_capture", exploding_capture)
+    monkeypatch.setattr("web.app.time.sleep", lambda _s: (_ for _ in ()).throw(StopIteration))
+
+    with pytest.raises(StopIteration):     # only our sentinel escapes the loop
+        dash.watch_connections()
+
+    assert calls, "the watcher must have tried"
+    # ...and the generation is NOT marked done, so the next tick retries it.
+    assert dash._last_captured_generation == -1
+
+
+# ---- the file gallery must show each file's OWN design ---------------------
+
+
+def _dashboard_in_file(tmp_path, monkeypatch, file_key, image):
+    """A dashboard whose plugin is currently in `file_key`, rendering `image`."""
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash.bridge.current_file = SimpleNamespace(file_key=file_key, file_name=file_key)
+    monkeypatch.setattr(
+        "web.app.get_screenshot",
+        lambda bridge, node_id=None: {"ok": image is not None, "image_base64": image, "error": None},
+    )
+    return dash
+
+
+def test_a_thumbnail_is_stored_for_the_file_that_is_actually_open(tmp_path, monkeypatch):
+    dash = _dashboard_in_file(tmp_path, monkeypatch, "fk-a", "PICTURE-OF-A")
+
+    dash._capture("fk-a", "Design A")
+
+    assert dash.registry.get("fk-a").thumbnail_base64 == "PICTURE-OF-A"
+
+
+def test_one_designs_picture_never_lands_on_another_designs_card(tmp_path, monkeypatch):
+    """The reported bug. The screenshot comes from whatever file the plugin is
+    in now; `file_key` is what we file it under. If the user switched files,
+    those differ -- and storing it anyway mislabels the design."""
+    dash = _dashboard_in_file(tmp_path, monkeypatch, "fk-b", "PICTURE-OF-B")
+
+    dash._capture("fk-a", "Design A")   # asked for A, but the plugin is in B
+
+    assert dash.registry.get("fk-a") is None
+
+
+def test_switching_files_mid_render_is_also_caught(tmp_path, monkeypatch):
+    """The check has to happen after the screenshot too: rendering takes time,
+    and the plugin can move during it."""
+    dash = _dashboard_in_file(tmp_path, monkeypatch, "fk-a", "PICTURE-OF-B")
+
+    def wander(bridge, node_id=None):
+        dash.bridge.current_file = SimpleNamespace(file_key="fk-b", file_name="B")
+        return {"ok": True, "image_base64": "PICTURE-OF-B", "error": None}
+
+    monkeypatch.setattr("web.app.get_screenshot", wander)
+    dash._capture("fk-a", "Design A")
+
+    assert dash.registry.get("fk-a") is None
+
+
+def test_a_failed_screenshot_keeps_the_last_good_thumbnail(tmp_path, monkeypatch):
+    """`upsert` replaces the whole entry, so writing None erased the picture --
+    a card would go blank because one render happened to fail."""
+    dash = _dashboard_in_file(tmp_path, monkeypatch, "fk-a", "GOOD-PICTURE")
+    dash._capture("fk-a", "Design A")
+
+    monkeypatch.setattr(
+        "web.app.get_screenshot",
+        lambda bridge, node_id=None: {"ok": False, "image_base64": None, "error": "Dev Mode"},
+    )
+    dash._capture("fk-a", "Design A")
+
+    assert dash.registry.get("fk-a").thumbnail_base64 == "GOOD-PICTURE"
+
+
+def test_no_plugin_connected_captures_nothing(tmp_path, monkeypatch):
+    dash = _dashboard_in_file(tmp_path, monkeypatch, "fk-a", "PICTURE")
+    dash.bridge.current_file = None
+
+    dash._capture("fk-a", "Design A")
+
+    assert dash.registry.get("fk-a") is None
+
+
+# ---- removing a file from the gallery -------------------------------------
+#
+# There is no "delete the Figma file" anywhere here, because no such operation
+# exists: a plugin runs INSIDE a file, the Plugin API has no deleteFile, and
+# figma.fileKey is read-only. The two things that ARE possible -- forgetting the
+# file locally, and emptying its canvas -- are separate, and the destructive one
+# is opt-in.
+
+
+def _gallery_with(tmp_path, monkeypatch, connected_key=None):
+    dash = make_dashboard(tmp_path, monkeypatch)
+    for key, name in (("fk-a", "Design A"), ("fk-b", "Design B")):
+        dash.registry.upsert(
+            FileEntry(file_key=key, file_name=name, thumbnail_base64="PIC", last_seen="2026-01-01")
+        )
+    if connected_key:
+        dash.bridge.current_file = SimpleNamespace(file_key=connected_key, file_name=connected_key)
+    return dash
+
+
+def test_removing_a_file_forgets_it_without_touching_figma(tmp_path, monkeypatch):
+    dash = _gallery_with(tmp_path, monkeypatch)
+    ran = []
+    monkeypatch.setattr("web.app.execute_figma_js", lambda *a, **k: ran.append(a) or {"ok": True})
+
+    ok, message = dash.forget_file("fk-a")
+
+    assert ok and "Removed" in message
+    assert dash.registry.get("fk-a") is None
+    assert dash.registry.get("fk-b") is not None      # only the one asked for
+    assert ran == [], "nothing may be executed in Figma for a gallery-only removal"
+
+
+def test_removing_an_unknown_file_is_refused(tmp_path, monkeypatch):
+    dash = _gallery_with(tmp_path, monkeypatch)
+
+    ok, message = dash.forget_file("nope")
+
+    assert not ok and "not in the gallery" in message
+
+
+def test_clearing_the_canvas_requires_that_file_to_be_open(tmp_path, monkeypatch):
+    """The script always runs in whichever file the plugin is in, so clearing
+    a file that is not open would wipe a different design entirely."""
+    dash = _gallery_with(tmp_path, monkeypatch, connected_key="fk-b")
+    ran = []
+    monkeypatch.setattr("web.app.execute_figma_js", lambda *a, **k: ran.append(a) or {"ok": True})
+
+    ok, message = dash.forget_file("fk-a", clear_canvas=True)
+
+    assert not ok
+    assert "not open with the plugin running" in message
+    assert ran == []
+    assert dash.registry.get("fk-a") is not None      # nothing removed either
+
+
+def test_clearing_the_canvas_runs_only_for_the_connected_file(tmp_path, monkeypatch):
+    dash = _gallery_with(tmp_path, monkeypatch, connected_key="fk-a")
+    monkeypatch.setattr(
+        "web.app.execute_figma_js",
+        lambda bridge, code, **k: {"ok": True, "result": {"removed": 4}, "error": None},
+    )
+
+    ok, message = dash.forget_file("fk-a", clear_canvas=True)
+
+    assert ok
+    assert "Deleted 4 top-level layer(s)" in message
+    assert dash.registry.get("fk-a") is None
+
+
+def test_a_failed_clear_keeps_the_file_in_the_gallery(tmp_path, monkeypatch):
+    """Reporting it as removed while the canvas is untouched would be a lie."""
+    dash = _gallery_with(tmp_path, monkeypatch, connected_key="fk-a")
+    monkeypatch.setattr(
+        "web.app.execute_figma_js",
+        lambda bridge, code, **k: {"ok": False, "result": None, "error": "Dev Mode is read-only"},
+    )
+
+    ok, message = dash.forget_file("fk-a", clear_canvas=True)
+
+    assert not ok and "Dev Mode" in message
+    assert dash.registry.get("fk-a") is not None
+
+
+def test_nothing_is_deleted_while_a_run_is_in_progress(tmp_path, monkeypatch):
+    dash = _gallery_with(tmp_path, monkeypatch, connected_key="fk-a")
+    dash._run_status = "running"
+
+    ok, message = dash.forget_file("fk-a")
+
+    assert not ok and "run is in progress" in message
+    assert dash.registry.get("fk-a") is not None
+
+
+def test_the_delete_endpoint_reports_refusals(tmp_path, monkeypatch):
+    dash = _gallery_with(tmp_path, monkeypatch)
+
+    ok, _ = dash.forget_file("fk-a")
+    assert ok
+    ok_again, message = dash.forget_file("fk-a")
+    assert not ok_again and message      # a second delete says why, rather than pretending

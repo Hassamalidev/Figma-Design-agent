@@ -155,18 +155,6 @@ h1 { font-size: 26px; font-weight: 600; letter-spacing: -.025em; margin: 0 0 6px
 .subtitle { color: var(--text-2); margin: 0 0 26px; font-size: 14px; }
 .section-label { font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--text-4); margin: 32px 0 12px; }
 
-/* ============================== banner ============================== */
-.banner {
-  display: none; align-items: center; gap: 14px; padding: 15px 17px; margin-bottom: 22px;
-  border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); background: var(--bg-2);
-}
-.banner.show { display: flex; }
-.banner.warn { border-color: rgba(245,158,11,.28); background: linear-gradient(90deg, rgba(245,158,11,.07), transparent 60%), var(--bg-2); }
-.banner-ico { width: 34px; height: 34px; flex: none; display: grid; place-items: center; border-radius: var(--radius-md); background: rgba(245,158,11,.13); color: var(--warning); }
-.banner-ico svg { width: 17px; height: 17px; }
-.banner-title { font-weight: 600; font-size: 13.5px; }
-.banner-text { color: var(--text-2); font-size: 12.5px; }
-
 /* ============================= composer ============================= */
 .composer {
   background: var(--bg-2); border: 1px solid var(--border-subtle);
@@ -242,8 +230,16 @@ h1 { font-size: 26px; font-weight: 600; letter-spacing: -.025em; margin: 0 0 6px
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
 .card { position: relative; overflow: hidden; background: var(--bg-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); cursor: pointer; transition: border-color .2s var(--ease), transform .16s var(--ease); }
 .card.selected { border-color: var(--border-accent); box-shadow: inset 0 0 0 1px var(--border-accent); }
-.thumb { aspect-ratio: 16/10; background: var(--bg-3); display: grid; place-items: center; color: var(--text-4); font-size: 11.5px; border-bottom: 1px solid var(--border-subtle); position: relative; }
-.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb { aspect-ratio: 16/10; background: var(--bg-3); display: grid; place-items: center; color: var(--text-4); font-size: 11.5px; border-bottom: 1px solid var(--border-subtle); position: relative; overflow: hidden; }
+/* Absolutely positioned, so the image is NOT a grid item. A Figma page
+   screenshot is routinely 1440x5200, and in flow its automatic minimum size
+   (grid items default to `min-height: auto`) expanded the thumbnail past its
+   own aspect-ratio, which stretched the whole grid row -- one tall design made
+   every card in the gallery the wrong shape. Out of flow it cannot size its
+   container at all, so the tile is always the same rectangle.
+   `object-position: top` because the top of a page is the recognisable part;
+   centring a 5200px-tall design shows an arbitrary slice of its middle. */
+.thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: top center; display: block; }
 .card-body { padding: 11px 13px; display: flex; align-items: center; gap: 9px; }
 .card-info { min-width: 0; flex: 1; }
 .card-name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -252,6 +248,22 @@ h1 { font-size: 26px; font-weight: 600; letter-spacing: -.025em; margin: 0 0 6px
 .card:hover .card-actions { opacity: 1; transform: translateY(0); }
 .mini-btn { width: 27px; height: 27px; display: grid; place-items: center; border-radius: var(--radius-sm); cursor: pointer; background: var(--glass); backdrop-filter: blur(12px); border: 1px solid var(--border-focus); color: var(--text-1); }
 .mini-btn:hover { background: var(--bg-4); }
+.mini-btn.danger:hover { background: rgba(239,68,68,.16); color: var(--error); border-color: rgba(239,68,68,.35); }
+.btn.danger { background: var(--error); color: #fff; }
+.btn.danger:hover:not(:disabled) { opacity: .88; }
+
+/* An explicit opt-in for the destructive half of the dialog. Unticked by
+   default: removing a card from a gallery and wiping a canvas are different
+   sizes of action and must never be the same click. */
+.opt-in { display: flex; gap: 11px; align-items: flex-start; padding: 13px; margin-top: 14px;
+  border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-3); }
+.opt-in.armed { border-color: rgba(239,68,68,.35); background: rgba(239,68,68,.06); }
+.opt-in input { margin: 2px 0 0; width: 15px; height: 15px; flex: none; accent-color: var(--error); }
+.opt-in .t { display: block; font-size: 13px; font-weight: 500; }
+.opt-in .d { display: block; font-size: 12px; color: var(--text-3); margin-top: 3px; line-height: 1.5; }
+.opt-in.disabled { opacity: .55; }
+.note { font-size: 12.5px; color: var(--text-2); line-height: 1.6; }
+.note strong { color: var(--text-1); }
 .mini-btn svg { width: 13px; height: 13px; }
 
 .empty { grid-column: 1/-1; text-align: center; padding: 60px 24px; border: 1px dashed var(--border-focus); border-radius: var(--radius-lg); color: var(--text-3); }
@@ -259,13 +271,31 @@ h1 { font-size: 26px; font-weight: 600; letter-spacing: -.025em; margin: 0 0 6px
 .empty p { margin: 0 0 18px; font-size: 13px; }
 
 /* ============================== history ============================== */
-.hist-item { display: flex; align-items: center; gap: 14px; padding: 13px; background: var(--bg-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); margin-bottom: 10px; transition: border-color .2s var(--ease); }
-.hist-item:hover { border-color: var(--border-focus); }
-.hist-thumb { width: 82px; height: 52px; flex: none; border-radius: var(--radius-sm); background: var(--bg-3); border: 1px solid var(--border-subtle); overflow: hidden; display: grid; place-items: center; color: var(--text-4); font-size: 10px; }
-.hist-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.hist-day { font-size: 10.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--text-4); margin: 22px 0 10px; }
+.hist-day:first-child { margin-top: 4px; }
+.hist-item { display: flex; align-items: center; gap: 14px; cursor: pointer; padding: 12px 13px; background: var(--bg-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); margin-bottom: 8px; transition: border-color .2s var(--ease), transform .16s var(--ease); }
+.hist-item:hover { border-color: var(--border-focus); transform: translateY(-1px); }
+.hist-item:hover .hist-reuse { opacity: 1; }
+.hist-thumb { position: relative; width: 96px; aspect-ratio: 16/10; flex: none; border-radius: var(--radius-sm); background: var(--bg-3); border: 1px solid var(--border-subtle); overflow: hidden; display: grid; place-items: center; color: var(--text-4); }
+.hist-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: top center; }
+.hist-thumb svg { width: 20px; height: 20px; opacity: .45; }
+/* Borrowed from the file gallery rather than captured from this run -- say so,
+   quietly, instead of implying it is a picture of this particular result. */
+.hist-thumb .borrowed { position: absolute; right: 3px; bottom: 3px; font-size: 9px; padding: 1px 5px; border-radius: 99px; background: var(--glass); backdrop-filter: blur(8px); border: 1px solid var(--border-subtle); color: var(--text-3); }
 .hist-body { flex: 1; min-width: 0; }
-.hist-prompt { font-size: 13px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-.hist-meta { font-size: 11px; color: var(--text-4); margin-top: 3px; }
+.hist-prompt { font-size: 13.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.hist-meta { font-size: 11.5px; color: var(--text-3); margin-top: 3px; }
+.hist-meta .sep { color: var(--text-4); margin: 0 5px; }
+.hist-note { font-size: 11.5px; color: var(--warning); margin-top: 3px; }
+.hist-note.bad { color: var(--error); }
+.hist-right { display: flex; align-items: center; gap: 8px; flex: none; }
+.hist-reuse { opacity: 0; transition: opacity .18s var(--ease); }
+@media (max-width: 640px) {
+  .hist-item { flex-wrap: wrap; }
+  .hist-thumb { width: 68px; }
+  .hist-right { width: 100%; justify-content: space-between; }
+  .hist-reuse { opacity: 1; }
+}
 .status-badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 99px; font-size: 11px; font-weight: 600; flex: none; }
 .status-badge.ok   { background: rgba(34,197,94,.13); color: var(--success); }
 .status-badge.bad  { background: rgba(239,68,68,.13); color: var(--error); }
@@ -327,6 +357,99 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
 .code-row { display: flex; align-items: center; gap: 8px; }
 .code-row code { flex: 1; padding: 8px 10px; overflow-x: auto; white-space: nowrap; }
 
+/* ======================= readiness: "what do I do next?" ======================= */
+/* A three-step checklist that is always on screen: model, plugin, file. It shows
+   which are done, which one is blocking, and the single button that clears it. */
+.ready {
+  display: flex; align-items: center; gap: 16px; padding: 14px 16px; margin-bottom: 20px;
+  background: var(--bg-2); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg);
+}
+/* The pills carry the state, so the card stays neutral. Washing the whole card
+   in the same colour on top of them read as a dirty yellow tint rather than as
+   emphasis, and doubled the weight of a strip that is only ever a signpost. */
+.ready.blocked { border-color: rgba(245,158,11,.24); }
+.ready.go { border-color: rgba(34,197,94,.22); }
+.ready-steps { display: flex; align-items: center; gap: 4px; flex: none; }
+.ready-step {
+  display: inline-flex; align-items: center; gap: 7px; flex: none; white-space: nowrap;
+  padding: 4px 11px 4px 4px; border-radius: 99px; font-size: 11.5px; font-weight: 500;
+  border: 1px solid transparent; background: var(--bg-3); color: var(--text-4);
+  transition: background .2s var(--ease), color .2s var(--ease), border-color .2s var(--ease);
+}
+.ready-num {
+  width: 19px; height: 19px; flex: none; border-radius: 50%; display: grid; place-items: center;
+  font-size: 10px; font-weight: 700; line-height: 1;
+  background: var(--bg-4); color: var(--text-4);
+}
+.ready-step.done { background: rgba(34,197,94,.09); border-color: rgba(34,197,94,.20); color: var(--success); }
+.ready-step.done .ready-num { background: rgba(34,197,94,.22); color: var(--success); }
+.ready-step.now { background: rgba(245,158,11,.11); border-color: rgba(245,158,11,.26); color: var(--warning); font-weight: 600; }
+.ready-step.now .ready-num { background: var(--warning); color: #2a1a02; }
+.ready-sep { width: 10px; height: 1px; background: var(--border-subtle); flex: none; }
+.ready-main { flex: 1; min-width: 0; }
+.ready-title { font-weight: 600; font-size: 13.5px; }
+.ready-text { color: var(--text-2); font-size: 12.5px; }
+
+/* ====================== run status: progress over prose ====================== */
+.run-progress { padding: 14px 17px; border-bottom: 1px solid var(--border-subtle); }
+.run-step-line { display: flex; align-items: baseline; gap: 10px; margin-bottom: 9px; font-size: 13px; }
+.run-step-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.run-step-count { flex: none; font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.bar { height: 5px; border-radius: 99px; background: var(--bg-4); overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 99px; background: var(--accent); width: 0; transition: width .45s var(--ease); }
+.bar-fill.indeterminate { width: 35% !important; animation: slide 1.4s var(--ease) infinite; }
+@keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(320%); } }
+.run-elapsed { font-size: 11.5px; color: var(--text-4); font-variant-numeric: tabular-nums; }
+
+.result-hero { display: flex; align-items: center; gap: 13px; padding: 15px 17px; border-bottom: 1px solid var(--border-subtle); }
+.result-ico { width: 36px; height: 36px; flex: none; display: grid; place-items: center; border-radius: var(--radius-md); font-size: 17px; }
+.result-hero.ok   .result-ico { background: rgba(34,197,94,.14); }
+.result-hero.warn .result-ico { background: rgba(245,158,11,.14); }
+.result-hero.bad  .result-ico { background: rgba(239,68,68,.14); }
+.result-title { font-weight: 600; font-size: 14.5px; }
+.result-sub { font-size: 12.5px; color: var(--text-2); }
+
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 1px; background: var(--border-subtle); border-bottom: 1px solid var(--border-subtle); }
+.stat { background: var(--bg-2); padding: 11px 13px; }
+.stat-num { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.stat-lbl { font-size: 10.5px; color: var(--text-4); text-transform: uppercase; letter-spacing: .06em; margin-top: 1px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 17px 0; }
+.chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 99px; font-size: 11.5px; border: 1px solid var(--border-subtle); background: var(--bg-3); color: var(--text-2); }
+.chip.miss { border-color: rgba(239,68,68,.30); color: var(--error); background: rgba(239,68,68,.07); }
+.chip.met  { border-color: rgba(34,197,94,.26); color: var(--success); background: rgba(34,197,94,.06); }
+
+details.drawer { border-top: 1px solid var(--border-subtle); }
+details.drawer > summary {
+  padding: 11px 17px; cursor: pointer; font-size: 12.5px; font-weight: 500; color: var(--text-2);
+  list-style: none; display: flex; align-items: center; gap: 8px; user-select: none;
+}
+details.drawer > summary::-webkit-details-marker { display: none; }
+details.drawer > summary::before { content: "\203A"; font-size: 15px; color: var(--text-4); transition: transform .2s var(--ease); }
+details.drawer[open] > summary::before { transform: rotate(90deg); }
+details.drawer > summary:hover { color: var(--text-1); }
+.drawer-body { padding: 0 17px 15px; }
+.count-tag { margin-left: auto; font-size: 10.5px; padding: 1px 7px; border-radius: 99px; background: var(--bg-4); color: var(--text-3); }
+
+/* ============================ settings density ============================ */
+/* Four flat cards of rows read as one long wall. Grouping them into drawers lets
+   someone open Settings, change the one thing they came for, and leave. */
+.setting-group { border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); background: var(--bg-2); margin-bottom: 12px; }
+.setting-group > summary { padding: 14px 18px; cursor: pointer; list-style: none; display: flex; align-items: center; gap: 10px; user-select: none; }
+.setting-group > summary::-webkit-details-marker { display: none; }
+.setting-group > summary::before { content: "\203A"; font-size: 16px; color: var(--text-4); transition: transform .2s var(--ease); }
+.setting-group[open] > summary::before { transform: rotate(90deg); }
+.setting-group-title { font-weight: 600; font-size: 13.5px; }
+.setting-group-note { font-size: 12px; color: var(--text-4); margin-left: auto; text-align: right; }
+.setting-group .setting-card { border: 0; background: transparent; margin: 0; padding: 0 18px 6px; }
+.pref-error { padding: 9px 18px 13px; font-size: 12px; color: var(--warning); }
+
+/* ============================== empty states ============================== */
+.empty svg { width: 34px; height: 34px; margin-bottom: 12px; opacity: .5; }
+.empty.bad { border-color: rgba(239,68,68,.30); }
+.skeleton { border-radius: var(--radius-lg); background: var(--bg-3); animation: pulse 1.5s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .45; } }
+
 /* ============================= responsive ============================= */
 @media (max-width: 900px) {
   .sidebar { display: none; }
@@ -334,23 +457,45 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
   .grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
   .brand span { display: none; }
 }
+
+/* Below 640px the tabs used to collapse into a hamburger dropdown -- a hidden
+   menu is the wrong shape for four destinations you switch between constantly.
+   They become a fixed bottom bar instead, which is what a phone expects and
+   what keeps every tab one thumb-tap away. */
 @media (max-width: 640px) {
-  .tabs { display: none; }
-  .tabs.mobile-open { display: flex; position: absolute; top: var(--header-h); left: 12px; right: 12px; flex-direction: column; padding: 8px; box-shadow: var(--shadow-lg); }
+  .tabs {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 45;
+    display: flex; gap: 0; padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
+    border: 0; border-top: 1px solid var(--border-subtle); border-radius: 0;
+    background: var(--glass); backdrop-filter: blur(24px) saturate(180%);
+  }
+  .tab { flex: 1; justify-content: center; padding: 9px 4px; font-size: 12px; min-height: 42px; }
   .grid, .template-grid { grid-template-columns: 1fr; }
   .pill.hide-sm { display: none; }
   .footer { display: none; }
+  .main { padding: 20px 14px 84px; }   /* clear of the bottom bar */
+  h1 { font-size: 22px; }
+
+  /* Rows built as "label ... control" squeeze the description to nothing on a
+     phone. Let them stack, and give every control a real tap target. */
+  .ready { flex-wrap: wrap; }
+  .ready-steps { order: 2; width: 100%; }
+  .setting-row { flex-wrap: wrap; }
+  .setting-row .btn, .setting-row .num, .setting-row .toggle { min-height: 38px; }
+  .num { width: 100% !important; }
+  .test-result { margin-left: 0; text-align: left; width: 100%; }
+  .composer-foot { flex-wrap: wrap; }
+  .composer-hint { width: 100%; white-space: normal; }
+  .stat-grid { grid-template-columns: repeat(2, 1fr); }
+  .modal-foot, .modal-head, .modal-body { padding-left: 16px; padding-right: 16px; }
+  .code-row { flex-wrap: wrap; }
 }
-@media (min-width: 641px) { #btn-menu { display: none; } }
 </style>
 </head>
 <body>
 <div class="ambient"></div>
 
 <header class="header">
-  <button class="icon-btn" id="btn-menu" aria-label="Menu">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
-  </button>
   <div class="brand"><span class="brand-mark">F</span><span>Figma Designer Agent</span></div>
 
   <nav class="tabs" id="tabs">
@@ -415,13 +560,17 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
         <h1>Design</h1>
         <p class="subtitle">Describe what you want to build and let the agent handle the rest.</p>
 
-        <div class="banner" id="banner">
-          <div class="banner-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg></div>
-          <div class="banner-body" style="flex:1">
-            <div class="banner-title" id="banner-title"></div>
-            <div class="banner-text" id="banner-text"></div>
+        <!-- Always visible, and always answers "what do I do next?". This
+             replaced a warning strip that only appeared when something was
+             broken -- so the one moment the user most needed direction, partway
+             through setup, showed nothing at all. -->
+        <div class="ready" id="ready">
+          <div class="ready-steps" id="ready-steps"></div>
+          <div class="ready-main">
+            <div class="ready-title" id="ready-title"></div>
+            <div class="ready-text" id="ready-text"></div>
           </div>
-          <button class="btn ghost sm" id="banner-action"></button>
+          <button class="btn ghost sm" id="ready-action"></button>
         </div>
 
         <div class="composer">
@@ -434,13 +583,29 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
           </div>
         </div>
 
+        <!-- Order is deliberate: outcome first, then progress, and the raw log
+             last and collapsed. The log was the most prominent thing here, which
+             made reading a scrolling wall of text the primary way to find out
+             what was happening. -->
         <div class="run-panel" id="run-panel">
           <div class="run-head">
             <span class="badge" id="status-badge"></span>
             <strong id="status-file" style="font-size:13px"></strong>
+            <span class="spacer"></span>
+            <span class="run-elapsed" id="run-elapsed"></span>
           </div>
-          <div id="log"></div>
+          <div class="run-progress" id="run-progress">
+            <div class="run-step-line">
+              <span class="run-step-label" id="run-step-label">Starting…</span>
+              <span class="run-step-count" id="run-step-count"></span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="run-bar"></div></div>
+          </div>
           <div id="result"></div>
+          <details class="drawer" id="log-drawer">
+            <summary>Run log <span class="count-tag" id="log-count">0</span></summary>
+            <div id="log"></div>
+          </details>
         </div>
 
         <p class="section-label">Start from a template</p>
@@ -471,7 +636,8 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
         <h1>Settings</h1>
         <p class="subtitle">Model credentials and how the agent runs.</p>
 
-        <p class="section-label">Model</p>
+        <details class="setting-group" id="group-model" open>
+          <summary><span class="setting-group-title">Model</span><span class="setting-group-note" id="note-model">Not configured</span></summary>
         <div class="setting-card">
           <div class="field">
             <label>API base URL <span class="tag" id="tag-base">unset</span></label>
@@ -494,40 +660,18 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
             <span class="test-result" id="test-result"></span>
           </div>
         </div>
+        </details>
 
-        <p class="section-label">Run behaviour</p>
-        <div class="setting-card" id="prefs-card">
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-name">Visual gate</div>
-              <div class="setting-desc">After each section, check the real geometry for collapsed text, overlap and overflow — and retry to fix what it finds.</div>
-            </div>
-            <button class="toggle" id="pref-visual_gate" role="switch" aria-checked="true"></button>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-name">Auto-select connected file</div>
-              <div class="setting-desc">Preselect whichever file is currently open with the plugin running.</div>
-            </div>
-            <button class="toggle" id="pref-auto_select" role="switch" aria-checked="true"></button>
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-name">Retries per step</div>
-              <div class="setting-desc">Attempts before a step falls back to a labelled placeholder.</div>
-            </div>
-            <input class="num" type="number" min="1" max="10" id="pref-max_retries" />
-          </div>
-          <div class="setting-row">
-            <div class="setting-info">
-              <div class="setting-name">Max steps</div>
-              <div class="setting-desc">Hard cap on plan length, to bound a runaway run.</div>
-            </div>
-            <input class="num" type="number" min="1" max="100" id="pref-max_steps" />
-          </div>
-        </div>
+        <details class="setting-group" id="group-prefs">
+          <summary><span class="setting-group-title">Run behaviour</span><span class="setting-group-note" id="note-prefs"></span></summary>
+          <!-- Rendered from /api/settings' prefs_schema rather than hardcoded here,
+               so the bounds this UI enforces are the ones the store applies. -->
+          <div class="setting-card" id="prefs-card"></div>
+          <div class="pref-error" id="pref-errors" style="display:none"></div>
+        </details>
 
-        <p class="section-label">Connection</p>
+        <details class="setting-group" id="group-connection">
+          <summary><span class="setting-group-title">Connection</span><span class="setting-group-note" id="note-connection"></span></summary>
         <div class="setting-card">
           <div class="setting-row">
             <div class="setting-info">
@@ -544,14 +688,17 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
             <button class="btn ghost sm" id="btn-setup2">Setup guide</button>
           </div>
         </div>
+        </details>
 
-        <p class="section-label">Keyboard</p>
+        <details class="setting-group" id="group-keys">
+          <summary><span class="setting-group-title">Keyboard shortcuts</span></summary>
         <div class="setting-card">
           <div class="setting-row"><div class="setting-info"><div class="setting-name">Run the current prompt</div></div><span class="kbd">Enter</span></div>
           <div class="setting-row"><div class="setting-info"><div class="setting-name">New design</div></div><span class="kbd">N</span></div>
           <div class="setting-row"><div class="setting-info"><div class="setting-name">Open files</div></div><span class="kbd">I</span></div>
           <div class="setting-row"><div class="setting-info"><div class="setting-name">Newline in the prompt</div></div><span class="kbd">Shift + Enter</span></div>
         </div>
+        </details>
       </section>
 
     </div>
@@ -565,6 +712,35 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
   <div class="spacer"></div>
   <span id="foot-status">Ready</span>
 </footer>
+
+<!-- remove a file from the gallery -->
+<div class="scrim" id="delete-modal">
+  <div class="modal" style="max-width:520px">
+    <div class="modal-head">
+      <h2>Remove <span id="del-name"></span>?</h2><div class="spacer"></div>
+      <button class="icon-btn" data-close="delete-modal" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <p class="note" style="margin:0">
+        This removes the file from <strong>this gallery only</strong>. The Figma file itself
+        is not touched — a plugin runs inside a file and cannot delete one, so nothing here
+        can. It reappears automatically the next time you open it with the plugin running.
+      </p>
+      <label class="opt-in" id="del-optin">
+        <input type="checkbox" id="del-clear" />
+        <span>
+          <span class="t">Also delete the design from the canvas</span>
+          <span class="d" id="del-clear-desc"></span>
+        </span>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn danger" id="del-confirm">Remove</button>
+      <button class="btn ghost" data-close="delete-modal">Cancel</button>
+      <span class="test-result" id="del-result"></span>
+    </div>
+  </div>
+</div>
 
 <!-- setup guide -->
 <div class="scrim" id="setup-modal">
@@ -630,14 +806,12 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
     document.querySelectorAll(".panel").forEach(function (p) { p.classList.toggle("active", p.id === "panel-" + name); });
     document.querySelectorAll(".tab").forEach(function (t) { t.classList.toggle("active", t.dataset.tab === name); });
     document.querySelectorAll(".side-item[data-tab]").forEach(function (s) { s.classList.toggle("active", s.dataset.tab === name); });
-    $("tabs").classList.remove("mobile-open");
     if (name === "history") refreshHistory();
     if (name === "settings") refreshSetup();
   }
   document.querySelectorAll("[data-tab]").forEach(function (el) {
     el.addEventListener("click", function () { showTab(el.dataset.tab); });
   });
-  $("btn-menu").onclick = function () { $("tabs").classList.toggle("mobile-open"); };
   $("side-new").onclick = function () { showTab("design"); $("instruction").focus(); };
 
   /* ---------------- templates ---------------- */
@@ -696,8 +870,10 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
     });
 
     if (!files.length) {
-      $("gallery").innerHTML = '<div class="empty"><h3>No files yet</h3>' +
-        "<p>Open a file in Figma Desktop with the plugin running — it appears here automatically.</p>" +
+      $("gallery").innerHTML = '<div class="empty">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 4h6l2 2h8v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/></svg>' +
+        "<h3>No files yet</h3>" +
+        "<p>This list fills itself in: open a design file in Figma Desktop with the plugin running, and it appears here. No Figma account or token needed.</p>" +
         '<button class="btn" id="empty-setup">Show me how</button></div>';
       $("empty-setup").onclick = function () { openModal("setup-modal"); };
       updateHint(); return;
@@ -710,6 +886,7 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
         '<div class="thumb">' + thumb +
           '<div class="card-actions">' +
             '<button class="mini-btn" data-act="use" title="Build in this file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>' +
+            '<button class="mini-btn danger" data-act="delete" title="Remove from gallery"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg></button>' +
           "</div></div>" +
         '<div class="card-body"><div class="card-info">' +
           '<div class="card-name">' + esc(f.file_name) + "</div>" +
@@ -720,6 +897,7 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
 
     $("gallery").querySelectorAll(".card").forEach(function (card) {
       card.onclick = function (e) {
+        if (e.target.closest('[data-act="delete"]')) { openDeleteDialog(card.dataset.key); return; }
         selectedKey = card.dataset.key;
         $("gallery").querySelectorAll(".card").forEach(function (c) { c.classList.remove("selected"); });
         card.classList.add("selected");
@@ -737,28 +915,165 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
     else if (sel.connected) $("hint").textContent = "Ready — “" + sel.file_name + "” is open with the plugin running.";
     else $("hint").textContent = "“" + sel.file_name + "” isn’t connected. Running will wait until you open it.";
     $("run-btn").disabled = busy || !selectedKey || !settings || !settings.configured;
+    renderReady(null);   // selecting a file can unblock the next step
   }
 
+  /* ---------------- removing a file ---------------- */
+  var deleteKey = null;
+  function openDeleteDialog(key) {
+    var file = filesByKey[key];
+    if (!file) return;
+    deleteKey = key;
+    $("del-name").textContent = "\u201c" + file.file_name + "\u201d";
+    $("del-result").textContent = "";
+    $("del-clear").checked = false;
+    // Emptying the canvas is only possible in the file the plugin is actually
+    // in -- the script always runs wherever the plugin is, so offering it for a
+    // file that is not open would wipe a different design.
+    $("del-clear").disabled = !file.connected;
+    $("del-optin").className = "opt-in" + (file.connected ? "" : " disabled");
+    $("del-clear-desc").textContent = file.connected
+      ? "Deletes every top-level layer on the current page of this file. You can undo it in Figma with Ctrl+Z."
+      : "Unavailable: open this file in Figma Desktop with the plugin running first.";
+    $("delete-modal").classList.add("show");
+  }
+
+  $("del-clear").onchange = function () {
+    $("del-optin").className = "opt-in" + ($("del-clear").checked ? " armed" : "");
+    $("del-confirm").textContent = $("del-clear").checked ? "Delete design and remove" : "Remove";
+  };
+
+  $("del-confirm").onclick = function () {
+    if (!deleteKey) return;
+    $("del-confirm").disabled = true;
+    $("del-result").className = "test-result";
+    $("del-result").textContent = "Working\u2026";
+    postJSON("/api/files/delete", { file_key: deleteKey, clear_canvas: $("del-clear").checked })
+      .then(function (r) {
+        $("del-confirm").disabled = false;
+        if (!r.body.ok) {
+          $("del-result").className = "test-result bad";
+          $("del-result").textContent = r.body.message || "Could not remove it.";
+          return;
+        }
+        if (selectedKey === deleteKey) selectedKey = null;
+        deleteKey = null;
+        $("delete-modal").classList.remove("show");
+        lastFiles = "";      // force a re-render on the next poll
+        refreshFiles();
+      });
+  };
+
   /* ---------------- history ---------------- */
+  var PLACEHOLDER_THUMB =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">' +
+    '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/>' +
+    '<path d="m21 15-5-5L5 21"/></svg>';
+
+  function plural(n, word) { return n + " " + word + (n === 1 ? "" : "s"); }
+
+  /* "Today" / "Yesterday" / "17 August" -- a flat list of 50 identical rows is
+     unreadable, and the date is the thing that actually separates them. */
+  function dayLabel(iso) {
+    var d = new Date(iso), now = new Date();
+    var days = Math.round((new Date(now.getFullYear(), now.getMonth(), now.getDate()) -
+                           new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000);
+    if (days === 0) return "Today";
+    if (days === 1) return "Yesterday";
+    return d.toLocaleDateString(undefined, { day: "numeric", month: "long" });
+  }
+
+  function clockTime(iso) {
+    return new Date(iso).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
+
+  /* One honest verdict per run. "Success" on a run that created nothing is the
+     kind of green tick that makes every other number here untrustworthy. */
+  function historyVerdict(r) {
+    if (r.status === "error") return { cls: "bad", label: "Failed" };
+    if (!r.created_node_count) return { cls: "bad", label: "Nothing built" };
+    if (r.failed_step_count) return { cls: "warn", label: "Partial" };
+    if (r.requirements_total && r.requirements_met < r.requirements_total)
+      return { cls: "warn", label: "Incomplete" };
+    if (r.layout_defect_count) return { cls: "warn", label: "Needs review" };
+    return { cls: "ok", label: "Success" };
+  }
+
+  function historyFacts(r) {
+    var facts = [esc(r.file_name || "Unknown file"), clockTime(r.finished_at)];
+    if (r.created_node_count) facts.push(plural(r.created_node_count, "node"));
+    if (r.duration_seconds) facts.push(fmtDuration(r.duration_seconds));
+    if (r.requirements_total)
+      facts.push(r.requirements_met + "/" + r.requirements_total + " requirements");
+    return facts.join('<span class="sep">·</span>');
+  }
+
+  /* The one thing worth saying about a run that did not go cleanly. */
+  function historyNote(r) {
+    if (r.status === "error")
+      return { cls: "bad", text: r.error || "The run stopped before it finished." };
+    if (!r.created_node_count)
+      return { cls: "bad", text: "This run finished without putting anything on the canvas." };
+    if (r.failed_step_count)
+      return { cls: "", text: plural(r.failed_step_count, "step") + " could not be built." };
+    if (r.requirements_total && r.requirements_met < r.requirements_total)
+      return { cls: "", text: plural(r.requirements_total - r.requirements_met, "requested item") +
+        " missing from the design." };
+    if (r.layout_defect_count)
+      return { cls: "", text: plural(r.layout_defect_count, "layout issue") + " left in the result." };
+    return null;
+  }
+
+  function historyRow(r) {
+    var verdict = historyVerdict(r), note = historyNote(r);
+    var thumb = r.thumbnail_base64
+      ? '<img src="data:image/png;base64,' + r.thumbnail_base64 + '" alt="">' +
+        (r.thumbnail_is_file ? '<span class="borrowed">file</span>' : "")
+      : PLACEHOLDER_THUMB;
+    return '<div class="hist-item" data-key="' + esc(r.file_key) +
+        '" data-prompt="' + esc(r.instruction) + '" title="' + esc(new Date(r.finished_at).toLocaleString()) + '">' +
+      '<div class="hist-thumb">' + thumb + "</div>" +
+      '<div class="hist-body">' +
+        '<div class="hist-prompt">' + esc(r.instruction) + "</div>" +
+        '<div class="hist-meta">' + historyFacts(r) + "</div>" +
+        (note ? '<div class="hist-note ' + note.cls + '">' + esc(note.text) + "</div>" : "") +
+      "</div>" +
+      '<div class="hist-right">' +
+        '<button class="btn ghost sm hist-reuse">Reuse</button>' +
+        '<span class="status-badge ' + verdict.cls + '">' + verdict.label + "</span>" +
+      "</div></div>";
+  }
+
   function refreshHistory() {
     getJSON("/api/history").then(function (rows) {
       $("count-history").textContent = rows.length;
       if (!rows.length) {
-        $("history-list").innerHTML = '<div class="empty"><h3>No runs yet</h3><p>Generations you run will be listed here.</p></div>';
+        $("history-list").innerHTML = '<div class="empty">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>' +
+          "<h3>No runs yet</h3><p>Every design you generate is kept here with its screenshot, so you can compare what different prompts produced.</p>" +
+          '<button class="btn" id="empty-history">Start a design</button></div>';
+        $("empty-history").onclick = function () { showTab("design"); $("instruction").focus(); };
         return;
       }
-      $("history-list").innerHTML = rows.map(function (r) {
-        var cls = r.status === "error" ? "bad" : (r.success ? "ok" : "warn");
-        var label = r.status === "error" ? "Failed" : (r.success ? "Success" : "Issues");
-        var thumb = r.thumbnail_base64 ? '<img src="data:image/png;base64,' + r.thumbnail_base64 + '" alt="">' : "no image";
-        return '<div class="hist-item">' +
-          '<div class="hist-thumb">' + thumb + "</div>" +
-          '<div class="hist-body"><div class="hist-prompt">' + esc(r.instruction) + "</div>" +
-          '<div class="hist-meta">' + esc(r.file_name) + " · " + relTime(r.finished_at) +
-            " · " + r.created_node_count + " nodes" +
-            (r.failed_step_count ? " · " + r.failed_step_count + " failed step(s)" : "") + "</div></div>" +
-          '<span class="status-badge ' + cls + '">' + label + "</span></div>";
-      }).join("");
+      var html = "", lastDay = null;
+      rows.forEach(function (r) {
+        var day = dayLabel(r.finished_at);
+        if (day !== lastDay) { lastDay = day; html += '<div class="hist-day">' + esc(day) + "</div>"; }
+        html += historyRow(r);
+      });
+      $("history-list").innerHTML = html;
+
+      // A past run is the fastest way to start the next one: put its prompt
+      // back in the composer and select the file it built in.
+      $("history-list").querySelectorAll(".hist-item").forEach(function (item) {
+        item.onclick = function () {
+          $("instruction").value = item.dataset.prompt;
+          if (filesByKey[item.dataset.key]) selectedKey = item.dataset.key;
+          showTab("design");
+          $("instruction").focus();
+          updateHint();
+        };
+      });
     });
   }
   $("btn-clear-history").onclick = function () {
@@ -786,33 +1101,74 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
       $(p[0]).textContent = labels[src];
     });
 
-    var prefs = s.prefs || {};
-    ["visual_gate", "auto_select"].forEach(function (k) {
-      var el = $("pref-" + k); if (el) el.setAttribute("aria-checked", prefs[k] !== false);
-    });
-    ["max_retries", "max_steps"].forEach(function (k) {
-      var el = $("pref-" + k); if (el) el.value = prefs[k];
-    });
+    renderPrefs(s);
+    $("note-model").textContent = s.configured ? (s.model_name || "Configured") : "Not configured";
+    $("note-model").style.color = s.configured ? "" : "var(--warning)";
 
     $("out-bridge").textContent = s.bridge_url;
     $("out-bridge2").textContent = s.bridge_url;
     updateHint();
   }
 
-  document.querySelectorAll(".toggle").forEach(function (t) {
-    t.onclick = function () {
-      var next = t.getAttribute("aria-checked") !== "true";
-      t.setAttribute("aria-checked", next);
-      var patch = {}; patch[t.id.replace("pref-", "")] = next;
-      postJSON("/api/prefs", patch).then(function (r) { renderSettings(r.body); });
-    };
-  });
-  ["max_retries", "max_steps"].forEach(function (k) {
-    $("pref-" + k).onchange = function () {
-      var patch = {}; patch[k] = $("pref-" + k).value;
-      postJSON("/api/prefs", patch).then(function (r) { renderSettings(r.body); });
-    };
-  });
+  /* Preferences are rendered from the server's schema, not from hardcoded HTML.
+     The bounds, the defaults and the labels then have exactly one home -- the
+     UI previously declared its own min/max, which is a second place for them to
+     be wrong (and they were: it advertised a cap the store did not enforce). */
+  var PREF_COPY = {
+    visual_gate: ["Visual gate",
+      "After each section, check the real geometry for collapsed text, overlap and overflow \u2014 and retry to fix what it finds."],
+    auto_select: ["Auto-select connected file",
+      "Preselect whichever file is currently open with the plugin running."],
+    max_retries: ["Retries per step",
+      "Attempts before a step falls back to a labelled placeholder."],
+    max_steps: ["Max steps",
+      "Hard cap on plan length, to bound a runaway run."]
+  };
+
+  function renderPrefs(s) {
+    var prefs = s.prefs || {}, schema = s.prefs_schema || [];
+    $("prefs-card").innerHTML = schema.map(function (row) {
+      var copy = PREF_COPY[row.key] || [row.key, ""];
+      var control = row.kind === "bool"
+        ? '<button class="toggle" id="pref-' + row.key + '" role="switch" aria-checked="' +
+            (prefs[row.key] !== false) + '"></button>'
+        : '<input class="num" type="number" id="pref-' + row.key + '" min="' + row.minimum +
+            '" max="' + row.maximum + '" value="' + esc(prefs[row.key]) + '" />';
+      var range = row.kind === "int" ? " (" + row.minimum + "\u2013" + row.maximum + ")" : "";
+      return '<div class="setting-row"><div class="setting-info">' +
+        '<div class="setting-name">' + esc(copy[0]) + "</div>" +
+        '<div class="setting-desc">' + esc(copy[1]) + esc(range) + "</div></div>" + control + "</div>";
+    }).join("");
+
+    var off = schema.filter(function (r) { return r.kind === "bool" && prefs[r.key] === false; });
+    $("note-prefs").textContent = off.length ? off.length + " turned off" : "Defaults";
+    bindPrefControls();
+  }
+
+  function savePref(key, value) {
+    var patch = {}; patch[key] = value;
+    postJSON("/api/prefs", patch).then(function (r) {
+      renderSettings(r.body);
+      // Nothing is dropped in silence any more: an out-of-range or unusable
+      // value comes back with the reason, instead of the input just reverting.
+      var errors = (r.body || {}).pref_errors || [];
+      $("pref-errors").style.display = errors.length ? "block" : "none";
+      $("pref-errors").textContent = errors.join(" \u00b7 ");
+    });
+  }
+
+  function bindPrefControls() {
+    $("prefs-card").querySelectorAll(".toggle").forEach(function (t) {
+      t.onclick = function () {
+        var next = t.getAttribute("aria-checked") !== "true";
+        t.setAttribute("aria-checked", next);
+        savePref(t.id.replace("pref-", ""), next);
+      };
+    });
+    $("prefs-card").querySelectorAll('input[type="number"]').forEach(function (input) {
+      input.onchange = function () { savePref(input.id.replace("pref-", ""), input.value); };
+    });
+  }
 
   $("btn-save").onclick = function () {
     var payload = { model_base_url: $("in-base").value.trim(), model_name: $("in-model").value.trim() };
@@ -820,7 +1176,7 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
     if (key) payload.model_api_key = key;
     $("btn-save").disabled = true; $("test-result").textContent = "";
     postJSON("/api/settings", payload).then(function (r) {
-      renderSettings(r.body); renderBanner(null);
+      renderSettings(r.body); renderReady(null);
       $("test-result").className = "test-result ok"; $("test-result").textContent = "Saved";
       $("btn-save").disabled = false;
     });
@@ -836,22 +1192,63 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
   };
   $("pill-model").onclick = function () { showTab("settings"); };
 
-  /* ---------------- banner + status ---------------- */
-  function renderBanner(status) {
-    var b = $("banner");
-    if (settings && !settings.configured) {
-      b.className = "banner warn show";
-      $("banner-title").textContent = "No model configured";
-      $("banner-text").textContent = "Add an API base URL, key and model name so the agent can start planning.";
-      $("banner-action").textContent = "Open Settings";
-      $("banner-action").onclick = function () { showTab("settings"); };
-    } else if (status && !status.plugin_connected) {
-      b.className = "banner warn show";
-      $("banner-title").textContent = "Figma plugin not connected";
-      $("banner-text").textContent = "Open a file in Figma Desktop and run the plugin to start designing.";
-      $("banner-action").textContent = "Setup guide";
-      $("banner-action").onclick = function () { openModal("setup-modal"); };
-    } else b.className = "banner";
+  /* ---------------- readiness + run status ---------------- */
+  /* The single source of "what should I do next?". Three things must be true
+     before a run can start; this shows which are done, which one is blocking,
+     and the one button that resolves it. */
+  var lastStatus = null, lastReadySignature = null;
+  function renderReady(status) {
+    if (status) lastStatus = status;
+    var s = lastStatus || {};
+    var done = {
+      model: !!(settings && settings.configured),
+      figma: !!s.plugin_connected,
+      file: !!selectedKey
+    };
+    var blocking = !done.model ? "model" : (!done.figma ? "figma" : (!done.file ? "file" : null));
+
+    var LABELS = [["model", "Model"], ["figma", "Figma"], ["file", "File"]];
+    var signature = [done.model, done.figma, done.file, selectedKey].join("|");
+    if (signature === lastReadySignature) return;
+    lastReadySignature = signature;
+
+    $("ready-steps").innerHTML = LABELS.map(function (pair, i) {
+      var key = pair[0];
+      var cls = done[key] ? "done" : (key === blocking ? "now" : "");
+      return (i ? '<span class="ready-sep"></span>' : "") +
+        '<span class="ready-step ' + cls + '"><span class="ready-num">' +
+        (done[key] ? "\u2713" : i + 1) + "</span>" + esc(pair[1]) + "</span>";
+    }).join("");
+
+    var COPY = {
+      model: ["Add your model credentials",
+              "The agent needs an API base URL, key and model name before it can plan anything.",
+              "Open Settings", function () { showTab("settings"); }],
+      figma: ["Connect the Figma plugin",
+              "Open a design file in Figma Desktop and run the plugin. Your file then appears here automatically.",
+              "Show me how", function () { openModal("setup-modal"); }],
+      file:  ["Choose a file to build in",
+              "Pick one of your Figma files, then describe the screen you want.",
+              "Browse files", function () { showTab("files"); }]
+    };
+
+    var card = $("ready");
+    if (blocking) {
+      var c = COPY[blocking];
+      card.className = "ready blocked";
+      $("ready-title").textContent = c[0];
+      $("ready-text").textContent = c[1];
+      $("ready-action").textContent = c[2];
+      $("ready-action").onclick = c[3];
+      $("ready-action").style.display = "";
+    } else {
+      var file = filesByKey[selectedKey];
+      card.className = "ready go";
+      $("ready-title").textContent = "Ready to build";
+      $("ready-text").textContent = "Describe the screen below and press Run \u2014 building in \u201c" +
+        ((file && file.file_name) || "your file") + "\u201d.";
+      $("ready-action").style.display = "none";
+    }
   }
 
   function renderStatus(s) {
@@ -867,28 +1264,146 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
     if (s.status === "idle") { panel.classList.remove("show"); updateHint(); return; }
     panel.classList.add("show");
 
+    var LABEL = { waiting_for_file: "waiting for file", running: "building", done: "finished", error: "failed" };
     $("status-badge").className = "badge " + s.status;
-    $("status-badge").innerHTML = (busy ? '<span class="spin"></span>' : "") + s.status.replace(/_/g, " ");
+    $("status-badge").innerHTML = (busy ? '<span class="spin"></span>' : "") + (LABEL[s.status] || s.status);
     $("status-file").textContent = s.connected_file ? s.connected_file.file_name : "";
+
+    renderProgress(s);
 
     var log = $("log");
     var pinned = log.scrollTop + log.clientHeight >= log.scrollHeight - 24;
     log.textContent = s.log.join("\n");
+    $("log-count").textContent = s.log.length;
     if (pinned) log.scrollTop = log.scrollHeight;
+    // The log is the detail view: useful while waiting, noise once there is a
+    // result to look at. Open it automatically only when it is the only signal.
+    if (!logTouched) $("log-drawer").open = busy && !s.result;
 
-    var r = s.result;
-    if (r) {
-      var h = '<div class="result-row">' + (r.success ? "✅ Completed" : "⚠️ Finished with issues") +
-        ' <span style="font-weight:400;color:var(--text-3)">· ' + r.created_node_count + " node(s)</span></div>";
-      if (r.failed_steps && r.failed_steps.length)
-        h += '<div class="issue bad">' + r.failed_steps.length + " step(s) failed: " + esc(r.failed_steps.join(" · ")) + "</div>";
-      (r.layout_defects || []).slice(0, 6).forEach(function (d) { h += '<div class="issue">' + esc(d) + "</div>"; });
-      (r.warnings || []).forEach(function (w) { h += '<div class="issue">' + esc(w) + "</div>"; });
-      if (r.final_screenshot_base64)
-        h += '<img src="data:image/png;base64,' + r.final_screenshot_base64 + '" alt="Result">';
-      $("result").innerHTML = h;
-    } else $("result").innerHTML = "";
+    // Only rebuild the result when it actually changes. The status endpoint is
+    // polled every 1.5s, and re-running innerHTML would slam shut any drawer the
+    // user had just opened -- and re-decode the screenshot -- on every tick.
+    var signature = s.status + "|" + JSON.stringify(s.result || null) + "|" +
+      (s.status === "error" ? (s.log || []).length : 0);
+    if (signature !== lastResultSignature) {
+      lastResultSignature = signature;
+      $("result").innerHTML = s.status === "error" && !s.result
+        ? renderRunError(s)
+        : (s.result ? renderResult(s.result) : "");
+    }
     updateHint();
+  }
+
+  var lastResultSignature = null;
+
+  var logTouched = false;
+  $("log-drawer").addEventListener("toggle", function () { logTouched = true; });
+
+  function fmtDuration(seconds) {
+    if (seconds == null) return "";
+    var s = Math.round(seconds);
+    return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
+  }
+
+  function renderProgress(s) {
+    var m = s.metrics || {}, p = m.progress || {};
+    var running = s.status === "running" || s.status === "waiting_for_file";
+    $("run-progress").style.display = s.result ? "none" : "";
+    $("run-elapsed").textContent = m.elapsed_seconds ? fmtDuration(m.elapsed_seconds) : "";
+
+    if (s.status === "waiting_for_file") {
+      $("run-step-label").textContent = "Waiting for Figma to connect…";
+      $("run-step-count").textContent = "";
+      $("run-bar").className = "bar-fill indeterminate";
+      return;
+    }
+    // Before the plan exists there is no denominator, so an honest bar is an
+    // indeterminate one -- a fake percentage during planning is a lie the user
+    // then measures the rest of the run against.
+    if (!p.total) {
+      $("run-step-label").textContent = running ? "Planning the design…" : "";
+      $("run-step-count").textContent = "";
+      $("run-bar").className = "bar-fill indeterminate";
+      return;
+    }
+    $("run-bar").className = "bar-fill";
+    $("run-bar").style.width = Math.round((p.index / p.total) * 100) + "%";
+    $("run-step-label").textContent = p.step || "";
+    $("run-step-count").textContent = "Step " + p.index + " of " + p.total +
+      (p.attempt > 1 ? " \u00b7 attempt " + p.attempt : "");
+  }
+
+  function renderRunError(s) {
+    var last = (s.log || []).slice(-1)[0] || "The run stopped unexpectedly.";
+    return '<div class="result-hero bad"><div class="result-ico">\u26a0\ufe0f</div><div>' +
+      '<div class="result-title">The run could not finish</div>' +
+      '<div class="result-sub">' + esc(last) + "</div></div></div>";
+  }
+
+  function renderResult(r) {
+    var m = r.metrics || {};
+    var missing = r.requirements_missing || [], met = r.requirements_met || [];
+    var failed = (r.failed_steps || []).length;
+    var tone = r.success ? "ok" : (failed ? "bad" : "warn");
+    var title = r.success ? "Design complete"
+      : (failed ? failed + " step(s) could not be built" : "Finished with issues");
+
+    var sub = [];
+    // Screens first: a design of three frames is a different thing from one
+    // tall page, and it is the first thing to check is what you asked for.
+    var screens = r.screens || [];
+    if (screens.length > 1) sub.push(screens.length + " screens");
+    if (met.length || missing.length) sub.push(met.length + "/" + (met.length + missing.length) + " requirements met");
+    sub.push(r.created_node_count + " nodes");
+    if (m.elapsed_seconds) sub.push(fmtDuration(m.elapsed_seconds));
+
+    var h = '<div class="result-hero ' + tone + '"><div class="result-ico">' +
+      (r.success ? "\u2705" : (failed ? "\u26a0\ufe0f" : "\ud83d\udfe1")) + "</div><div>" +
+      '<div class="result-title">' + esc(title) + "</div>" +
+      '<div class="result-sub">' + esc(sub.join(" \u00b7 ")) + "</div></div></div>";
+
+    if (screens.length > 1) {
+      h += '<div class="chips">' + screens.map(function (name) {
+        return '<span class="chip">' + esc(name) + "</span>";
+      }).join("") + "</div>";
+    }
+
+    // What was asked for but is not on the canvas -- the most actionable thing
+    // the run can tell you, so it sits above every other detail.
+    if (missing.length) {
+      h += '<div class="chips"><span class="chip miss">Missing: ' + esc(missing.join(", ")) + "</span></div>";
+    }
+
+    if (m.model) {
+      h += '<div class="stat-grid">' +
+        stat(m.model.count, "model calls") +
+        stat(m.bridge_calls, "figma calls") +
+        stat("\u00d7" + (m.retry_rate || 1).toFixed(2), "attempts/step") +
+        stat(m.model.p95_seconds + "s", "model p95") + "</div>";
+    }
+
+    h += drawer("Layout issues", r.layout_defects);
+    h += drawer("Design system notes", r.design_notes);
+    h += drawer("Warnings", r.warnings);
+
+    if (r.final_screenshot_base64)
+      h += '<div style="padding:15px 17px"><img style="max-width:100%;border-radius:var(--radius-md);border:1px solid var(--border-subtle);display:block" src="data:image/png;base64,' +
+        r.final_screenshot_base64 + '" alt="The finished design"></div>';
+    return h;
+  }
+
+  function stat(value, label) {
+    return '<div class="stat"><div class="stat-num">' + esc(value) +
+      '</div><div class="stat-lbl">' + esc(label) + "</div></div>";
+  }
+
+  function drawer(title, items) {
+    if (!items || !items.length) return "";
+    return '<details class="drawer"><summary>' + esc(title) +
+      '<span class="count-tag">' + items.length + "</span></summary>" +
+      '<div class="drawer-body">' + items.map(function (i) {
+        return '<div class="issue">' + esc(i) + "</div>";
+      }).join("") + "</div></details>";
   }
 
   /* ---------------- modal + setup ---------------- */
@@ -949,13 +1464,13 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
   }
   function refreshStatus() {
     getJSON("/api/status").then(function (s) {
-      renderStatus(s); renderBanner(s);
+      renderStatus(s); renderReady(s);
       if ($("setup-modal").classList.contains("show")) refreshSetup();
       if (s.status === "done" || s.status === "error") getJSON("/api/history").then(function (r) { $("count-history").textContent = r.length; });
     });
   }
   getJSON("/api/settings").then(function (s) {
-    renderSettings(s); renderBanner(null); refreshFiles(); refreshStatus(); refreshHistory();
+    renderSettings(s); renderReady(null); refreshFiles(); refreshStatus(); refreshHistory();
   });
   setInterval(refreshFiles, 3000);
   setInterval(refreshStatus, 1500);

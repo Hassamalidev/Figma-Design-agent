@@ -114,20 +114,36 @@ MIN_TEXT_CONTRAST = 4.5
 ACCENT_MIN_CHROMA = 0.15
 
 
-def relative_luminance(hex_value: str) -> float:
-    """WCAG relative luminance (0 = black, 1 = white)."""
-    channels = []
-    for value in hex_to_rgb(hex_value):
-        channels.append(value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4)
+def relative_luminance_rgb(rgb: tuple[float, float, float]) -> float:
+    """WCAG relative luminance from 0-1 RGB (0 = black, 1 = white).
+
+    The RGB form is the primitive: the critic reads colours back off the canvas
+    as 0-1 floats (that is what the Plugin API stores), so making hex the only
+    entry point would mean converting real colours to text and back to compare
+    them.
+    """
+    channels = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in rgb]
     r, g, b = channels
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
+def contrast_ratio_rgb(
+    a: tuple[float, float, float], b: tuple[float, float, float]
+) -> float:
+    """WCAG contrast ratio between two 0-1 RGB colours, 1.0 to 21.0."""
+    la, lb = relative_luminance_rgb(a), relative_luminance_rgb(b)
+    lighter, darker = max(la, lb), min(la, lb)
+    return round((lighter + 0.05) / (darker + 0.05), 1)
+
+
+def relative_luminance(hex_value: str) -> float:
+    """WCAG relative luminance (0 = black, 1 = white)."""
+    return relative_luminance_rgb(hex_to_rgb(hex_value))
+
+
 def contrast_ratio(hex_a: str, hex_b: str) -> float:
     """WCAG contrast ratio between two colours, 1.0 (identical) to 21.0."""
-    a, b = relative_luminance(hex_a), relative_luminance(hex_b)
-    lighter, darker = max(a, b), min(a, b)
-    return round((lighter + 0.05) / (darker + 0.05), 1)
+    return contrast_ratio_rgb(hex_to_rgb(hex_a), hex_to_rgb(hex_b))
 
 
 def _chroma(hex_value: str) -> float:
@@ -234,9 +250,16 @@ for (const s of existingStyles) { styleByName[s.name] = s; }
 
 const names = [];
 const failed = [];
+const unbound = [];
 
 for (const entry of entries) {
   const varName = 'color/' + entry.name;
+  let paint = { type: 'SOLID', color: { r: entry.r, g: entry.g, b: entry.b } };
+
+  // The VARIABLE is the nice-to-have. Its own try block, so a collection that
+  // rejects one variable cannot cost us the paint style too -- a run that ends
+  // up with one usable colour has nothing to bind text to, and produces
+  // invisible copy on an accent background.
   try {
     let variable = varByName[varName];
     if (!variable) {
@@ -244,22 +267,27 @@ for (const entry of entries) {
       varByName[varName] = variable;
     }
     variable.setValueForMode(modeId, { r: entry.r, g: entry.g, b: entry.b, a: 1 });
+    paint = figma.variables.setBoundVariableForPaint(paint, 'color', variable);
+  } catch (e) {
+    unbound.push(varName + ': ' + String(e && e.message ? e.message : e));
+  }
 
+  // The STYLE is what every later script actually looks up by name, so this is
+  // the part that must not fail.
+  try {
     let style = styleByName[varName];
     if (!style) {
       style = figma.createPaintStyle();
       style.name = varName;
       styleByName[varName] = style;
     }
-    let paint = { type: 'SOLID', color: { r: entry.r, g: entry.g, b: entry.b } };
-    paint = figma.variables.setBoundVariableForPaint(paint, 'color', variable);
     style.paints = [paint];
     names.push(varName);
   } catch (e) {
     failed.push(varName + ': ' + String(e && e.message ? e.message : e));
   }
 }
-return { createdNodeIds: [], tokenNames: names, failedTokens: failed };
+return { createdNodeIds: [], tokenNames: names, failedTokens: failed, unboundTokens: unbound };
 """
 
 
@@ -419,4 +447,92 @@ label.fills = [{{ type: 'SOLID', color: {{ r: 0.45, g: 0.47, b: 0.52 }} }}];
 section.appendChild(label);
 
 return {{ createdNodeIds: [section.id] }};
+"""
+
+
+# Gap between two screen frames on the page. Wide enough that the frames read
+# as separate screens rather than one design that happens to have a seam.
+SCREEN_GAP = 160
+
+
+def build_screen_frames_script(specs: list[dict]) -> str:
+    """Create one top-level FRAME per screen, laid out left to right.
+
+    This is Figma's own structure, which the agent used to ignore: a PAGE is a
+    workspace and a FRAME is a screen. Several screens are sibling frames side
+    by side on one page -- never sections stacked into a single frame, and
+    never separate Figma pages.
+
+    Harness-authored (CLAUDE.md section 6a) because it is completely
+    mechanical and because getting it wrong cascades: every later step appends
+    into one of these frames, so a frame at the wrong coordinates means an
+    entire screen rendered on top of another one.
+
+    Each spec is {name, x, y, width}. Positions are computed in Python (section
+    7: do arithmetic in Python), so two screens can never overlap.
+    """
+    return _SCREEN_FRAMES_SCRIPT.replace("__SPECS__", json.dumps(specs))
+
+
+# Wrapped per entry: scripts are atomic, so one bad spec would otherwise
+# discard every screen and leave the run with nowhere to build.
+_SCREEN_FRAMES_SCRIPT = """const specs = __SPECS__;
+const made = [];
+const ids = [];
+const failed = [];
+
+for (const spec of specs) {
+  try {
+    const frame = figma.createFrame();
+    frame.name = spec.name;
+    frame.resize(spec.width, 900);
+    figma.currentPage.appendChild(frame);
+    frame.x = spec.x;
+    frame.y = spec.y;
+    frame.layoutMode = 'VERTICAL';
+    frame.counterAxisSizingMode = 'FIXED';
+    frame.primaryAxisSizingMode = 'AUTO';
+    frame.itemSpacing = 0;
+    frame.fills = [{ type: 'SOLID', color: { r: 1, g: 1, b: 1 } }];
+    made.push({ name: spec.name, id: frame.id });
+    ids.push(frame.id);
+  } catch (e) {
+    failed.push(spec.name + ': ' + String(e && e.message ? e.message : e));
+  }
+}
+return { createdNodeIds: ids, screens: made, failedScreens: failed };
+"""
+
+
+def build_clear_page_script() -> str:
+    """Remove every top-level layer from the current page.
+
+    This is as close to "delete the design" as a plugin can get. The Plugin API
+    has no way to delete a FILE -- there is no `figma.deleteFile`, and
+    `figma.fileKey` is read-only (verified against the real typings) -- so what
+    a plugin can offer is emptying the canvas it is running in.
+
+    Destructive, and only ever called behind an explicit confirmation. Figma's
+    own undo still applies, which is the safety net that makes it reasonable to
+    offer at all.
+    """
+    return _CLEAR_PAGE_SCRIPT
+
+
+# `children` is live while we remove from it, so iterate over a COPY -- removing
+# in place skips every other node. Each removal is wrapped because one locked or
+# already-detached node must not abandon the rest.
+_CLEAR_PAGE_SCRIPT = """const page = figma.currentPage;
+const nodes = page.children.slice();
+let removed = 0;
+const failed = [];
+for (const node of nodes) {
+  try {
+    node.remove();
+    removed = removed + 1;
+  } catch (e) {
+    failed.push(node.name + ': ' + String(e && e.message ? e.message : e));
+  }
+}
+return { createdNodeIds: [], removed: removed, failed: failed, pageName: page.name };
 """

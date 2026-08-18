@@ -75,3 +75,78 @@ def test_per_step_retrieval_pulls_typings_not_the_inlined_gotchas():
 
     typings_only = retrieve("text node auto resize", sources=("api_types.d.ts",))
     assert "gotchas.md" not in typings_only
+
+
+# ---- retrieval quality ----------------------------------------------------
+#
+# These are regressions, not aspirations: every query below returned the WRONG
+# chunk under the previous raw-overlap scorer, because counting matched words
+# rewards long chunks. The worst case was "line height on a text node", which
+# retrieved the typings file's PREAMBLE -- the longest chunk in the corpus and
+# the one carrying the least information.
+
+
+def top_heading(query: str) -> str:
+    from knowledge.index import retrieve
+
+    result = retrieve(query, sources=("api_types.d.ts",), max_chars=400)
+    return result.splitlines()[0] if result else ""
+
+
+def test_plain_english_reaches_the_api_that_answers_it():
+    """Plan steps are plain English by design (under 20 words, no API names),
+    so retrieval has to bridge the gap to compound identifiers on its own."""
+    assert "TextNode" in top_heading("set the line height on a text node")
+    assert "VariablesAPI" in top_heading("bind a paint to a colour variable")
+    assert "AutoLayoutMixin" in top_heading("make a child fill its auto layout parent")
+
+
+def test_a_long_low_signal_chunk_no_longer_wins_on_length_alone():
+    """The typings preamble is the longest chunk and answers nothing."""
+    assert "header" not in top_heading("set the line height on a text node")
+
+
+def test_identifiers_are_indexed_whole_and_in_parts():
+    from knowledge.index import _tokenize
+
+    tokens = _tokenize("setBoundVariableForPaint")
+
+    assert "setboundvariableforpaint" in tokens  # the exact name still matches
+    assert {"bound", "variable", "paint"} <= set(tokens)  # and so does English
+
+
+def test_repeated_identical_queries_are_served_from_cache():
+    """Every retry of a step asks the identical question, and the corpus cannot
+    change during a run -- so the second answer can only be the first one
+    recomputed."""
+    from knowledge.index import retrieve
+
+    retrieve.cache_clear()
+    first = retrieve("append a section into the root frame", sources=("api_types.d.ts",))
+    second = retrieve("append a section into the root frame", sources=("api_types.d.ts",))
+
+    assert first == second
+    assert retrieve.cache_info().hits == 1
+
+
+def test_the_backend_is_swappable_and_an_unknown_name_is_survivable():
+    """CLAUDE.md promises embeddings are a one-file change. An unknown backend
+    must degrade to keyword search, never take a run down."""
+    from knowledge import index
+
+    assert index.set_backend("keyword") == "keyword"
+    assert index.set_backend("nonsense-backend") == "keyword"
+    assert index.retrieve("text node", sources=("api_types.d.ts",))
+
+
+def test_the_embedding_backend_falls_back_when_the_dependency_is_absent():
+    """sentence-transformers pulls in PyTorch and is deliberately not required.
+    Asking for it without installing it must still return documentation."""
+    from knowledge.index import EmbeddingBackend, _chunks
+
+    backend = EmbeddingBackend(model_name="definitely-not-a-real-model")
+    backend._ensure_loaded = lambda: False  # simulate the missing dependency
+
+    ranked = backend.rank("text node line height", _chunks())
+
+    assert ranked, "must fall back to keyword scoring rather than returning nothing"

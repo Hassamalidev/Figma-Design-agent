@@ -37,12 +37,16 @@ API facts that trip everyone up (do not guess these):
   Prefer `figma.getNodeByIdAsync(id)` with an id you already created.
 
 Rules you must follow:
-0. BUILD SECTIONS WITH `render_ui`, NOT WITH JAVASCRIPT. Describe what the
-   section contains as a UI tree and the harness writes the Figma code for
-   you -- fonts, auto-layout, sizing, spacing and token colours are all
-   handled, so they cannot go wrong. One `render_ui` call builds an entire
-   section. Reach for `execute_figma_js` only for something render_ui
-   genuinely cannot express.
+0. BUILD WITH `render_ui`. For a section step it is the ONLY build tool you
+   have -- `execute_figma_js` is not offered, because every Plugin API trap
+   below is one the renderer already handles for you: font loading, creation
+   order, resize-before-sizing-mode, append-before-FILL, style lookup, enum
+   values and token colours. You describe WHAT the section contains; the
+   harness writes HOW.
+
+   One `render_ui` call should build the WHOLE section, nested as deeply as it
+   needs to be. Do not split a section across calls, and do not stop after a
+   container -- an empty frame is reported as a defect.
 
    {"kind":"section","name":"Sign in","gap":"lg","children":[
      {"kind":"text","style":"Heading","value":"Welcome back"},
@@ -58,15 +62,29 @@ Rules you must follow:
    gap and padding are NAMES: xs sm md lg xl 2xl. radius: sm md lg xl.
    colour is a ROLE, never a hex: background, surface, border, text,
    text-muted, accent, on-accent, success, warning, error, info.
+   A container may also take `width: N` (a FIXED width, e.g. a 240px sidebar)
+   and `height: N`. Use `"direction":"row"` for anything side by side.
 
-1. One logical operation per `execute_figma_js` call (create a node, set its
-   props, parent it). Never batch many operations into one script.
+   A SIDEBAR LAYOUT is one row with a fixed-width column beside a filling one:
+     {"kind":"row","name":"Shell","gap":"none","padding":"none","children":[
+       {"kind":"col","name":"Sidebar","width":240,"padding":"lg","gap":"sm",
+        "background":"surface","children":[ ...nav items... ]},
+       {"kind":"col","name":"Main","padding":"xl","gap":"lg","children":[ ... ]}]}
+
+   A TABLE is rows of text inside a col; a KPI grid is a row of cards.
+   Write REAL sample content ("$128,430", "Acme Corp", "2 hours ago") -- never
+   placeholder words like "Text" or "Lorem ipsum".
+
+1. The rules below apply ONLY when `execute_figma_js` was offered to you.
+   One logical operation per call (create a node, set its props, parent it).
+   Never batch many operations into one script.
 2. Every script you run must end with `return { createdNodeIds: [...] }`
    (empty array for read-only scripts).
-3. Tokens before components before composition: create color/spacing/type
-   variables first, then build reusable components, then compose the screen
-   using those components -- never hardcode a color or spacing value into a
-   final node.
+3. Do NOT create Figma COMPONENTS. Colour and text styles already exist and
+   the renderer applies them, which is what makes the design consistent. A
+   component built for a static mockup lands loose on the page, clutters the
+   canvas and fails with "would create a component inside a component".
+   Build each section inline with `render_ui`.
 4. If a script throws, read the error message, fix the specific problem it
    names, and resubmit a corrected script. Do not retry the same code
    unchanged.
@@ -78,9 +96,15 @@ Rules you must follow:
 7. Colors are 0-1 floats, not 0-255 integers.
 
 LAYOUT -- this is what makes the result look designed instead of scattered:
-- There is ONE root frame for the screen. Every section (header, hero,
-  about, footer...) is a child of it, appended in order. Never leave section
-  frames loose on the page -- they all land at (0,0) and overlap.
+- A PAGE is a workspace; a FRAME is a screen. Screens sit side by side as
+  sibling frames on one page. The harness has already created every screen's
+  frame and tells you the id of the ONE you are building into.
+- So: never create a top-level frame, never call `figma.createPage()`, and
+  never append to another screen's frame. Everything you make goes inside the
+  frame id you were given.
+- Within that screen, every section (header, hero, about, footer...) is a
+  child of it, appended in order. Never leave section frames loose on the
+  page -- they all land at (0,0) and overlap.
 - The root frame uses `layoutMode = 'VERTICAL'` so sections stack
   automatically. Inside a section, use auto layout too. Once a node is in an
   auto-layout parent, do NOT set `x`/`y` -- layout owns position, and setting
@@ -121,7 +145,59 @@ def system_prompt(gotchas: str = "") -> str:
         f"{gotchas}"
     )
 
-EXEMPLARS = """\
+RENDER_EXEMPLARS = """\
+Known-good specs -- mirror this shape. Note how ONE call builds the whole
+section, with real content and no placeholder text:
+
+    // a sign-in card, centred in the screen
+    {"kind":"section","name":"Sign in","padding":"2xl","gap":"lg",
+     "align":"CENTER","children":[
+      {"kind":"card","name":"Card","width":480,"gap":"md","children":[
+        {"kind":"text","style":"Heading","value":"Welcome back"},
+        {"kind":"text","style":"Body","color":"text-muted",
+         "value":"Sign in to continue to your dashboard"},
+        {"kind":"input","label":"Email","placeholder":"you@company.com"},
+        {"kind":"input","label":"Password","placeholder":"........"},
+        {"kind":"text","style":"Caption","color":"accent","value":"Forgot password?"},
+        {"kind":"button","label":"Sign in","variant":"primary"},
+        {"kind":"divider"},
+        {"kind":"button","label":"Continue with Google","variant":"secondary"}]}]}
+
+    // a WHOLE dashboard screen in ONE call: sidebar beside main content.
+    // Build the complete screen like this -- never the sidebar on its own and
+    // the header separately, or the screen ends up with two sidebars.
+    {"kind":"row","name":"Shell","gap":"none","padding":"none","children":[
+      {"kind":"col","name":"Sidebar","width":240,"padding":"lg","gap":"sm",
+       "background":"surface","children":[
+        {"kind":"text","style":"Subheading","value":"Acme"},
+        {"kind":"text","style":"Body","color":"accent","value":"Dashboard"},
+        {"kind":"text","style":"Body","color":"text-muted","value":"Profile"},
+        {"kind":"text","style":"Body","color":"text-muted","value":"Settings"}]},
+      {"kind":"col","name":"Main","padding":"xl","gap":"lg","children":[
+        {"kind":"text","style":"Heading","value":"Overview"},
+        {"kind":"row","name":"KPIs","gap":"md","children":[
+          {"kind":"card","children":[
+            {"kind":"text","style":"Caption","color":"text-muted","value":"Revenue"},
+            {"kind":"text","style":"Display","value":"$128,430"},
+            {"kind":"badge","tone":"success","label":"+12.5%"}]},
+          {"kind":"card","children":[
+            {"kind":"text","style":"Caption","color":"text-muted","value":"Users"},
+            {"kind":"text","style":"Display","value":"8,214"},
+            {"kind":"badge","tone":"success","label":"+3.1%"}]}]},
+        {"kind":"text","style":"Subheading","value":"Recent activity"},
+        {"kind":"col","name":"Table","gap":"none","children":[
+          {"kind":"row","gap":"md","padding":"md","children":[
+            {"kind":"text","style":"Body","value":"12 Aug"},
+            {"kind":"text","style":"Body","value":"Invoice paid"},
+            {"kind":"badge","tone":"success","label":"Complete"}]},
+          {"kind":"divider"},
+          {"kind":"row","gap":"md","padding":"md","children":[
+            {"kind":"text","style":"Body","value":"11 Aug"},
+            {"kind":"text","style":"Body","value":"New signup"},
+            {"kind":"badge","tone":"info","label":"Pending"}]}]}]}]}
+"""
+
+JS_EXEMPLARS = """\
 Known-good patterns -- mirror these exactly:
 
     // A section: create -> resize -> APPEND -> then sizing.
@@ -155,7 +231,7 @@ Known-good patterns -- mirror these exactly:
 """
 
 STEP_USER_TEMPLATE = """\
-{design_context}{plan_outline}{repair}Current step: {step}
+{design_context}{screen}{plan_outline}{repair}Current step: {step}
 
 {root_frame}{tokens}{fonts}{exemplars}
 Relevant docs:
@@ -170,6 +246,16 @@ Recent progress:
 CLOSING_BUILD = """\
 Call `execute_figma_js` with a small, atomic script that accomplishes this \
 step."""
+
+CLOSING_RENDER = """\
+Call `render_ui` ONCE with a spec for this whole section. It is the only build \
+tool you have here, and one call should produce the complete section with real \
+content -- not an empty container you intend to fill later."""
+
+CLOSING_RENDER_REPAIR = """\
+Call `render_ui` ONCE with a corrected spec for this section. The nodes listed \
+above will be REPLACED by what you return, so include the whole section again \
+with the problems fixed -- do not return only the broken part."""
 
 CLOSING_REPAIR = """\
 Call `execute_figma_js` with a small script that MODIFIES the existing nodes \
@@ -230,8 +316,18 @@ correctly between the sections above and below it:
 
 """
 
+SCREEN_NOTE = """\
+THE SCREEN YOU ARE BUILDING: "{screen}"{siblings}
+
+"""
+
+SCREEN_SIBLINGS = """ -- one of {count} screens on this page, each its own frame.
+Build ONLY into the frame id below. The other screens ({others}) are separate \
+frames and are being built by their own steps; nothing you do here may touch \
+them or sit on top of them."""
+
 ROOT_FRAME_NOTE = """\
-The page's root frame ALREADY EXISTS -- do not create another one. Its id is \
+This screen's frame ALREADY EXISTS -- do not create another one. Its id is \
 "{root_frame_id}" and it is a VERTICAL auto-layout frame. Get it with:
 
     const root = await figma.getNodeByIdAsync("{root_frame_id}");
@@ -265,7 +361,7 @@ Apply them by name, looking the id up once per script:
 """
 
 ROOT_FRAME_REPAIR_NOTE = """\
-The page's root frame is "{root_frame_id}". The nodes you are fixing are \
+This screen's frame is "{root_frame_id}". The nodes you are fixing are \
 ALREADY inside it -- do not append anything to it in this script, or the page \
 gets a second copy of the section.
 """
@@ -305,41 +401,100 @@ ENHANCE_USER_TEMPLATE = """\
 Instruction: {instruction}
 """
 
+SCREENS_SYSTEM_PROMPT = """\
+You decide how many separate SCREENS a design request needs.
+
+In Figma a PAGE is a workspace and a FRAME is a screen. Several screens live
+side by side as sibling frames on ONE page -- never stacked into a single
+frame, and never on separate Figma pages.
+
+A SCREEN is something a user would look at on its own, and could not see at
+the same time as another screen: a sign-in screen, a sign-up screen, a
+dashboard, a settings page, a checkout step.
+
+A SECTION is a part of one screen: a nav bar, a hero, a feature row, a footer,
+a sidebar, a form, a card grid. Sections are NOT screens.
+
+Rules:
+- Most requests are ONE screen. Return exactly one name then -- do not invent
+  extra screens the user did not ask for.
+- Only return several when the request genuinely names several destinations
+  ("a login and a signup screen", "the whole onboarding flow", "sign in,
+  dashboard and profile").
+- At most 6, in the order they should appear left to right.
+- Name each one the way a designer would label the frame: "Login", "Sign Up",
+  "Dashboard", "Settings". Two or three words maximum, no numbering.
+
+Respond with ONLY a JSON array of screen names. No prose, no markdown fences.
+"""
+
+SCREENS_USER_TEMPLATE = """\
+Request: {instruction}
+
+Design brief:
+{brief}
+"""
+
+
+def screens_user_message(instruction: str, brief: str) -> str:
+    trimmed = (brief or "").strip()
+    if len(trimmed) > MAX_BRIEF_CHARS:
+        trimmed = trimmed[:MAX_BRIEF_CHARS].rsplit("\n", 1)[0].rstrip()
+    return SCREENS_USER_TEMPLATE.format(
+        instruction=instruction, brief=trimmed or "(none)"
+    )
+
+
 PLANNING_SYSTEM_PROMPT = """\
 You turn a design brief into an ordered list of build steps for a \
 Figma-building agent. Each step must be doable in one or two small Plugin \
 API scripts.
 
+You are planning ONE SCREEN. Its frame already exists and every step appends
+into it. Do not plan another screen, and do not plan navigation between
+screens -- other screens are being planned separately.
+
 Two things ALREADY EXIST before your plan runs, created automatically:
-- the root frame (never plan a step that creates, resizes or positions it)
+- this screen's frame (never plan a step that creates, resizes or positions it)
 - all colour styles and text styles (never plan a token/style/variable step)
 
-Required order:
-1. At most TWO reusable components, and only if they are used three or more
-   times (typically a button and a card). One component per step. Anything
-   used once or twice is built inline inside its section instead.
-2. One step per section, in top-to-bottom visual order, each appending into
-   the existing root frame.
+NEVER plan a step that creates a Figma COMPONENT, a component set, variants,
+or a "shared library". Styles already exist and the builder applies them, which
+is what makes the design consistent. Component steps land loose on the canvas,
+clutter the page and fail; sections are built inline.
+
+Plan ONE STEP PER REGION, in top-to-bottom visual order, each appending into
+this screen's frame.
 
 Rules:
-- Aim for 6-12 steps. Fewer, meatier steps beat many trivial ones -- every
-  step costs a full model round trip and can fail.
+- **DEFAULT TO ONE STEP.** One step builds the ENTIRE screen, nested as deeply
+  as it needs to be -- a sign-in screen, a dashboard, a settings page are each
+  one step. The builder makes the whole thing in a single call.
+- Only split into 2 or 3 steps when the screen is a long SCROLLING page with
+  clearly separate bands stacked top to bottom (a marketing landing page:
+  hero, then features, then pricing, then footer). Never more than 3.
+- NEVER split a screen into overlapping parts. "Add the sidebar" then "add the
+  header" then "add the main content" is wrong: they are one layout, so the
+  second step rebuilds the sidebar and the screen ends up with two of them.
+  A screen with a sidebar is always ONE step.
+- Each step must describe a region that no other step touches.
 - **Keep each step to ONE SHORT SENTENCE, under about 20 words.** Name the
   section and what it contains; do not specify exact pixel values, hex
   colours, font names, node names or per-child instructions. Those are
   decisions for the build step, which already has the tokens and the layout
   rules it needs.
-  - GOOD: "Add the sign-in card section with heading, email and password
-    fields, and a primary button, into the root frame."
+  - GOOD: "Add the sign-in card with heading, email and password fields, and
+    a primary button, into the frame."
   - BAD: "Create frame-1 with auto-layout vertical, spacing 16px, padding
     24px, width 320px... Inside, create title-1 text node with Montserrat
     Bold 24pt colour #333333. Create email-field-1 rectangle (280x48px,
     1px solid #CCCCCC, radius 4px) with a child text node..." -- that is
     five nodes and a dozen properties in one step. It will fail.
-- NEVER list many components in one step. "Create ButtonPrimary,
-  ButtonSecondary, Card, Modal, Toast, Stepper..." is far too much for one
-  step and will fail; drop it and build those inline in the sections.
-- Every section step must say that it appends into the root frame.
+- NEVER plan "Create ButtonPrimary, Card, Modal..." steps at all. Those are
+  components; build them inline inside the sections that use them.
+- Every section step must say that it appends into this screen's frame.
+- Sections belong to THIS screen only. A dashboard's sidebar is not part of a
+  sign-in screen, however sensible it would look elsewhere.
 
 Respond with ONLY a JSON array of short step strings. No prose, no markdown \
 fences.
@@ -347,9 +502,21 @@ fences.
 
 PLANNING_USER_TEMPLATE = """\
 Instruction: {instruction}
-{existing_work}
+{screen_note}{existing_work}
 What currently exists on the canvas:
 {inspection_summary}
+"""
+
+SCREEN_PLANNING_NOTE = """
+THE SCREEN YOU ARE PLANNING: "{screen}"
+{siblings}
+Plan the sections of "{screen}" and nothing else.
+"""
+
+SIBLING_SCREENS_NOTE = """\
+The full design also contains these other screens, each its own frame beside
+this one -- they are being built separately, so do not plan their content:
+{others}
 """
 
 CONTINUING_NOTE = """
@@ -396,7 +563,7 @@ def plan_outline_note(plan: list[str] | None, step_index: int) -> str:
         return ""
     lines = []
     for number, entry in enumerate(plan, start=1):
-        text = entry.strip()
+        text = str(entry).strip()
         if len(text) > MAX_OUTLINE_STEP_CHARS:
             text = text[: MAX_OUTLINE_STEP_CHARS - 1].rstrip() + "…"
         if number == step_index:
@@ -452,8 +619,21 @@ def step_user_message(
     prior_error: str = "",
     palette_info: list[tuple[str, str, str]] | None = None,
     pairings: list[str] | None = None,
+    screen_name: str = "",
+    other_screens: list[str] | None = None,
+    render_only: bool = False,
 ) -> str:
     repair = repair_note(prior_node_ids, prior_defects, prior_error)
+    screen_note = ""
+    if screen_name:
+        siblings = (
+            SCREEN_SIBLINGS.format(
+                count=len(other_screens) + 1, others=", ".join(f'"{s}"' for s in other_screens)
+            )
+            if other_screens
+            else ""
+        )
+        screen_note = SCREEN_NOTE.format(screen=screen_name, siblings=siblings)
 
     root_note = ""
     if root_frame_id and repair:
@@ -497,29 +677,53 @@ def step_user_message(
 
     return STEP_USER_TEMPLATE.format(
         step=step,
+        screen=screen_note,
         docs=docs or "(none retrieved)",
         state_summary=state_summary,
         root_frame=root_note,
         tokens=tokens_note,
         fonts=fonts_note,
-        exemplars=EXEMPLARS.replace("ROOT_ID", root_frame_id or "ROOT_ID"),
+        exemplars=(
+            RENDER_EXEMPLARS if render_only
+            else JS_EXEMPLARS.replace("ROOT_ID", root_frame_id or "ROOT_ID")
+        ),
         design_context=design_context_note(instruction, brief),
         plan_outline=plan_outline_note(plan, step_index),
         repair=repair,
-        closing=CLOSING_REPAIR if repair else CLOSING_BUILD,
+        closing=_closing(render_only, bool(repair)),
     )
 
 
+def _closing(render_only: bool, repairing: bool) -> str:
+    """The final instruction, matched to the one tool this step actually has."""
+    if render_only:
+        return CLOSING_RENDER_REPAIR if repairing else CLOSING_RENDER
+    return CLOSING_REPAIR if repairing else CLOSING_BUILD
+
+
 def planning_user_message(
-    instruction: str, inspection_summary: str, existing_sections: list[str] | None = None
+    instruction: str,
+    inspection_summary: str,
+    existing_sections: list[str] | None = None,
+    screen: str = "",
+    other_screens: list[str] | None = None,
 ) -> str:
     existing_work = (
         CONTINUING_NOTE.format(sections="\n".join(f"  - {s}" for s in existing_sections))
         if existing_sections
         else ""
     )
+    screen_note = ""
+    if screen:
+        siblings = (
+            SIBLING_SCREENS_NOTE.format(others="\n".join(f"  - {s}" for s in other_screens))
+            if other_screens
+            else ""
+        )
+        screen_note = SCREEN_PLANNING_NOTE.format(screen=screen, siblings=siblings)
     return PLANNING_USER_TEMPLATE.format(
         instruction=instruction,
+        screen_note=screen_note,
         existing_work=existing_work,
         inspection_summary=inspection_summary or "(empty page)",
     )

@@ -63,6 +63,25 @@ def main() -> int:
     print(f"Instruction: {result.instruction}")
     print(f"Success: {result.success}")
     print(f"Created {len(result.created_node_ids)} node(s).")
+
+    # Whether the design contains what was ASKED for -- the CLI reported how the
+    # build went and never this, so a run that matched none of the instruction
+    # printed "Success: True" and nothing else.
+    if result.requirements_met or result.requirements_missing:
+        total = len(result.requirements_met) + len(result.requirements_missing)
+        print(f"Requirements: {len(result.requirements_met)}/{total} met.")
+        for label in result.requirements_missing:
+            print(f"  - MISSING: {label}")
+    if result.design_notes:
+        print(f"Design-system notes ({len(result.design_notes)}):")
+        for note in result.design_notes[:5]:
+            print(f"  - {note}")
+    if result.metrics:
+        print(f"Cost: {result.metrics.get('elapsed_seconds')}s, "
+              f"{result.metrics['model']['count']} model call(s), "
+              f"{result.metrics['bridge_calls']} Figma call(s), "
+              f"x{result.metrics['retry_rate']} attempts per step.")
+
     if result.failed_steps:
         print("Failed steps:")
         for step in result.failed_steps:

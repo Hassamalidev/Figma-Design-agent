@@ -1,0 +1,10 @@
+# Optional. The project runs fully without any of these -- `requirements.txt` is
+# still the complete list of what is REQUIRED (CLAUDE.md section 12: few, boring
+# dependencies).
+#
+# Dense retrieval over knowledge/. Off by default: it pulls in PyTorch, which is
+# a heavier dependency than this entire project, and at the current corpus size
+# (~650 lines of typings) the built-in BM25 scorer measurably wins. Worth turning
+# on when the knowledge base grows past a few thousand lines -- see CLAUDE.md
+# section 9, then call knowledge.index.set_backend("embeddings").
+sentence-transformers>=3.0

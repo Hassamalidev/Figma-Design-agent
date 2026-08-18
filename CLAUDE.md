@@ -29,6 +29,39 @@ and every step is checked against ground truth — the file's metadata and its r
 shape, the harness does it *itself* rather than asking the model. See section 6a — this is
 the single biggest source of reliability in the project.
 
+### Screens are FRAMES, side by side on ONE page
+
+Figma's own model, which this project got wrong for a long time: a **page** is
+a workspace and a **frame** is a screen. Several screens are sibling frames
+laid out side by side on one page.
+
+```
+PAGE: Website Design          <- one workspace, created by nobody
+├── FRAME: Login              <- a screen
+├── FRAME: Sign Up            <- a screen, beside it
+└── FRAME: Dashboard          <- a screen, beside that
+      ├── FRAME: Sidebar      <- a SECTION inside the dashboard
+      └── FRAME: Content
+```
+
+The agent used to build **everything into one frame**, so "a login and a
+dashboard" produced a sign-in form stacked on top of a dashboard in a single
+tall column, and a re-run stamped fresh work over the old. Now:
+
+- `planner.plan_screens` asks one small question — *which screens does this
+  need?* — before anything is drawn. Sections (hero, nav, footer) are filtered
+  out deterministically, because promoting one to a top-level frame scatters a
+  screen's parts across the canvas.
+- The harness creates **one frame per screen**, positions computed in Python so
+  they can never overlap each other or existing work (section 6a).
+- Each screen is **planned separately** and each step carries its `screen_index`,
+  so a dashboard step cannot append into the login frame.
+- A re-run matches a screen to an existing frame **by name**, so it extends
+  `Login` instead of overwriting whichever frame happened to be largest.
+- Most requests are one screen, and that path is unchanged.
+
+Never create a Figma page per screen, and never `figma.createPage()`.
+
 ### The single most important design fact
 
 You **cannot** write to the Figma canvas from Python. Figma's document is only mutable from
@@ -125,12 +158,15 @@ figma-agent/
 |   |-- loop.py              # the orchestration loop (section 6)
 |   |-- planner.py           # instruction -> design brief -> ordered plan
 |   |-- scaffold.py          # Python-authored Figma scripts (section 6a)
-|   |-- critic.py            # the visual gate (section 8)
+|   |-- critic.py            # the visual gate + design-system checks (section 8)
+|   |-- requirements.py      # did the design contain what was ASKED for? (section 8d)
+|   |-- metrics.py           # what a run cost: calls, round trips, retries (section 19)
 |   |-- prompts.py           # system prompt + templates + few-shot exemplars
 |   |-- state.py             # RunState dataclass
 |
 |-- tools/
 |   |-- registry.py          # tool JSON schemas + dispatch
+|   |-- bridge_io.py         # the one timed, measured path to the plugin (section 19)
 |   |-- figma_exec.py        # execute_figma_js
 |   |-- figma_read.py        # get_metadata, get_screenshot
 |   |-- docs.py              # query_docs (calls knowledge/)
@@ -166,8 +202,10 @@ figma-agent/
 |-- tests/                   # no Figma, no network, no model — all fakes
     |-- test_bridge.py       # protocol round-trips + handshake + disconnects
     |-- test_loop.py         # loop logic with a fake ModelClient + fake bridge
-    |-- test_critic.py       # the visual gate's geometry analysis
-    |-- test_scaffold.py     # palette parsing + generated JS actually compiles
+    |-- test_critic.py      # the visual gate's geometry, contrast + design checks
+    |-- test_requirements.py# requirement coverage, and its false-positive rules
+    |-- test_metrics.py     # the run recorder: cost, latency, failure reasons
+    |-- test_scaffold.py    # palette parsing + generated JS actually compiles
     |-- test_llm.py          # tool-call recovery for small models
     |-- test_settings.py     # settings precedence, masking, dashboard API
     |-- test_registry.py     # file-gallery history
@@ -233,7 +271,7 @@ which is exactly what the swap point is for.
 ### Cost discipline
 
 Debug the **harness** (does the loop close, do tools fire, do the gates block) against the
-fakes in `tests/` — 87 tests run with no network, no Figma and no model. Spend real model
+fakes in `tests/` — 354 tests run with no network, no Figma and no model. Spend real model
 calls on genuine design runs.
 
 ---
@@ -330,13 +368,16 @@ deterministic, unit-tested, and compiled as JavaScript in CI.
 
 | Harness does it | Why the model couldn't |
 |---|---|
-| **Root frame** (`create_root_frame`) | The model tried `layoutSizingHorizontal = 'FILL'` on a child of the PAGE — never legal — and failed 3× in a row. Every "append into root frame" step then had no parent, so 7 of 10 steps failed. |
-| **Reuse of an existing root** | Re-running must *continue* a design, not stamp a second copy on top. Looks for an auto-layout frame (preferring one we made, then matching width); creates a new one clear of existing content only if none is found. |
+| **Screen frames** (`create_screens`) | The model tried `layoutSizingHorizontal = 'FILL'` on a child of the PAGE — never legal — and failed 3× in a row. Every "append into root frame" step then had no parent, so 7 of 10 steps failed. It also has no way to place several screens without overlapping them; positions are arithmetic, so Python owns them. |
+| **Reuse of an existing screen** | Re-running must *continue* a design, not stamp a second copy on top. Screens are matched to existing frames **by name**; a single-screen run additionally falls back to the old shape heuristic (an auto-layout frame, preferring one we made, then matching width). Anything new is placed clear of existing content. |
 | **Design tokens** (`bootstrap_tokens`) | Token steps failed more than any other: `createVariableSet`, `figma.createStyle`, collection-id-vs-object, invented mode ids. The palette is already spelled out in the model's own brief, so we parse the hex codes and write the API calls ourselves. |
 | **Text styles** | Same story, plus font-style guessing. A fixed Inter type scale is created instead. |
 | **Layout auditing** (`agent/critic.py`) | Overlap and overflow are geometry, not judgement — section 7 says do arithmetic in Python. |
 | **Placeholder recovery** | When a section step exhausts its retries, a labelled `TODO — <section>` frame keeps the page's structure and makes the gap visible, instead of leaving a hole. Tokens/components get no placeholder: a fake component is worse than none. |
+| **Surviving a failed variable** (`build_token_script`) | A run created ONE of six colour tokens, so nothing had a readable text or background colour to bind to and the result was 1.0:1 invisible copy. The variable and the paint style now fail independently: a style that is not variable-backed is worth far more than no style at all. |
 | **Colour roles + contrast** (`describe_palette`, `readable_pairings`) | Token *names* come from the brief, so they can be `deep-navy`, `cta`, `soft-cream` — nothing tells the model which is a background and which is a foreground. It bound text to whatever sounded right and produced invisible copy that passed every gate, because geometry cannot see contrast. Roles are now derived from WCAG luminance and the legal fg/bg pairs are *measured* and handed over as fact. |
+| **The Plugin API itself** (`agent/renderer.py`) | The decisive one. A real 29-step run called `execute_figma_js` for EVERY step and lost most of them to `FILL can only be set on children of auto-layout frames`, `HUG can only be set on…`, `Reparenting would create a component inside a component`, `counterAxisAlignItems … received 'END'` and `findAll callback crashed`. None of those is a design mistake; all are mistakes about an API that never changes. A section step is now given `render_ui` and NOT `execute_figma_js`, so they are unreachable. Telling the model to prefer the renderer did not work — removing the alternative did. |
+| **Refusing component steps** (`planner._drop_component_steps`) | The same run planned five "Create a Button component" steps across five screens. Each either failed outright or left a loose component on the canvas that no section ever used. Components add nothing to a static mockup: consistency comes from the styles the harness already made and the renderer already applies. |
 | **Tracking what's been built** (`record_section`) | `existing_sections` was filled in once, only when reusing a root frame — so on a fresh run every step was told the page was empty and duly rebuilt what was already there. Each completed section (and each TODO placeholder) is now recorded as it lands. |
 
 Consequence for the planner: it is told the root frame and all styles **already exist** and
@@ -376,8 +417,13 @@ These are the levers that move UI quality and keep the run affordable. Apply all
 
 ## 8. The visual gate (`agent/critic.py`)
 
-This is what makes designs actually *look* right. It has **two halves that catch different
-bugs**, and the first one works with any model.
+This is what makes designs actually *look* right. It has **four parts that catch different
+bugs**, and only the last one needs a model at all.
+
+The dividing line throughout is **fact vs judgement**. A 0x0 node renders nothing and a
+1.2:1 contrast ratio is invisible — those are arithmetic, and they gate. "This gap is 17px
+instead of 16px" is a polish note — it is reported and never fails a step. Getting this
+backwards is how a critic starts replacing working sections with `TODO` placeholders.
 
 ### 8a. Deterministic geometry analysis (always on, free)
 
@@ -394,11 +440,65 @@ it cannot hallucinate a defect:
 | `overlap` | Two siblings overlapping by more than 2px — **only** checked when the parent is not auto-layout, since auto-layout cannot produce overlap (avoids false positives). |
 | `empty-frame` | A frame over 40×40 with no children: a blank region. Smaller ones are icon placeholders and ignored. |
 | `invisible` / `empty-text` | Hidden nodes and text with no characters. |
+| `contrast` | Text under ~3:1 against its resolved background — **invisible copy**. See 8b. |
 
 The 2px tolerances exist so rounding never produces noise. This is section 7's "do
 arithmetic in Python" applied to layout: overlap is geometry, not judgement.
 
-### 8b. Screenshot critique (a SEPARATE vision model)
+### 8b. Contrast (always on, free) — the defect geometry is blind to
+
+Section 6a explains that colour *roles* are derived from WCAG luminance so the builder is
+handed the legal foreground/background pairs as fact. Nothing checked the result. A model
+that ignored the list produced text that was the right size, in the right place, overlapping
+nothing — and completely unreadable. Every gate passed it.
+
+The layout read now returns each node's resolved fill and whether it is token-backed, so the
+same arithmetic runs over what actually landed:
+
+- The background is the nearest **filled ancestor**, not the direct parent — a transparent
+  wrapper between the text and the fill must not hide the defect.
+- Large text (>=24px, or >=18.66px bold) is held to WCAG's lower 3:1 bar, not 4.5:1.
+- **Only the unreadable band blocks.** Below AA but above ~3:1 is legible-but-not-accessible:
+  reported as advisory. Failing a section over 4.4:1 — and eventually demoting it to a
+  placeholder — would be a worse design outcome than shipping it.
+- Silent when either colour is unresolvable. Text over an image or a gradient has no single
+  background colour, and inventing one produces confident nonsense.
+
+### 8c. Design-system adherence (always on, free, never blocking)
+
+The rules CLAUDE.md states as prose, measured against the finished tree. All advisory, all
+reported in `RunResult.design_notes`:
+
+| Check | What it catches |
+|---|---|
+| `off-scale-spacing` | An auto-layout gap or padding off the 8px scale — what makes a page feel arrhythmic even when nothing overlaps. |
+| `off-ramp-type` | A `fontSize` outside the ramp `bootstrap_tokens` created: a text style was set aside for an ad-hoc size. |
+| `untokenised-fill` | Golden rule 5. A hardcoded colour matching no token, so changing the palette will not change it. Runs *after* `audit_variable_bindings` has rebound everything close to a token, so what survives is genuinely off-palette. Nodes under 24x24 are exempt — a one-off icon colour is normal. |
+
+The scale and the ramp are defined once, in `critic.py`, and imported by `bench/score.py`
+so the benchmark cannot drift from the gate that runs during a build.
+
+### 8d. Requirement coverage (`agent/requirements.py`)
+
+Every check above measures *how* something was built. None asked whether the sign-in screen
+has a password field. Two rules keep this honest:
+
+1. **Requirements come from the USER'S instruction, never the brief.** The brief is written
+   by the model, so triggering on it would let the agent set its own homework and mark it
+   complete.
+2. **Only what was literally named is asserted.** Nothing is assumed about what a "landing
+   page" ought to contain, so a reported miss is always something asked for and absent.
+
+Quoted copy counts too: if the instruction says `'Welcome back'`, that text must be on the
+canvas. Like the benchmark's `requirements` dimension this is a **proxy** — it checks that a
+node named or reading "password" exists, which is evidence, not proof.
+
+`success` now fails a run that satisfied **none** of a clearly-specified instruction (three
+or more requirements, zero met). One missing item is a flaw, not a failure — only
+zero-of-many is the wrong design. This closes the gap where a run could match nothing the
+user asked for and still report a green tick.
+
+### 8e. Screenshot critique (a SEPARATE vision model)
 
 **The critic is its own model** (`CRITIC_*` in `.env`, built by
 `llm.build_critic_client`). The generator needs reliable tool calling and runs ~50 times per
@@ -423,7 +523,7 @@ Three rules make this safe to switch on. Without them a vision model makes outpu
    is judgement, and trading a real section for an empty `TODO` frame over judgement is a
    regression, not a gate.
 
-### 8c. How the critique is assembled
+### 8f. How the critique is assembled
 
 When the model can see images, `get_screenshot` is called and the model is sent **both**
 signals: metadata is structural ground truth (sizes, counts, hierarchy), the screenshot is
@@ -495,11 +595,41 @@ Plugin API surface, not its training memory.
   interface/method: each chunk is one type or method signature plus its doc comment.
 - `gotchas.md` — the traps in section 11. Chunk by rule (one trap per chunk).
 
-**Current implementation (`knowledge/index.py`): keyword overlap, no vector store.**
-`gotchas.md` is split at each `##` heading, `api_types.d.ts` at each interface/type, and the
-step description is scored against those chunks. Zero dependencies, and verified to retrieve
-the right chunk for the exact queries that failed in live runs. Swap in embeddings later by
-changing this one file — `retrieve(query) -> str` is the whole interface.
+**Current implementation (`knowledge/index.py`): BM25, no vector store.** `gotchas.md` is
+split at each `##` heading, `api_types.d.ts` at each interface/type, and the step description
+is scored against those chunks. Zero dependencies. `retrieve(query) -> str` is the whole
+interface and every scorer behind it is a swappable backend (`set_backend`), so the promise
+that embeddings are a one-file change is now structural rather than aspirational.
+
+The scorer used to count how many query words a chunk contained, which rewards LONG chunks —
+and the longest chunk in the corpus is the typings preamble. Measured, on the queries a real
+plan produces:
+
+| Query (a plain-English plan step) | Old top hit | Now |
+|---|---|---|
+| "set the line height on a text node" | the file **header** | `TextNode` |
+| "bind a paint to a colour variable" | `RGBA` | `VariablesAPI` |
+| "make a child fill its auto layout parent" | — | `AutoLayoutMixin` |
+
+Two changes did it, both dependency-free:
+
+- **BM25** weights rare terms above common ones (IDF) and divides out chunk length. Long
+  low-signal chunks can no longer win on volume alone.
+- **Identifier-aware tokenization.** `setBoundVariableForPaint` is indexed both whole and as
+  set/bound/variable/for/paint, so plain English can reach a compound API name. The planner
+  is *told* to keep steps under 20 words and strip out API detail, so this gap was structural.
+
+**Caching**, three layers, because the same text was otherwise re-derived constantly:
+the parsed corpus, the term statistics, and the answers (`retrieve` is memoized — a retrying
+step asks an identical question up to `max_retries` times). Chunk keywords were a `@property`
+that re-ran the tokenizer over the whole corpus on *every scored chunk of every call*.
+Measured: **0.31ms -> 0.031ms** per uncached call, and ~0 on a repeat.
+
+**Embeddings are built but off.** `EmbeddingBackend` works and falls back to BM25 with a
+logged warning if `sentence-transformers` is absent — it pulls in PyTorch, a heavier
+dependency than this entire project, and at ~650 lines of typings BM25 measurably wins. Turn
+it on when the corpus grows past a few thousand lines or gains prose that shares no
+vocabulary with the queries.
 
 **The gotchas are not retrieved — they are carried.** The whole corpus is ~4k tokens, which
 is small enough to simply live in the system prompt (`prompts.system_prompt()`). As a *tool*
@@ -531,8 +661,11 @@ script; the error will tell you more"*.
 - three **few-shot exemplars**: section (create → resize → append → *then* sizing), text
   (font-load first, real width), and clone-edit-reassign for fills
 
-**Not yet built:** embeddings over the full `.d.ts`, and prompt caching of a stable prefix.
-Both are worth doing on a paid hosted model; neither matters much on the free tier.
+**Not yet built:** provider-side prompt caching of the stable prefix. The system prompt is
+already a byte-identical ~5k-token prefix per process, so an endpoint that caches prefixes
+automatically already benefits; explicit `cache_control` breakpoints need a paid endpoint to
+verify against and are not worth writing blind. Token counts are now recorded (section 19),
+so the benefit is measurable the moment someone switches.
 
 ---
 
@@ -719,6 +852,20 @@ Values are saved to `web/runtime_settings.json` (git-ignored) and **take precede
 `.env`**; the API key is never sent back to the browser (masked). `main.py` still requires
 `.env` and fails loudly — it has nowhere to ask.
 
+**Run preferences are declared once**, in `settings_store.PREF_SPECS`, with their type,
+bounds and where the default comes from. The dashboard renders its inputs from that
+declaration (`/api/settings` -> `prefs_schema`) rather than hardcoding min/max in HTML, so
+the limit the UI shows is the limit the store enforces is the limit the run uses. Numeric
+defaults come from `.env` via `Settings`, which closes a real divergence: `MAX_RETRIES=5`
+used to apply to the CLI and be silently ignored by the dashboard, which ran 3 and displayed
+3 from the same file.
+
+Coercion is shared between reads and writes, so a value can only ever round-trip to itself.
+Anything rejected comes back to the UI with its reason (`pref_errors`) instead of the input
+silently reverting, and the settings file is written via a temp file and renamed, so an
+interrupted save cannot leave JSON that reads back as "no settings at all" and loses the
+user's API key.
+
 Run:
 
 ```bash
@@ -745,6 +892,13 @@ Optional browser UI; the CLI still works unchanged. It adds:
   account or REST token — it only ever shows files it has actually seen via the handshake.
 - **choosing which file to build in.** Picking one that isn't currently open puts the run in
   "waiting for file" and starts it the moment that file connects.
+- **removing a file from the gallery** — and, as a separate opt-in, emptying its canvas.
+  There is deliberately no "delete the Figma file": a plugin runs INSIDE a file, the Plugin
+  API has no `deleteFile` and `figma.fileKey` is read-only (verified against the typings),
+  and Figma's REST API has no delete-file endpoint. So the dialog says exactly that, and
+  offers the two things that are real. Clearing the canvas is guarded by the same identity
+  check as the thumbnail capture — the script always runs in whichever file the plugin is
+  in now, so without re-checking, deleting one card could wipe a different design.
 - live status pills for plugin/model, the run log, and the final screenshot.
 - **dark/light themes** (follows the OS, remembers your choice).
 - a **Connect Figma** guide with the exact manifest path to import, step 4 turning green when
@@ -769,36 +923,45 @@ Do not start a phase until the previous one runs end to end.
 1. **No baseline recorded yet.** The benchmark exists (section 16a) but has never been run
    against live Figma, so every improvement in this file is still argued from code reading
    rather than measured. Capture a baseline before changing anything else.
-2. **No requirement-coverage check.** Every gate measures geometry; none asks whether the
-   sign-in screen actually contains a password field. `success` still only means "no step
-   exhausted its retries", so a run can satisfy none of the instruction and report success.
-3. **The planner emits `list[str]`.** Structure is then recovered by keyword-matching English
-   in `_is_section_step`, so phrasing silently changes whether the gate and the placeholder
-   fallback run. It should emit a typed spec with per-section acceptance criteria.
-4. **No deterministic design checks** beyond geometry: contrast is computed for the *prompt*
-   but not yet enforced in `critic.py`, and nothing checks spacing-scale or type-ramp
-   adherence. All arithmetic, all cheap, none written.
+2. ~~**No requirement-coverage check.**~~ **Done** — `agent/requirements.py` (section 8d).
+   Requirements are derived from the user's own instruction, checked against the finished
+   tree, and reported as `requirements_met` / `requirements_missing`. `success` now fails a
+   run that satisfied none of a clearly-specified instruction.
+3. **The planner emits `list[PlanStep]`** — each step now carries the `screen_index` it
+   belongs to, so screen assignment is data rather than a guess. Section detection is still
+   keyword-matched English (`_is_section_step`), and per-section acceptance criteria are
+   still not emitted; that half of the gap is open.
+4. ~~**No deterministic design checks** beyond geometry~~ **Done** — sections 8b and 8c.
+   Contrast is now enforced against what landed (unreadable blocks, below-AA is advisory),
+   and spacing-scale, type-ramp and token-backing are measured and reported.
 5. **No vision critic is configured yet.** The architecture is in place and safe to enable
    (section 8b), but `CRITIC_MODEL_NAME` is blank, so screenshot critique never runs. This is
    now the biggest single quality lever available — it is the only check that can see
    contrast, balance and whether the screen reads as the product that was asked for.
 6. Design quality on a 20B model. Real, but it was masked by the plumbing gaps above; retest
    it once the benchmark exists.
-7. No embeddings over `api_types.d.ts` (the corpus is ~650 lines — this would gain nothing);
-   no prompt caching (the system prompt is now a ~5k-token stable prefix, so this is finally
-   worth doing on a paid model).
+7. Embeddings over `api_types.d.ts` are **built but off by default** (section 9): BM25 wins
+   at this corpus size and needs no dependency. No provider-side prompt caching yet — the
+   prefix is stable and token counts are now recorded, so the benefit is measurable the
+   moment someone points this at a paid endpoint.
+8. **`bench/` still records no `visual` dimension**, and the benchmark has still never been
+   run against live Figma. Gap #1 is unchanged and remains the most important one: every
+   improvement above is argued from unit tests and measured micro-benchmarks, not from a
+   design-quality baseline.
 
 ---
 
 ## 16. Testing
 
-**186 tests, no network, no Figma, no model.** `pytest` runs the whole suite in ~7 seconds.
+**354 tests, no network, no Figma, no model.** `pytest` runs the whole suite in ~7 seconds.
 
 | File | Covers |
 |---|---|
 | `test_bridge.py` | Protocol round-trips over a real loopback socket, the `hello` handshake, timeouts, abrupt disconnects |
 | `test_loop.py` | The loop with `FakeModelClient` (scripted tool calls) + `FakeBridge` (canned results): retries, both gates, root-frame reuse, repeat guard, doc-query budget, placeholder fallback |
-| `test_critic.py` | The visual gate's geometry analysis — and that a clean tree reports **nothing** |
+| `test_critic.py` | The visual gate: geometry, contrast (including what must NOT be flagged), design-system adherence — and that a clean tree reports **nothing** |
+| `test_requirements.py` | Requirement coverage, weighted towards its false-positive rules: a wrongly-reported miss is worse than a missed check |
+| `test_metrics.py` | The run recorder: latency distributions, per-thread isolation, and that measuring never breaks what it measures |
 | `test_scaffold.py` | Palette parsing, and that generated JS **actually compiles** via `new AsyncFunction(...)`, exactly as the plugin evals it |
 | `test_llm.py` | Tool-call recovery for models that emit them as text |
 | `test_settings.py` | Settings precedence (UI over `.env`), key masking, dashboard API |
@@ -813,6 +976,11 @@ Two rules that keep this suite honest:
   a new harness script means teaching `_harness_response` about it, not editing every test.
 - **Generated JavaScript is compiled in CI.** A syntax slip in `scaffold.py` or `critic.py`
   fails here rather than halfway through a live run.
+- **Every stateful path a test touches must be redirected to `tmp_path`.** `DashboardServer`
+  falls back to the real `web/history.json` when no `History` is passed, so each test that
+  drove a run wrote a fake "a dashboard / Untitled / 5ms" entry into the user's own History
+  tab — 50 of them, which buried every real run. Settings and the file registry were already
+  redirected; the log was the one that was not. When adding a fake, check what it writes.
 
 Also verify plugin changes: `cd figma_plugin && npm run build && npm run lint` — the ESLint
 plugin catches disallowed Figma API usage. Keep Figma-dependent checks as a manual smoke test.
@@ -884,6 +1052,11 @@ which is evidence a password field was built, not proof it was built well. Read 
 | Change how a run is orchestrated | `agent/loop.py` |
 | Change what the harness builds itself | `agent/scaffold.py` (section 6a) |
 | Tune the visual gate / add a defect check | `agent/critic.py` (section 8) |
+| Add a design-system rule (spacing, type, tokens) | `agent/critic.py` — `_check_design` (section 8c) |
+| Change what counts as a satisfied requirement | `agent/requirements.py` — `_ELEMENTS` (section 8d) |
+| See what a run cost / add a metric | `agent/metrics.py` (section 19) |
+| Switch retrieval to embeddings | `knowledge/index.py` — `set_backend("embeddings")` (section 9) |
+| Add or change a dashboard preference | `web/settings_store.py` — `PREF_SPECS` (section 14) |
 | Change what every step prompt says | `agent/prompts.py` (system prompt, exemplars, notes) |
 | Change retrieval / what docs are injected | `knowledge/index.py` (section 9) |
 | Add/adjust a tool the model can call | `tools/registry.py` + the tool file |
@@ -917,3 +1090,44 @@ which is evidence a password field was built, not proof it was built well. Read 
    confident-looking APIs in earlier drafts simply did not exist.
 6. **Write a test from the real trace.** Every guardrail in section 6 exists because a live
    run produced it; the tests encode those exact traces so they cannot regress.
+
+---
+
+## 19. Observability (`agent/metrics.py`)
+
+Every claim in this file used to be argued from reading the code. That is honest while there
+are no numbers, but it means nobody can tell whether a change helped — and the two most
+expensive things in a run were the two nobody counted.
+
+`RunMetrics` records, per run:
+
+| Measured | Why it is the number you want |
+|---|---|
+| Model calls: count, mean, **p50/p95**, errors | ~50 calls per design. A mean hides the one 40s call that made a run feel broken; p95 is what you tune against. |
+| `model_transient_retries` | Endpoint blips absorbed by `llm.py`. A run that "felt slow" is often this, not the model. |
+| Prompt / completion tokens | Best-effort (not every endpoint reports `usage`). Makes prompt-caching benefit measurable. |
+| Figma round trips, **split by request type** | A slow `screenshot` and a slow `exec` have completely different causes. |
+| `plugin_wait_seconds` | Time spent waiting for the user to open Figma. Not a failure, but it dominates wall clock and was otherwise blamed on the agent. |
+| Steps planned / completed / failed, and `retry_rate` | Attempts per step. `1.0` means nothing needed a second try; it is the single best predictor of a slow, expensive run. |
+| `failure_reasons`, bucketed | `no-script-run` (a prompt problem) and `script-error` (belongs in `ERROR_HINTS`) read identically in the log and call for different fixes. |
+| `gate_failures` by gate | How often geometry vs vision is the thing rejecting work. |
+
+Three design choices, each load-bearing:
+
+1. **Instrumented at the seams, not the call sites.** Model timing lives in `llm.py` (golden
+   rule 1 guarantees every caller goes through it) and Figma timing in `tools/bridge_io.py`.
+   The loop, the planner and the critic are measured without any of them knowing.
+2. **Thread-local, not a parameter.** The alternative is threading a metrics object through
+   `run -> run_step -> converse_step -> dispatch -> the tool functions`. The dashboard
+   already runs each run on its own thread, which is exactly the right granularity.
+3. **`current()` never returns None.** Outside a run it returns a throwaway, so instrumented
+   code is a plain `metrics.current().observe(...)` with no guard — a guard that would
+   eventually be forgotten somewhere.
+
+The dashboard passes its own `RunMetrics` into `loop.run` and polls it live, which is how the
+UI shows "Step 4 of 9 · attempt 2" instead of asking the user to read a scrolling log. Every
+run also logs one summary line, and `RunResult.metrics` is saved with benchmark results.
+
+**A metric must never break the thing it measures.** The status endpoint reads the recorder
+from the HTTP thread while the run thread writes it; a torn read returns `None` rather than
+500ing, because a skipped progress frame is a far better outcome than a dead dashboard.

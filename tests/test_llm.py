@@ -6,7 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent import llm
 from agent.llm import _recover_tool_call_from_content, _strip_code_fence
+from tools.registry import ALL_TOOLS, SECTION_TOOLS
 
 TOOLS = [{"type": "function", "function": {"name": "execute_figma_js"}}]
 
@@ -270,3 +272,59 @@ def test_absorbed_endpoint_blips_are_counted_separately_from_calls(monkeypatch):
     assert completions.calls == 2                   # retried once at the transport
     assert measured.model.count == 1                # one logical call
     assert measured.model_transient_retries == 1    # with the blip made visible
+
+
+# ---- a real trace: the correction was printed, not called ------------------
+#
+# The model rendered a section, decided it was "missing several required
+# details", and wrote the corrected call out as prose with a fenced ```json
+# block holding {"spec": {...}} -- no `name`, no `arguments`, no envelope. The
+# loop saw text, concluded the step was finished, and the fix never ran.
+
+_PROSE_WITH_A_BARE_SPEC = '''The previous render was missing the card background and the shadow.
+
+```json
+{
+  "spec": {
+    "kind": "section",
+    "name": "Login",
+    "children": [{"kind": "text", "style": "Heading", "value": "Welcome Back"}]
+  }
+}
+```
+
+Run this render_ui call to create the complete Login section.'''
+
+
+def _recovered(content, tools):
+    message = SimpleNamespace(content=content, tool_calls=None)
+    return getattr(llm._recover_tool_call_from_content(message, tools), "tool_calls", None)
+
+
+def test_a_spec_printed_without_its_envelope_is_still_a_render_call():
+    calls = _recovered(_PROSE_WITH_A_BARE_SPEC, SECTION_TOOLS)
+
+    assert calls and len(calls) == 1
+    assert calls[0].function.name == "render_ui"
+    assert "Welcome Back" in calls[0].function.arguments
+
+
+def test_a_bare_script_payload_is_still_an_execute_call():
+    calls = _recovered('```json\n{"code": "return {createdNodeIds: []};"}\n```', ALL_TOOLS)
+
+    assert calls and calls[0].function.name == "execute_figma_js"
+
+
+def test_recovery_needs_the_argument_to_be_unambiguous():
+    """Guessing the tool from an argument name is only safe while exactly one
+    tool claims that name. A shared argument must recover nothing."""
+    shared = [
+        {"function": {"name": "a", "parameters": {"required": ["spec"]}}},
+        {"function": {"name": "b", "parameters": {"required": ["spec"]}}},
+    ]
+    assert llm._tools_by_sole_argument(shared) == {}
+
+
+def test_ordinary_prose_is_not_mistaken_for_a_tool_call():
+    assert _recovered("I have finished building the login card.", SECTION_TOOLS) is None
+    assert _recovered('```json\n{"note": "all done"}\n```', SECTION_TOOLS) is None

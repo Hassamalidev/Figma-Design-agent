@@ -48,6 +48,10 @@ class PlanStep:
 
     description: str
     screen_index: int = 0
+    # None = work it out from the wording. Harness-authored steps set it
+    # explicitly, because deciding whether a step may write raw JavaScript by
+    # keyword-matching its English is exactly the guesswork this field removes.
+    render_only: bool | None = None
 
     def __str__(self) -> str:
         return self.description
@@ -69,10 +73,19 @@ class RunResult:
     created_node_ids: list[str]
     failed_steps: list[str]
     warnings: list[str]
+    # True when the user stopped the run. Kept apart from `success` because
+    # "you stopped it" and "it failed" are different things to be told.
+    stopped: bool = False
+    # The bridge died mid-run: the work is kept and reported, but nothing
+    # was validated, so this is never a success.
+    ended_early: bool = False
     final_screenshot_base64: str | None = None
     layout_defects: list[str] = field(default_factory=list)
     # The screens this run produced, left to right -- one Figma frame each.
     screens: list[str] = field(default_factory=list)
+    # One rendered PNG per screen, so the dashboard can page through them
+    # instead of showing every frame shrunk into a single wide strip.
+    screen_shots: list[dict] = field(default_factory=list)
     # Design-system adherence: contrast below AA, off-scale spacing, off-ramp
     # type, untokenised fills. Advisory by construction -- reported so the rules
     # are measurable, never used to fail a step (see agent/critic.py).
@@ -95,6 +108,12 @@ class RunState:
     """Mutable state for a single run of the agent loop."""
 
     instruction: str
+    # Text derived from the user's ATTACHMENTS (a screenshot read by a vision
+    # model, a spec document). Kept apart from `instruction` on purpose: it
+    # feeds the brief, the plan and the palette, but `agent/requirements.py`
+    # must only ever grade the design against the user's OWN words, or the
+    # agent would be setting its own homework (CLAUDE.md section 8d).
+    references: str = ""
     enhanced_brief: str = ""
     plan: list[PlanStep] = field(default_factory=list)
     inspection_summary: str = ""
@@ -120,6 +139,7 @@ class RunState:
     # Non-blocking visual observations, reported but never used to fail a step.
     minor_notes: list[str] = field(default_factory=list)
     layout_defects: list[str] = field(default_factory=list)  # from the final visual review
+    screen_shots: list[dict] = field(default_factory=list)  # {name, image_base64} per screen
     design_notes: list[str] = field(default_factory=list)  # advisory design-system findings
     requirements_met: list[str] = field(default_factory=list)
     requirements_missing: list[str] = field(default_factory=list)
@@ -128,11 +148,41 @@ class RunState:
     # fail a run over.
     satisfied_no_requirements: bool = False
     visual_gate_enabled: bool = True  # user preference, from the dashboard
+    # Asked at every checkpoint. A run is stopped COOPERATIVELY -- a model call
+    # or a Figma round trip in flight cannot be interrupted, so the honest
+    # promise is "no new work starts", not "everything halts this instant".
+    should_stop: object | None = None
+    stopped: bool = False  # the user asked for this run to end early
+    # The bridge died mid-run: what was built is kept and reported, but
+    # nothing was validated, so it is never reported as a success.
+    ended_early: bool = False
     created_node_ids: list[str] = field(default_factory=list)
     step_results: list[StepResult] = field(default_factory=list)
     failed_steps: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     final_screenshot_base64: str | None = None
+
+    def stop_requested(self) -> bool:
+        """Has the user asked this run to stop? Never raises -- a broken
+        callback must not be able to take the run down."""
+        if self.should_stop is None:
+            return False
+        try:
+            return bool(self.should_stop())
+        except Exception:
+            return False
+
+    def forget_node_ids(self, node_ids: list[str]) -> None:
+        """Drop nodes that were removed from the canvas.
+
+        The binding audit and the final review both walk `created_node_ids`, so
+        a deleted node left in here means the run reports on, and tries to
+        rebind, something that no longer exists.
+        """
+        gone = {node_id for node_id in node_ids if node_id}
+        if not gone:
+            return
+        self.created_node_ids = [i for i in self.created_node_ids if i not in gone]
 
     def add_node_ids(self, node_ids: list[str]) -> None:
         """Track new nodes, never duplicating.
@@ -186,8 +236,14 @@ class RunState:
         if cleaned not in self.existing_sections:
             self.existing_sections.append(cleaned)
 
+    def completed_step_descriptions(self) -> set[str]:
+        """Steps that finished, so a run cut short can name only what it owes."""
+        return {r.step_description for r in self.step_results if r.ok}
+
     def mark_failed(self, step) -> None:
-        self.failed_steps.append(str(step))
+        description = str(step)
+        if description not in self.failed_steps:
+            self.failed_steps.append(description)
 
     def recent_summary(self, n: int = 5) -> str:
         """A short, model-facing digest of the last n steps -- never the full transcript."""
@@ -196,6 +252,17 @@ class RunState:
             status = "ok" if r.ok else "FAILED"
             lines.append(f"- [{status}] {r.step_description}: {r.summary}")
         return "\n".join(lines) if lines else "(no steps completed yet)"
+
+    def design_source(self) -> str:
+        """Everything describing the design to build: the instruction and the
+        attachments. This is what the brief and the PALETTE are read from --
+        a screenshot's colours are facts about a real image, and the best
+        source available. It is deliberately NOT what requirements are read
+        from; see `references`.
+        """
+        if not self.references:
+            return self.instruction
+        return self.instruction + "\n\n" + self.references
 
     def built_section_count(self) -> int:
         """Sections that are real work, not `TODO` placeholders."""
@@ -220,6 +287,13 @@ class RunState:
         One missing requirement is a flaw, not a failure -- only zero-of-many
         is treated as the wrong design (see agent/requirements.py).
         """
+        if self.stopped:
+            return False  # a design that was cut short is not a finished one
+        if self.ended_early:
+            # The plugin went away mid-run. The work already on the canvas is
+            # real and is reported, but a run that never reached its own final
+            # validation has not been checked and must not claim a green tick.
+            return False
         built_something = any(r.created_node_ids for r in self.step_results if r.ok)
         return not self.failed_steps and built_something and not self.satisfied_no_requirements
 
@@ -227,12 +301,15 @@ class RunState:
         return RunResult(
             instruction=self.instruction,
             success=self.succeeded(),
+            ended_early=self.ended_early,
+            stopped=self.stopped,
             created_node_ids=list(self.created_node_ids),
             failed_steps=list(self.failed_steps),
             warnings=list(self.warnings),
             final_screenshot_base64=self.final_screenshot_base64,
             layout_defects=list(self.layout_defects),
             screens=self.screen_names(),
+            screen_shots=list(self.screen_shots),
             design_notes=list(self.design_notes),
             requirements_met=list(self.requirements_met),
             requirements_missing=list(self.requirements_missing),

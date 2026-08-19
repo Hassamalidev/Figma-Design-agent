@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 
+from agent import scaffold
+
 # The 8px scale. The model picks a NAME, never a number, so off-scale spacing
 # is not expressible rather than merely discouraged.
 SPACING = {"none": 0, "xs": 4, "sm": 8, "md": 16, "lg": 24, "xl": 32, "2xl": 48}
@@ -49,7 +51,34 @@ DEFAULT_TEXT_STYLE = "Body"
 # Semantic tones a badge/status can use, resolved against the palette roles.
 TONES = ("success", "warning", "error", "info", "accent", "neutral")
 
+# Synonyms for the kinds that really exist. A live run lost turns to
+# `unknown kind 'ellipse'`, `'frame'`, `'checkbox'` and `'image'` -- all
+# reasonable names for things the renderer can already draw. Rejecting a
+# synonym teaches the model nothing and costs a whole turn, so they are mapped.
+ALIASES = {
+    "frame": "col", "group": "col", "container": "col", "div": "col",
+    "stack": "col", "vstack": "col", "list": "col", "form": "col",
+    "hstack": "row", "flex": "row", "inline": "row",
+    "panel": "card", "surface": "card",
+    "heading": "text", "title": "text", "label": "text", "paragraph": "text",
+    "link": "text", "caption": "text", "span": "text",
+    "cta": "button", "submit": "button",
+    "textfield": "input", "textbox": "input", "field": "input",
+    "ellipse": "avatar", "circle": "avatar", "dot": "avatar",
+    "icon": "avatar", "logo": "avatar",
+    "image": "box", "img": "box", "illustration": "box", "graphic": "box",
+    "rectangle": "box", "rect": "box", "shape": "box", "spacer": "box",
+    "gradient": "box", "chart": "box", "placeholder": "box",
+    "line": "divider", "rule": "divider", "separator": "divider",
+    "radio": "checkbox", "toggle": "checkbox", "switch": "checkbox",
+    "tag": "badge", "chip": "badge", "pill": "badge",
+}
+
 MAX_NODES = 400  # a runaway spec must not lock up Figma
+
+# Below this ratio an aliased role is indistinguishable from what it sits on,
+# so the alias is dropped rather than painting a divider white on white.
+MIN_ALIAS_CONTRAST = 1.35
 
 
 class SpecError(ValueError):
@@ -62,10 +91,15 @@ def _js(value) -> str:
 
 
 class _Compiler:
-    def __init__(self, parent_id: str, color_roles: dict[str, str]):
+    def __init__(self, parent_id: str, color_roles: dict[str, str], token_names=()):
         self.parent_id = parent_id
         # role -> real paint style name, e.g. {"text": "color/dark-gray"}
         self.roles = color_roles
+        # Every token that really exists, keyed loosely so "color/deep-navy",
+        # "deep-navy" and "Deep Navy" all resolve to the same paint style.
+        self.tokens = {_token_key(n): n for n in (token_names or ())}
+        # Row frames with an explicit height: their children stretch to it.
+        self.fixed_rows: set[str] = set()
         self.lines: list[str] = []
         self.fonts: set[tuple[str, str]] = set()
         self.created: list[str] = []
@@ -82,10 +116,17 @@ class _Compiler:
     def fill(self, var: str, role: str | None) -> None:
         """Apply a paint STYLE by name. Styles are variable-bound already, so
         this is what keeps the design token-backed without the model ever
-        touching a hex value."""
+        touching a hex value.
+
+        A ROLE is the normal way in. A real TOKEN name is also accepted, because
+        roles cannot express everything a palette contains: a dark-to-light
+        split screen needs the near-black token by name, and asking for the
+        `background` role -- which is by definition the lightest colour -- gave
+        it white and rendered the whole panel as a blank void.
+        """
         if not role:
             return
-        style = self.roles.get(role)
+        style = self.roles.get(role) or self.tokens.get(_token_key(role))
         if not style:
             return  # unknown role: leave the default fill rather than guessing
         self.lines.append(f"  await applyFill({var}, {_js(style)});")
@@ -117,9 +158,10 @@ class _Compiler:
             self.lines.append(f"  {var}.counterAxisAlignItems = {_js(node['align'])};")
         self.fill(var, node.get("background"))
         self.lines.append(f"  {parent}.appendChild({var});")
-        # Stretch to the parent's width unless the node opts out (buttons and
-        # badges hug their label). `setFill` re-checks at runtime that the
-        # parent really is auto-layout, so this can never throw.
+        # SIZE FIRST, THEN SIZING MODES. `resize()` resets HUG/FILL back to
+        # FIXED (knowledge/gotchas.md), so a FILL applied before a resize is
+        # silently thrown away -- which is how a full-width row ended up frozen
+        # at whatever width it happened to have when it was measured.
         # A FIXED width is what a sidebar is: 240px beside a filling content
         # column. It must not also stretch, so it opts out of FILL.
         if node.get("width"):
@@ -127,8 +169,6 @@ class _Compiler:
             axis = "primaryAxisSizingMode" if direction == "row" else "counterAxisSizingMode"
             self.lines.append(f"  {var}.{axis} = 'FIXED';")
             self.lines.append(f"  {var}.resize({width}, {var}.height);")
-        elif node.get("fill", True):
-            self.lines.append(f"  setFill({var});")
         if node.get("height"):
             self.lines.append(
                 f"  {var}.counterAxisSizingMode = 'FIXED';"
@@ -136,6 +176,25 @@ class _Compiler:
                 else f"  {var}.primaryAxisSizingMode = 'FIXED';"
             )
             self.lines.append(f"  {var}.resize({var}.width, {int(node['height'])});")
+        if not node.get("width") and node.get("fill", True):
+            # `setFill` re-checks at runtime that the parent really is
+            # auto-layout, so this can never throw.
+            self.lines.append(f"  setFill({var});")
+        # A column beside another column has to be as tall as the row holding
+        # them, or a 55/45 split screen renders as two short bands with the
+        # page showing through underneath. Automatic for a container inside a
+        # fixed-height ROW -- which is exactly the split-screen case and never
+        # a row of buttons.
+        stretches = node.get("stretch") or (
+            # `fill: False` marks something that hugs its own content -- a
+            # button or a badge. One of those dropped straight into a
+            # fixed-height row must not become 900px tall.
+            parent in self.fixed_rows and node.get("fill", True)
+        )
+        if stretches:
+            self.lines.append(f"  setFillV({var});")
+        if direction == "row" and node.get("height"):
+            self.fixed_rows.add(var)
         self.created.append(var)
         return var
 
@@ -210,9 +269,15 @@ class _Compiler:
              "background": "surface", "align": "CENTER"},
             wrapper,
         )
-        self.text(
-            {"style": "Body", "value": node.get("placeholder", ""), "color": "text-muted"}, box
-        )
+        # An input with no placeholder rendered an EMPTY text node, so the box
+        # came back as "408x56 frame is empty, leaving a blank region" -- a
+        # defect the harness caused and then reported. A field always shows
+        # something; fall back to the label, then to a neutral hint.
+        placeholder = str(node.get("placeholder") or "").strip()
+        if not placeholder:
+            label = str(node.get("label") or "").strip()
+            placeholder = f"Enter {label.lower()}" if label else "Enter a value"
+        self.text({"style": "Body", "value": placeholder, "color": "text-muted"}, box)
         return wrapper
 
     def avatar(self, node: dict, parent: str) -> str:
@@ -250,12 +315,34 @@ class _Compiler:
         self.lines.append(f"  {var}.resize({var}.width, {height});")
         return var
 
+    def checkbox(self, node: dict, parent: str) -> str:
+        """A 20px box beside its label. Every auth screen wants one ("Remember
+        me", "I agree to the Terms"), and rejecting the kind cost a step three
+        turns each time it asked."""
+        row = self.frame(
+            {"name": f"Checkbox / {node.get('label', '')}"[:60], "direction": "row",
+             "gap": "sm", "align": "CENTER", "fill": False},
+            parent,
+        )
+        mark = self.var()
+        checked = bool(node.get("checked"))
+        self.lines.append(f"  const {mark} = figma.createFrame();")
+        self.lines.append(f"  {mark}.name = 'Box';")
+        self.lines.append(f"  {mark}.resize(20, 20);")
+        self.lines.append(f"  {mark}.cornerRadius = {RADIUS['sm'] // 2};")
+        self.fill(mark, node.get("color") or ("accent" if checked else "surface"))
+        self.lines.append(f"  {row}.appendChild({mark});")
+        self.created.append(mark)
+        if node.get("label"):
+            self.text({"style": "Caption", "value": node["label"], "color": "text"}, row)
+        return row
+
     # -- dispatch ----------------------------------------------------------
 
     def node(self, spec: dict, parent: str) -> str:
         if not isinstance(spec, dict):
             raise SpecError(f"every node must be an object, got {type(spec).__name__}")
-        kind = spec.get("kind")
+        kind = ALIASES.get(str(spec.get("kind") or "").strip().lower(), spec.get("kind"))
         if kind in ("section", "col", "row", "card", "stack"):
             defaults = {"row": "row"}.get(kind, "col")
             node = dict(spec)
@@ -267,10 +354,15 @@ class _Compiler:
                 node.setdefault("padding", "xl")
                 node.setdefault("gap", "lg")
             var = self.frame(node, parent, default_dir=defaults)
-            for child in spec.get("children") or []:
+            for child in _without_duplicate_labels(spec.get("children") or []):
                 self.node(child, var)
             return var
         if kind == "text":
+            if not str(spec.get("value") or "").strip():
+                raise SpecError(
+                    "a text node needs a non-empty `value` -- an empty one renders "
+                    "as a blank region and is reported as a defect"
+                )
             return self.text(spec, parent)
         if kind == "button":
             return self.button(spec, parent)
@@ -284,9 +376,11 @@ class _Compiler:
             return self.divider(spec, parent)
         if kind == "box":
             return self.box(spec, parent)
+        if kind == "checkbox":
+            return self.checkbox(spec, parent)
         raise SpecError(
             f"unknown kind {kind!r}. Valid kinds: section, col, row, card, text, "
-            "button, badge, input, avatar, divider, box"
+            "button, badge, input, checkbox, avatar, divider, box"
         )
 
 
@@ -323,10 +417,51 @@ function setFill(node) {{
     node.layoutSizingHorizontal = 'FILL';
   }}
 }}
+// The cross-axis twin: what makes both halves of a split screen full height.
+function setFillV(node) {{
+  const p = node.parent;
+  if (p && 'layoutMode' in p && p.layoutMode !== 'NONE') {{
+    try {{ node.layoutSizingVertical = 'FILL'; }} catch (e) {{}}
+  }}
+}}
 
 const created = [];
 {{
 """
+
+
+def _without_duplicate_labels(children: list) -> list:
+    """Drop a text node that only repeats the label of the input right after it.
+
+    `input` renders its own label, so a spec that writes the label out AND
+    labels the field produces "Email" twice, stacked. The vision critic caught
+    it correctly ("the label is duplicated immediately above the input field")
+    -- but a judgement call cannot fail a step, so the run just spent its whole
+    repair budget on it. The renderer owns field layout, so the renderer
+    resolves the collision (CLAUDE.md section 6a).
+    """
+    kept: list = []
+    for index, child in enumerate(children):
+        following = children[index + 1] if index + 1 < len(children) else None
+        if (
+            isinstance(child, dict)
+            and isinstance(following, dict)
+            and child.get("kind") == "text"
+            and following.get("kind") == "input"
+            and _same_label(child.get("value"), following.get("label"))
+        ):
+            continue
+        kept.append(child)
+    return kept
+
+
+def _same_label(a, b) -> bool:
+    return bool(a) and bool(b) and str(a).strip().strip(":*").lower() == str(b).strip().lower()
+
+
+def _token_key(name: str) -> str:
+    """Loose key for a token name, so near-misses still find the real style."""
+    return str(name).strip().lower().replace("color/", "").replace(" ", "-").replace("_", "-")
 
 
 def compile_spec(
@@ -334,6 +469,7 @@ def compile_spec(
     parent_id: str,
     color_roles: dict[str, str],
     replace_ids: list[str] | None = None,
+    token_names: list[str] | None = None,
 ) -> tuple[str, list[str]]:
     """Turn one UI tree into an atomic Figma script. Returns (js, node_var_names).
 
@@ -346,7 +482,7 @@ def compile_spec(
     retry a REPLACEMENT rather than a second copy appended beside the first.
     Scripts are atomic, so a failed repair leaves the original section intact.
     """
-    compiler = _Compiler(parent_id, color_roles)
+    compiler = _Compiler(parent_id, color_roles, token_names or [])
     compiler.node(spec, "root0")
 
     fonts = "\n".join(
@@ -373,22 +509,64 @@ def role_map(palette_info: list[tuple[str, str, str]]) -> dict[str, str]:
     names come from the brief and can be anything ("deep-navy", "cta"), so a
     model choosing them directly is guessing -- which is how invisible text on
     an accent background kept happening.
+
+    **A role is never aliased onto a colour it cannot be seen against.** The old
+    chain was `border -> surface -> background`, so a palette with no border
+    colour painted every divider in the page fill: white on white, invisible,
+    and the input boxes lost their edges with it. An alias that collapses to the
+    background is worse than no fill at all -- an unfilled divider keeps Figma's
+    default grey, which is at least visible -- so those aliases are now
+    contrast-checked and dropped when they would disappear.
     """
     mapping: dict[str, str] = {}
-    for token_name, _hex, role in palette_info:
+    hex_of: dict[str, str] = {}
+    for token_name, hex_value, role in palette_info:
         key = role.split(" ")[0].strip().lower()
+        hex_of.setdefault(token_name, hex_value)
+        if key == "decorative":
+            # A colour with no role is still a real token the spec can name
+            # directly -- it just is not something `background` may resolve to.
+            continue
         mapping.setdefault(key, token_name)
-    # Sensible aliases so a reasonable spec never silently loses its colour.
-    if "background" in mapping:
-        mapping.setdefault("surface", mapping["background"])
-        mapping.setdefault("on-accent", mapping["background"])
-    if "text" in mapping:
-        mapping.setdefault("text-muted", mapping["text"])
-        mapping.setdefault("neutral", mapping["text"])
-    if "surface" in mapping:
-        mapping.setdefault("border", mapping["surface"])
-        for tone in TONES:
-            mapping.setdefault(f"{tone}-bg", mapping["surface"])
+
+    def visible_against(candidate: str, ground_role: str | None) -> bool:
+        """Would this alias still be distinguishable from what sits behind it?
+
+        `ground_role` is a ROLE, so it is resolved through the mapping first --
+        comparing it as a token name silently matched nothing and let every
+        alias through, which is the bug this guard exists to stop.
+        """
+        if not ground_role:
+            return True
+        a, b = hex_of.get(candidate), hex_of.get(mapping.get(ground_role, ""))
+        if not a or not b:
+            return True
+        return scaffold.contrast_ratio(a, b) >= MIN_ALIAS_CONTRAST
+
+    def alias(role: str, source: str, *, against: str | None = None) -> None:
+        target = mapping.get(source)
+        if role in mapping or not target:
+            return
+        if visible_against(target, against):
+            mapping[role] = target
+
+    # A card on the page fill reads as the page; that is a flat design, not a
+    # broken one, so this alias stands unconditionally.
+    alias("surface", "background")
+    alias("on-accent", "background")
+    alias("text-muted", "text")
+    alias("neutral", "text")
+    # An inverse panel with no second background is simply unavailable, and
+    # copy for it falls back to whatever is readable there rather than to the
+    # ordinary text colour, which would vanish on a dark panel.
+    alias("text-on-alt", "background")
+    # These MUST stay distinguishable from what they sit on.
+    alias("border", "surface", against="background")
+    alias("border", "text-muted", against="background")
     for tone in TONES:
-        mapping.setdefault(tone, mapping.get("accent", mapping.get("text", "")))
+        alias(f"{tone}-bg", "surface")
+    for tone in TONES:
+        alias(tone, "accent")
+    for tone in TONES:
+        alias(tone, "text")
     return {k: v for k, v in mapping.items() if v}

@@ -42,18 +42,27 @@ _HEX = r"#[0-9a-fA-F]{6}"
 _NAMED = re.compile(rf"([A-Za-z][\w \-/]{{1,38}}?)\s*[:(\-–—]\s*[`'\"]?({_HEX})")
 
 
-def extract_palette(brief: str, limit: int = 12) -> list[tuple[str, str]]:
-    """Pull `name -> hex` pairs out of the model's own design brief.
+def extract_palette(brief: str, instruction: str = "", limit: int = 12) -> list[tuple[str, str]]:
+    """Pull `name -> hex` pairs out of the instruction first, then the brief.
 
-    The brief reliably lists colours (that is what we asked it for); it is
-    turning them into Plugin API calls that it fails at. Falls back to a
-    neutral palette if nothing parseable is there.
+    The USER'S instruction is read first and is authoritative. A real run asked
+    for nine named colours in a clean `* Deep background: #0B1020` list and got
+    three tokens, because the palette was only ever read out of the model's
+    rewritten brief -- which had scattered the same colours into table cells
+    ("1 px solid #E5E7EB") that no `name: #hex` pattern can see. Six colours
+    vanished, `border` and `surface` collapsed onto the page fill, and the
+    result was white dividers on white panels.
+
+    The brief still contributes whatever the instruction did not name, since
+    most instructions specify no palette at all. Falls back to a neutral
+    palette when neither has anything parseable.
     """
     found: list[tuple[str, str]] = []
     seen_hex: set[str] = set()
     seen_names: set[str] = set()
 
-    for raw_name, hex_value in _NAMED.findall(brief or ""):
+    pairs = _NAMED.findall(instruction or "") + _NAMED.findall(brief or "")
+    for raw_name, hex_value in pairs:
         hex_value = hex_value.upper()
         if hex_value in seen_hex:
             continue
@@ -151,6 +160,189 @@ def _chroma(hex_value: str) -> float:
     return max(rgb) - min(rgb)
 
 
+# Words in a token name that DECLARE what the colour is for. A brief that says
+# "Border: #E5E7EB" has told us the answer, and luminance ordering alone got it
+# wrong every time: in a real run #E5E7EB was ranked a "surface", #111827 became
+# "text-muted", and the near-black page background was labelled "text". Names
+# are only trusted for these unambiguous words -- everything else still falls
+# out of the arithmetic below.
+_ROLE_WORDS: list[tuple[str, tuple[str, ...]]] = [
+    ("text", ("text", "ink", "foreground", "copy", "type")),
+    ("border", ("border", "divider", "outline", "stroke", "rule")),
+    ("surface", ("surface", "card", "panel", "input", "field", "elevated", "raised")),
+    ("background", ("background", "bg", "canvas", "page", "base")),
+    ("accent", ("accent", "primary", "cta", "brand", "highlight")),
+]
+# A modifier that turns "text" into "secondary copy".
+_MUTED_WORDS = ("muted", "secondary", "subtle", "tertiary", "placeholder", "hint")
+
+ROLE_LABELS = {
+    "accent": "accent (buttons, links, emphasis)",
+    "background": "background (the page fill this screen sits on)",
+    "background-alt": "background-alt (inverse/dark panels, hero halves)",
+    "surface": "surface (cards, inputs, raised areas)",
+    "border": "border / divider",
+    "text": "text (body copy on the background)",
+    "text-muted": "text-muted (secondary copy)",
+    "text-on-alt": "text-on-alt (copy sitting on background-alt)",
+}
+# The roles a palette must fill for the renderer to draw a distinguishable UI.
+# Anything still missing after parsing is DERIVED (see complete_palette).
+REQUIRED_ROLES = ("background", "surface", "border", "text", "text-muted", "accent")
+
+
+def _name_hint(token_name: str) -> str | None:
+    """The role a token's own name declares, or None if it declares nothing."""
+    words = set(re.split(r"[-/_ ]+", token_name.lower()))
+    for role, vocabulary in _ROLE_WORDS:
+        if words & set(vocabulary):
+            if role == "text" and words & set(_MUTED_WORDS):
+                return "text-muted"
+            return role
+    return None
+
+
+def assign_roles(entries: list[tuple[str, str]]) -> dict[str, str]:
+    """token name -> role key, from the names the brief used and the arithmetic.
+
+    Two sources, in that order. A name that says what it is wins, because it is
+    the designer's own statement of intent; everything else is decided by
+    luminance and chroma, which is what CLAUDE.md section 7 means by doing the
+    arithmetic in Python rather than letting the model guess.
+    """
+    if not entries:
+        return {}
+    hexes = dict(entries)
+    claims: dict[str, list[str]] = {}
+    for name, _hex in entries:
+        hint = _name_hint(name)
+        if hint:
+            claims.setdefault(hint, []).append(name)
+
+    by_light = sorted(entries, key=lambda e: relative_luminance(e[1]), reverse=True)
+    roles: dict[str, str] = {}
+    taken: set[str] = set()
+
+    def claim(role: str, name: str | None) -> None:
+        if name and name not in taken:
+            roles[name] = role
+            taken.add(name)
+
+    # Accent: the name wins, else the most saturated colour in the palette.
+    accent = next(
+        (n for n in claims.get("accent", []) if _chroma(hexes[n]) >= ACCENT_MIN_CHROMA), None
+    )
+    if accent is None:
+        boldest = max(entries, key=lambda e: _chroma(e[1]))
+        accent = boldest[0] if _chroma(boldest[1]) >= ACCENT_MIN_CHROMA else None
+    claim("accent", accent)
+
+    # Text: the darkest of whatever claims to be text, else the darkest colour.
+    text = min(claims.get("text", []), key=lambda n: relative_luminance(hexes[n]), default=None)
+    if text is None:
+        text = next((n for n, _ in reversed(by_light) if n not in taken), None)
+    claim("text", text)
+
+    # Background: of everything claiming it, the one this screen's text can
+    # actually be read on. A brief with a dark hero AND a white form panel has
+    # two backgrounds, and picking the wrong one paints near-black text on a
+    # near-black page -- which is exactly what a live run produced.
+    backgrounds = [n for n in claims.get("background", []) if n not in taken]
+    if text and backgrounds:
+        background = max(backgrounds, key=lambda n: contrast_ratio(hexes[n], hexes[text]))
+    elif backgrounds:
+        background = backgrounds[0]
+    else:
+        background = next((n for n, _ in by_light if n not in taken), None)
+    claim("background", background)
+
+    # background-alt is the SECOND background: the inverse panel a modern
+    # split-screen layout is built from. Without it the dark half of a
+    # dark-to-light design is not expressible at all, so the model asked for
+    # "background", got the white one, and rendered a 1440x900 white void.
+    if background:
+        rest = [n for n in backgrounds if n not in taken]
+        alt = max(rest, key=lambda n: contrast_ratio(hexes[n], hexes[background]), default=None)
+        claim("background-alt", alt)
+
+    claim("surface", next((n for n in claims.get("surface", []) if n not in taken), None))
+    claim("border", next((n for n in claims.get("border", []) if n not in taken), None))
+    claim("text-muted", next((n for n in claims.get("text-muted", []) if n not in taken), None))
+
+    # Whatever is left is ranked by luminance between the background and the
+    # text -- the same reasoning as before, applied only to the colours that
+    # did not declare themselves.
+    filled = set(roles.values())
+    leftover = [(n, h) for n, h in by_light if n not in taken]
+    for position, (name, hex_value) in enumerate(leftover):
+        if "surface" not in filled and relative_luminance(hex_value) >= 0.5:
+            claim("surface", name)
+            filled.add("surface")
+        elif "text-muted" not in filled and position == len(leftover) - 1:
+            claim("text-muted", name)
+            filled.add("text-muted")
+        elif "border" not in filled:
+            claim("border", name)
+            filled.add("border")
+
+    # Copy that sits on the inverse panel. Measured, never assumed: whichever
+    # colour in the palette is genuinely readable there.
+    alt_name = next((n for n, r in roles.items() if r == "background-alt"), None)
+    if alt_name:
+        readable = [
+            (contrast_ratio(h, hexes[alt_name]), n)
+            for n, h in entries
+            if n != alt_name and contrast_ratio(h, hexes[alt_name]) >= MIN_TEXT_CONTRAST
+        ]
+        if readable:
+            roles.setdefault(max(readable)[1], "text-on-alt")
+    return roles
+
+
+def complete_palette(palette: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Add derived tokens for any role the brief left unfilled.
+
+    A palette missing `border` used to alias it onto `surface`, which aliased
+    onto `background` -- so a divider was painted white on a white panel and
+    the input boxes had no visible edge at all. Aliasing a role onto the page
+    fill is never a usable answer, so the missing colours are MIXED here
+    instead: deterministic arithmetic from the two colours we do have, created
+    as real tokens the renderer binds to like any other.
+    """
+    if not palette:
+        return palette
+    entries = [(f"color/{n}", h) for n, h in palette]
+    roles = assign_roles(entries)
+    have = set(roles.values())
+    hexes = dict(entries)
+    background = next((hexes[n] for n, r in roles.items() if r == "background"), "#FFFFFF")
+    text = next((hexes[n] for n, r in roles.items() if r == "text"), "#111827")
+
+    # How far each derived colour sits from the page fill, towards the ink.
+    recipe = {"surface": 0.04, "border": 0.16, "text-muted": 0.55}
+    existing_hexes = {h.upper() for _, h in palette}
+    taken = {name for name, _ in palette}
+    extra: list[tuple[str, str]] = []
+    for role in ("surface", "border", "text-muted"):
+        if role in have:
+            continue
+        derived = _mix(background, text, recipe[role])
+        if derived in existing_hexes:
+            continue
+        existing_hexes.add(derived)
+        name = _unique_name(role, taken)
+        taken.add(name)
+        extra.append((name, derived))
+    return list(palette) + extra
+
+
+def _mix(hex_a: str, hex_b: str, amount: float) -> str:
+    """`amount` of the way from A to B, as a hex string."""
+    a, b = hex_to_rgb(hex_a), hex_to_rgb(hex_b)
+    channels = [round((x + (y - x) * amount) * 255) for x, y in zip(a, b)]
+    return "#" + "".join(f"{max(0, min(255, c)):02X}" for c in channels)
+
+
 def describe_palette(palette: list[tuple[str, str]]) -> list[tuple[str, str, str]]:
     """Annotate each token with a functional role: (token_name, hex, role).
 
@@ -160,35 +352,12 @@ def describe_palette(palette: list[tuple[str, str]]) -> list[tuple[str, str, str
     """
     if not palette:
         return []
-
     entries = [(f"color/{name}", hex_value) for name, hex_value in palette]
-    accent = max(entries, key=lambda e: _chroma(e[1]))
-    has_accent = _chroma(accent[1]) >= ACCENT_MIN_CHROMA
-
-    neutrals = [e for e in entries if not (has_accent and e[0] == accent[0])]
-    neutrals.sort(key=lambda e: relative_luminance(e[1]), reverse=True)  # lightest first
-
-    roles: dict[str, str] = {}
-    if has_accent:
-        roles[accent[0]] = "accent (buttons, links, emphasis)"
-    for position, (name, _) in enumerate(neutrals):
-        from_end = len(neutrals) - 1 - position
-        hex_value = neutrals[position][1]
-        if position == 0:
-            roles[name] = "background (page/section fill)"
-        elif from_end == 0:
-            roles[name] = "text (body copy on a light background)"
-        elif relative_luminance(hex_value) >= 0.5:
-            # Light enough to sit under content.
-            roles[name] = "surface (cards, inputs, raised areas)"
-        elif from_end == 1:
-            # Dark, but not the darkest -- that reads as secondary copy, not a
-            # card fill, however close to the top of the list it happens to be.
-            roles[name] = "text-muted (secondary copy)"
-        else:
-            roles[name] = "border / divider"
-
-    return [(name, hex_value, roles.get(name, "decorative")) for name, hex_value in entries]
+    roles = assign_roles(entries)
+    return [
+        (name, hex_value, ROLE_LABELS.get(roles.get(name, ""), "decorative"))
+        for name, hex_value in entries
+    ]
 
 
 def readable_pairings(palette: list[tuple[str, str]], limit: int = 8) -> list[str]:
@@ -411,21 +580,80 @@ return {{ createdNodeIds: [], changed: Math.round(root.height) !== before,
 """
 
 
-def build_placeholder_section_script(root_id: str, label: str, height: int = 160) -> str:
+def build_remove_nodes_script(node_ids: list[str]) -> str:
+    """Delete specific nodes, tolerating ones that are already gone.
+
+    A step that exhausted its retries used to leave its broken section on the
+    canvas AND get a TODO placeholder appended beneath it, so the page showed
+    both the failure and the marker for it -- a 1440x900 white void followed by
+    a "TODO: left visual panel" band. A failed final repair was worse: it had
+    already replaced the section, then ran out of turns, and its half-built
+    copy simply stayed. Four stacked copies of one sign-in form is what that
+    looks like on the canvas.
+
+    Wrapped per id, because scripts are atomic and one stale id must not cost
+    the whole cleanup.
+    """
+    return _REMOVE_NODES_SCRIPT.replace("__IDS__", json.dumps(list(node_ids)))
+
+
+_REMOVE_NODES_SCRIPT = """const ids = __IDS__;
+const removed = [];
+for (const id of ids) {
+  try {
+    const node = await figma.getNodeByIdAsync(id);
+    if (node && !node.removed) { node.remove(); removed.push(id); }
+  } catch (e) {}
+}
+return { createdNodeIds: [], removedNodeIds: removed };
+"""
+
+
+def build_placeholder_section_script(
+    root_id: str,
+    label: str,
+    height: int = 160,
+    surface_style: str = "",
+    text_style: str = "",
+) -> str:
     """A labelled stand-in for a section whose step failed.
 
     Keeps the page's vertical rhythm intact and makes the gap obvious in the
     file, instead of silently leaving a hole where a section should be.
+
+    The two styles are passed in RESOLVED. The script used to hunt for a style
+    whose name merely contained "surface" or "text", which in a real run picked
+    a near-black page background and then found nothing at all for the label --
+    so the marker rendered as grey-on-navy at 2.3:1, and the run reported its
+    own scaffolding as a contrast defect.
     """
     return _PLACEHOLDER_SCRIPT.format(
-        root_id=json.dumps(root_id), label=json.dumps(label[:60]), height=height
+        root_id=json.dumps(root_id),
+        label=json.dumps(label[:60]),
+        height=height,
+        surface_style=json.dumps(surface_style),
+        text_style=json.dumps(text_style),
     )
 
 
+# The placeholder used a 14px label and two hardcoded greys, so the harness's
+# own scaffolding failed the harness's own design checks -- a finished run
+# reported six "issues" that were all about its own TODO frames. It now uses
+# the token styles and the 13px Caption size from the type ramp, and falls back
+# to a legible grey only when a run has no styles at all.
 _PLACEHOLDER_SCRIPT = """\
 const root = await figma.getNodeByIdAsync({root_id});
 if (!root) {{ throw new Error('root frame not found'); }}
 await figma.loadFontAsync({{ family: 'Inter', style: 'Regular' }});
+
+const paints = await figma.getLocalPaintStylesAsync();
+const byName = {{}};
+for (const s of paints) {{ byName[s.name] = s; }}
+// Exact names, resolved by the harness from the palette ROLES. Substring
+// matching picked whichever style happened to contain the word.
+function styleNamed(wanted) {{
+  return wanted && byName[wanted] ? byName[wanted] : null;
+}}
 
 const section = figma.createFrame();
 section.name = 'TODO — ' + {label};
@@ -437,13 +665,17 @@ section.counterAxisAlignItems = 'CENTER';
 section.paddingTop = 24; section.paddingBottom = 24;
 section.layoutSizingHorizontal = 'FILL';
 section.layoutSizingVertical = 'FIXED';
-section.fills = [{{ type: 'SOLID', color: {{ r: 0.97, g: 0.97, b: 0.98 }} }}];
+const surface = styleNamed({surface_style});
+if (surface) {{ await section.setFillStyleIdAsync(surface.id); }}
+else {{ section.fills = [{{ type: 'SOLID', color: {{ r: 0.97, g: 0.97, b: 0.98 }} }}]; }}
 
 const label = figma.createText();
 label.fontName = {{ family: 'Inter', style: 'Regular' }};
 label.characters = 'TODO: ' + {label};
-label.fontSize = 14;
-label.fills = [{{ type: 'SOLID', color: {{ r: 0.45, g: 0.47, b: 0.52 }} }}];
+label.fontSize = 13;                       // on the type ramp
+const ink = styleNamed({text_style});
+if (ink) {{ await label.setFillStyleIdAsync(ink.id); }}
+else {{ label.fills = [{{ type: 'SOLID', color: {{ r: 0.29, g: 0.31, b: 0.36 }} }}]; }}
 section.appendChild(label);
 
 return {{ createdNodeIds: [section.id] }};

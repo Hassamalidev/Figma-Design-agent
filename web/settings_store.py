@@ -22,7 +22,12 @@ DEFAULT_RUNTIME_PATH = Path(__file__).parent / "runtime_settings.json"
 
 # Only these may be set from the UI. Bridge host/port are excluded on purpose:
 # they must match the plugin manifest's networkAccess, which is a file edit.
-EDITABLE = ("model_base_url", "model_api_key", "model_name")
+# `vision_model_name` is here and its base URL / key are not, on purpose: the
+# fallback chain in `Settings.vision_settings` already borrows those from the
+# critic or the main model, so naming a multimodal model is usually the ONLY
+# thing a user has to do to unlock reading an attached screenshot. Three more
+# inputs to express what one usually says is a worse panel, not a fuller one.
+EDITABLE = ("model_base_url", "model_api_key", "model_name", "vision_model_name")
 
 # Run preferences, also editable from the UI. Each one changes real behaviour --
 # nothing here is a decorative switch.
@@ -107,6 +112,8 @@ PREF_SPECS: dict[str, BoolPref | IntPref] = {
     "visual_gate": BoolPref(default=True),
     # preselect whichever file is currently connected
     "auto_select": BoolPref(default=True),
+    # after the design is built, go back and fix what the review found
+    "final_repair": BoolPref(default=True),
 }
 PREFS = tuple(PREF_SPECS)
 INT_PREFS = tuple(k for k, s in PREF_SPECS.items() if isinstance(s, IntPref))

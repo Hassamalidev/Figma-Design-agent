@@ -24,6 +24,14 @@ class Settings:
     critic_api_key: str = ""
     critic_model_name: str = ""
 
+    # The model that READS attachments. A screenshot only becomes a design if
+    # something can see it, and the generator (gpt-oss:20b) cannot. Defaults to
+    # the critic, which is already a probed vision model -- set VISION_* only to
+    # use a different one for transcription than for critique.
+    vision_base_url: str = ""
+    vision_api_key: str = ""
+    vision_model_name: str = ""
+
     bridge_host: str = "localhost"
     bridge_port: int = 9223
 
@@ -46,6 +54,29 @@ class Settings:
             self.critic_base_url or self.model_base_url,
             self.critic_api_key or self.model_api_key,
             self.critic_model_name,
+        )
+
+    @property
+    def has_vision(self) -> bool:
+        """Can this configuration look at an attached image at all?
+
+        Attachments are refused with a clear message when it cannot, rather
+        than being silently dropped -- a run that ignored the screenshot you
+        attached and built something generic is the worst possible outcome.
+        """
+        return bool(self.vision_model_name or self.critic_model_name)
+
+    def vision_settings(self) -> tuple[str, str, str]:
+        """(base_url, api_key, model) for reading attachments.
+
+        Falls through VISION_* -> CRITIC_* -> the main model, so configuring a
+        vision critic is enough to unlock screenshot input too.
+        """
+        model = self.vision_model_name or self.critic_model_name
+        return (
+            self.vision_base_url or self.critic_base_url or self.model_base_url,
+            self.vision_api_key or self.critic_api_key or self.model_api_key,
+            model,
         )
 
     def with_overrides(self, **overrides: object) -> "Settings":
@@ -87,6 +118,9 @@ def load_settings(env_path: str | Path = ".env", require_model: bool = True) -> 
         critic_base_url=_get(values, "CRITIC_BASE_URL", ""),
         critic_api_key=_get(values, "CRITIC_API_KEY", ""),
         critic_model_name=_get(values, "CRITIC_MODEL_NAME", ""),
+        vision_base_url=_get(values, "VISION_BASE_URL", ""),
+        vision_api_key=_get(values, "VISION_API_KEY", ""),
+        vision_model_name=_get(values, "VISION_MODEL_NAME", ""),
         bridge_host=_get(values, "BRIDGE_HOST", "localhost"),
         bridge_port=_int(values, "BRIDGE_PORT", "9223"),
         max_retries=_int(values, "MAX_RETRIES", "3"),
@@ -101,4 +135,10 @@ def env_configured_keys(env_path: str | Path = ".env") -> set[str]:
     unless the user deliberately overrides them.
     """
     values = {**os.environ, **dotenv_values(env_path)}
-    return {key for key in ("MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_NAME") if values.get(key)}
+    known = ("MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_NAME", "VISION_MODEL_NAME")
+    found = {key for key in known if values.get(key)}
+    # A critic model already makes attachments readable, so the UI must not show
+    # "unset" next to a vision field that is, in effect, set.
+    if values.get("CRITIC_MODEL_NAME"):
+        found.add("VISION_MODEL_NAME")
+    return found

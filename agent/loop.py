@@ -64,6 +64,14 @@ DEFAULT_ROOT_WIDTH = 1440
 # Bounds one step's tool-calling back-and-forth so a confused model can't spin forever.
 MAX_TOOL_TURNS_PER_STEP = 8
 
+# How many times one step may rebuild its section. Each `render_ui` replaces
+# the last, so this bounds self-correction rather than forbidding it.
+MAX_RENDERS_PER_STEP = 3
+
+# How many refused calls a step tolerates before it is ended. A refusal the
+# model ignores is a stuck loop, and every further turn costs a model call.
+MAX_REFUSALS_PER_STEP = 3
+
 # Retrieval is restricted to the typings: the gotchas are inlined in the
 # system prompt, so pulling them in again per step would spend context twice.
 STEP_DOC_SOURCES = ("api_types.d.ts",)
@@ -78,15 +86,27 @@ def run(
     visual_gate: bool = True,
     critic_llm: ModelClient | None = None,
     run_metrics: RunMetrics | None = None,
+    final_repair: bool = True,
+    should_stop=None,
+    references: str = "",
 ) -> RunResult:
     """Build the design, measuring what it cost.
 
     `run_metrics` is optional and exists so a CALLER can hold the same recorder
     the run writes into -- the dashboard polls it live for step progress. When
     it is omitted a fresh one is created, so metrics are never conditional.
+
+    `should_stop` is a callable asked at every checkpoint. Stopping is
+    COOPERATIVE: a model call or a Figma round trip already in flight cannot be
+    interrupted, so what it promises is that no NEW work starts -- in practice
+    the run ends within one model call. Whatever was built is kept and
+    returned, because a half-finished design is still the user's design.
     """
     with metrics.recording(run_metrics) as measured:
-        result = _run(instruction, bridge, llm, max_retries, max_steps, visual_gate, critic_llm)
+        result = _run(
+            instruction, bridge, llm, max_retries, max_steps, visual_gate, critic_llm,
+            final_repair, should_stop, references,
+        )
     result.metrics = measured.snapshot()
     logger.info("Run cost: %s", measured.summary())
     return result
@@ -100,8 +120,13 @@ def _run(
     max_steps: int,
     visual_gate: bool,
     critic_llm: ModelClient | None,
+    final_repair: bool = True,
+    should_stop=None,
+    references: str = "",
 ) -> RunResult:
     state = RunState(instruction=instruction)
+    state.references = references
+    state.should_stop = should_stop
     state.visual_gate_enabled = visual_gate
     # A separate vision model, if one is configured. The generator needs
     # reliable tool calling; the critic needs eyes. Rarely the same model.
@@ -111,15 +136,62 @@ def _run(
         # endpoint 400s, which costs a round trip per step to rediscover.
         state.model_sees_images = False
 
+    try:
+        return _build(state, bridge, llm, max_retries, max_steps, final_repair)
+    except Cancelled:
+        return _stop_gracefully(state, bridge)
+    except Exception as exc:
+        # The plugin going away mid-run is the common case: Figma was closed,
+        # the file was switched, the socket timed out. A real run built two
+        # complete screens, lost the bridge during the last repair, and was
+        # reported as "Run crashed" with every node thrown away. The nodes are
+        # on the user's canvas either way, so the run has to report them.
+        return _end_after_failure(state, exc)
+
+
+def _end_after_failure(state: RunState, exc: Exception) -> RunResult:
+    """Report a run that died mid-flight, keeping what it already built.
+
+    Nothing here touches the bridge: whatever killed the run has usually taken
+    the bridge with it, and a tidy-up that throws again would put us straight
+    back where we started.
+    """
+    logger.info("Run ended early (%s: %s)", type(exc).__name__, exc)
+    state.ended_early = True
+    state.warnings.insert(
+        0,
+        f"The run ended early -- {exc}. Everything built before that point is on the "
+        f"canvas and is listed below.",
+    )
+    if state.plan:
+        for step in state.plan:
+            if step.description not in state.completed_step_descriptions():
+                state.mark_failed(step)
+    return state.result()
+
+
+def _build(
+    state: RunState,
+    bridge: Bridge,
+    llm: ModelClient,
+    max_retries: int,
+    max_steps: int,
+    final_repair: bool,
+) -> RunResult:
+    instruction = state.instruction
+
     logger.info("Inspecting the current canvas...")
     inspect_file(state, bridge)  # 1. READ-ONLY: never assume canvas state
 
-    state.enhanced_brief = planner.enhance_instruction(instruction, llm)  # fill in what's unspecified
+    # The attachments describe the design as much as the instruction does, so
+    # the brief is written from both. Requirements are still graded against
+    # the user's own words alone -- see RunState.references.
+    state.enhanced_brief = planner.enhance_instruction(state.design_source(), llm)
 
     # WHICH SCREENS, before anything is drawn. In Figma a page is a workspace
     # and a frame is a screen, so "login and a dashboard" is two sibling frames
     # side by side -- not two sections stacked into one frame.
-    state.screens = planner.plan_screens(instruction, state.enhanced_brief, llm)
+    state.screens = planner.plan_screens(state.design_source(), state.enhanced_brief, llm)
 
     create_screens(state, bridge)     # deterministic: every section needs this parent
     bootstrap_tokens(state, bridge)   # deterministic: the model never has to write these
@@ -129,13 +201,36 @@ def _run(
     total = len(state.plan)
     metrics.current().steps_planned = total
     for index, step in enumerate(state.plan, start=1):  # 3. one step at a time
+        _stop_if_asked(state)
         logger.info("Step %d/%d [%s]: %s", index, total, _screen_label(state, step), step.description)
         metrics.current().start_step(step.description, index, total)
         run_step(step, state, bridge, llm, max_retries, index, total)
 
     logger.info("Final validation: screenshot + variable-binding audit...")
-    final_validation(state, bridge)  # 4. whole-screen screenshot
+    final_validation(state, bridge, llm if final_repair else None)  # 4. whole-screen screenshot
     logger.info("Done. Success=%s, created %d node(s).", not state.failed_steps, len(state.created_node_ids))
+    return state.result()
+
+
+def _stop_gracefully(state: RunState, bridge: Bridge) -> RunResult:
+    """Wind up a run the user stopped, keeping whatever it managed to build.
+
+    Only the cheap, model-free finishing work runs: the screens are photographed
+    so the partial design can be looked at, and the layout is reviewed so the
+    report is honest about it. The end-of-run repair pass is skipped outright --
+    spending model calls on a run somebody just asked to stop is precisely what
+    they asked not to happen.
+    """
+    state.stopped = True
+    logger.info("Stopped by request after %d node(s).", len(state.created_node_ids))
+    state.warnings.insert(0, "You stopped this run, so the design is unfinished.")
+    try:
+        capture_screens(state, bridge)
+        final_layout_review(state, bridge)
+    except Exception as exc:
+        # The canvas may be mid-anything; a tidy-up failure must not replace
+        # "you stopped it" with a crash.
+        logger.info("Could not finish tidying up after the stop: %s", exc)
     return state.result()
 
 
@@ -306,7 +401,13 @@ def bootstrap_tokens(state: RunState, bridge: Bridge) -> None:
     with tokens guaranteed to exist, and gives every later step real style
     names to bind to instead of hardcoded hexes.
     """
-    palette = scaffold.extract_palette(state.enhanced_brief)
+    # The user's own instruction is read first: it is the authoritative palette,
+    # and reading only the model's rewritten brief lost six of nine colours in a
+    # real run. Missing roles are then DERIVED rather than aliased onto the page
+    # fill, which is what produced white dividers on white panels.
+    palette = scaffold.complete_palette(
+        scaffold.extract_palette(state.enhanced_brief, state.design_source())
+    )
     state.palette = palette  # kept so hardcoded fills can be rebound to these later
 
     colors = execute_figma_js(bridge, scaffold.build_token_script(palette))
@@ -470,6 +571,7 @@ def run_step(
     seen_calls: set[tuple[str, str]] = set()
 
     for attempt in range(max_retries):
+        _stop_if_asked(state)
         metrics.current().start_attempt()
         if attempt:
             logger.info(
@@ -534,6 +636,10 @@ def run_step(
     state.mark_failed(step)
     metrics.current().steps_failed += 1
     metrics.current().record_failure("exhausted-retries")
+    # The broken section must GO before the placeholder that stands in for it
+    # arrives. Leaving both put a 1440x900 white void on the page followed by a
+    # "TODO" band marking the gap the void was already occupying.
+    discard_nodes(landed_ids, state, bridge, label)
     recovered = fallback_for_step(step, state, bridge, label, frame_id)
     state.record_step_result(
         step.description,
@@ -544,6 +650,35 @@ def run_step(
             summary="exhausted retries" + (" (placeholder added)" if recovered else ""),
         ),
     )
+
+
+def _builds_a_section(step: PlanStep) -> bool:
+    """Does this step put a block on the page? A DECLARED answer beats a guess.
+
+    Tool availability hangs off this: a section step gets `render_ui` and no
+    raw JavaScript. Deciding that by keyword-matching a step's English is the
+    known-fragile heuristic CLAUDE.md complains about, so harness-authored
+    steps (the final repair pass) say what they are instead.
+    """
+    if step.render_only is not None:
+        return step.render_only
+    return _is_section_step(step.description)
+
+
+class Cancelled(Exception):
+    """The user asked the run to stop.
+
+    Raised at checkpoints rather than checked after every statement: the run is
+    a deep call stack (run -> run_step -> converse_step -> dispatch), and an
+    exception unwinds it in one move instead of threading a "stop now" return
+    value through every layer.
+    """
+
+
+def _stop_if_asked(state: RunState) -> None:
+    """Checkpoint. Cheap enough to call in any loop."""
+    if state.stop_requested():
+        raise Cancelled()
 
 
 def _failure_reason(summary: str) -> str:
@@ -575,7 +710,7 @@ def build_system_prompt() -> str:
 def _accept(step: PlanStep, state: RunState, outcome: StepResult) -> None:
     """Record a step as done, and register its section so later steps know."""
     state.record_step_result(step.description, outcome)
-    if _is_section_step(step.description):
+    if _builds_a_section(step):
         # Later steps are told this is FINISHED, so they add what's missing
         # instead of building a second copy of it. Recorded against this step's
         # OWN screen -- a header on the dashboard does not mean the sign-in
@@ -630,7 +765,7 @@ def visual_gate(
     then spent its full retry budget on someone else's problem. The whole page
     is still reviewed once, at the end, by `final_layout_review`.
     """
-    if not state.visual_gate_enabled or not frame_id or not _is_section_step(step.description):
+    if not state.visual_gate_enabled or not frame_id or not _builds_a_section(step):
         return GateResult()
 
     scope = [i for i in (created_node_ids or []) if not _is_style_id(i)]
@@ -644,6 +779,10 @@ def visual_gate(
         return GateResult()
 
     geometry = [str(d) for d in critic.find_layout_defects(tree, scope_ids=scope)]
+    # Rebuilding a region the screen already has is a fact, not a judgement, so
+    # it blocks like geometry does -- and a render_ui repair REPLACES the
+    # section, which is exactly the correction needed.
+    geometry += [str(d) for d in critic.find_duplicate_sections(tree, scope_ids=scope)]
     # Judge the section that was just built, not the whole page.
     subtree = critic.find_subtrees(tree, set(scope))
     vision = critique_with_model(state, bridge, llm, subtree[0] if subtree else tree, scope[0])
@@ -705,6 +844,40 @@ def critique_with_model(
     return critic.blocking_only(defects)
 
 
+def _placeholder_styles(state: RunState) -> tuple[str, str]:
+    """The fill and ink a TODO marker should use, resolved from the real roles.
+
+    A marker that is itself unreadable is worse than no marker: a run reported
+    six contrast and design-system defects that were all about its own
+    scaffolding.
+    """
+    roles = renderer.role_map(state.palette_info)
+    return roles.get("surface", roles.get("background", "")), roles.get("text", "")
+
+
+def discard_nodes(node_ids: list[str], state: RunState, bridge: Bridge, label: str) -> None:
+    """Remove work that did not survive its gates, so it cannot be shipped.
+
+    Everything this agent builds is additive -- `render_ui` appends, and a
+    replacement only happens when the NEXT attempt names the nodes to replace.
+    So an attempt that ends the step (retries exhausted, or a repair that ran
+    out of turns) leaves its output on the canvas with nothing to remove it. A
+    real run finished with four stacked copies of one sign-in form for exactly
+    this reason.
+    """
+    ids = [i for i in dict.fromkeys(node_ids) if i and not _is_style_id(i)]
+    if not ids:
+        return
+    result = execute_figma_js(bridge, scaffold.build_remove_nodes_script(ids))
+    if not result["ok"]:
+        logger.info("%s: could not clean up %d unusable node(s)", label, len(ids))
+        return
+    removed = _normalize_node_ids((result.get("result") or {}).get("removedNodeIds"))
+    state.forget_node_ids(removed)
+    if removed:
+        logger.info("%s: removed %d node(s) that did not pass", label, len(removed))
+
+
 def fallback_for_step(
     step: PlanStep, state: RunState, bridge: Bridge, label: str, frame_id: str | None = None
 ) -> list[str]:
@@ -716,9 +889,12 @@ def fallback_for_step(
     a fake component is worse than none, and tokens already exist from
     `bootstrap_tokens`.
     """
-    if not frame_id or not _is_section_step(step.description):
+    if not frame_id or not _builds_a_section(step):
         return []
-    script = scaffold.build_placeholder_section_script(frame_id, _section_label(step.description))
+    surface, ink = _placeholder_styles(state)
+    script = scaffold.build_placeholder_section_script(
+        frame_id, _section_label(step.description), surface_style=surface, text_style=ink
+    )
     result = execute_figma_js(bridge, script)
     if not result["ok"]:
         logger.info("%s: placeholder fallback also failed -- %s", label, result["error"])
@@ -782,7 +958,7 @@ def converse_step(
     # A section step may only use render_ui, so it must not be shown JavaScript
     # exemplars or told to "call execute_figma_js" -- the surest way to make a
     # model reach for a tool is to demonstrate it.
-    render_only = _is_section_step(step.description)
+    render_only = _builds_a_section(step)
     messages = [
         {"role": "system", "content": build_system_prompt()},
         {
@@ -830,10 +1006,44 @@ def converse_step(
     # no way to be corrected at all, so every visual-gate failure would end as
     # a TODO placeholder.
     root_appends = 1 if (prior_node_ids and not render_only) else 0
+    # `render_ui` REPLACES: every call removes the nodes named in `replace_ids`
+    # and builds the section again in their place. So a second call inside one
+    # step is a self-correction, not a duplicate -- which is exactly what a
+    # model asks for when it says "the previous render was missing the card
+    # background". Refusing it meant the fix it had already written could never
+    # run. Capped, because an unbounded rebuild loop is the other failure mode.
+    render_ids: list[str] = []
+    renders = 0
+    # A refused call teaches the model something ONLY if it then does something
+    # else. In a real run a step was refused the same `get_metadata` five times
+    # and re-issued it every turn until the budget ran out -- five model calls
+    # and a lost attempt, spent re-reading a node it had already read.
+    refusals = 0
     # A section step may only use `render_ui`; raw JS is not on the menu.
     tools = tools_for(render_only)
     allowed = {t["function"]["name"] for t in tools}
+    def refuse(call, message: str, note: str) -> bool:
+        """Log a refusal, hand it to the model, and say whether the step is done for.
+
+        A refusal only teaches the model something if it then does something
+        different. When it does not, every further turn is a wasted model call,
+        so the count is what ends the step.
+        """
+        nonlocal refusals
+        refusals += 1
+        logger.info("%s: %s", label, note)
+        messages.append(_tool_result_message(call.id, {"ok": False, "error": message}))
+        return refusals >= MAX_REFUSALS_PER_STEP
+
     for turn in range(1, MAX_TOOL_TURNS_PER_STEP + 1):
+        try:
+            _stop_if_asked(state)
+        except Cancelled:
+            # Whatever this step already put on the canvas is really there, so
+            # record it before unwinding. Reporting a design as having built
+            # nothing while the user can see the nodes is worse than useless.
+            state.add_node_ids(created_ids)
+            raise
         logger.info("%s: thinking (turn %d/%d)...", label, turn, MAX_TOOL_TURNS_PER_STEP)
         message = llm.complete(messages, tools=tools)
         messages.append(_assistant_message_dict(message))
@@ -851,7 +1061,9 @@ def converse_step(
                     created_node_ids=created_ids,
                     summary=(
                         "You replied with text instead of calling the tool, so nothing ran. "
-                        "Call execute_figma_js as a real tool call, passing the script as `code`."
+                        f"Call {'render_ui' if render_only else 'execute_figma_js'} as a real "
+                        f"tool call, with the "
+                        f"{'`spec` UI tree' if render_only else 'script as `code`'}."
                     ),
                 )
             # A script did run -- the model considers the step done.
@@ -871,10 +1083,9 @@ def converse_step(
             # it anyway would put raw Plugin API JS back into section steps,
             # which is the whole thing this narrowing exists to prevent.
             if call.function.name not in allowed:
-                logger.info("%s: refused %s -- not available for this step", label, call.function.name)
-                messages.append(
-                    _tool_result_message(call.id, {"ok": False, "error": _WRONG_TOOL_REFUSAL})
-                )
+                if refuse(call, _WRONG_TOOL_REFUSAL,
+                          f"refused {call.function.name} -- not available for this step"):
+                    break
                 continue
 
             # Identical repeated calls are always a stuck loop, never intent:
@@ -883,32 +1094,23 @@ def converse_step(
             # say so, rather than silently doing the work again.
             signature = (call.function.name, call.function.arguments or "")
             if signature in seen_calls:
-                logger.info("%s: refused a repeated identical call", label)
-                messages.append(
-                    _tool_result_message(
-                        call.id,
-                        {
-                            "ok": False,
-                            "error": (
-                                "You already ran this exact call in this step and it was handled. "
-                                "Repeating it would duplicate work. Either move on to the next part "
-                                "of the step with a DIFFERENT script, or stop and finish the step."
-                            ),
-                        },
-                    )
-                )
+                if refuse(call, _REPEATED_CALL_REFUSAL, "refused a repeated identical call"):
+                    break
                 continue
             seen_calls.add(signature)
 
             # One section per step. Reworded near-duplicates slip past the
             # identical-call guard, so cap the thing that actually matters:
             # how many times this step appends a new block to the page.
+            is_render = call.function.name == "render_ui"
+            if is_render and renders >= MAX_RENDERS_PER_STEP:
+                if refuse(call, _SECOND_APPEND_REFUSAL, f"refused a {renders + 1}th rebuild of this section"):
+                    break
+                continue
             appends_to_root = _appends_to_root(call.function.name, args, frame_id)
             if appends_to_root and root_appends >= 1:
-                logger.info("%s: refused a second append into the root frame", label)
-                messages.append(
-                    _tool_result_message(call.id, {"ok": False, "error": _SECOND_APPEND_REFUSAL})
-                )
+                if refuse(call, _SECOND_APPEND_REFUSAL, "refused a second append into the root frame"):
+                    break
                 continue
 
             try:
@@ -917,9 +1119,13 @@ def converse_step(
                     render_context={
                         "parent_id": frame_id,
                         "color_roles": renderer.role_map(state.palette_info),
+                        # Real token names, so a spec can name a palette colour
+                        # directly when no role expresses it (a dark panel).
+                        "token_names": list(state.token_names),
                         # On a repair, the section this step already built is
-                        # replaced by the corrected one.
-                        "replace_ids": list(prior_node_ids or []),
+                        # replaced by the corrected one -- and so is anything
+                        # rendered earlier in THIS attempt.
+                        "replace_ids": list(prior_node_ids or []) + list(render_ids),
                     },
                 )
             except Exception as exc:
@@ -951,11 +1157,20 @@ def converse_step(
             # Only a call that actually landed spends the one-section budget.
             # A rejected spec or a thrown script changes nothing (Figma scripts
             # are atomic), so it must not lock the step out of building at all.
-            if appends_to_root:
+            if appends_to_root and not is_render:
                 root_appends += 1
             new_ids = _normalize_node_ids((result.get("result") or {}).get("createdNodeIds"))
             if new_ids:
                 logger.info("%s: created %s", label, ", ".join(new_ids))
+            if is_render:
+                # The nodes it replaced are gone from the canvas, so they must
+                # go from the step's own bookkeeping too -- otherwise the run
+                # reports, rebinds and tries to clean up nodes that no longer
+                # exist.
+                renders += 1
+                replaced = set(render_ids)
+                created_ids[:] = [i for i in created_ids if i not in replaced]
+                render_ids = list(new_ids)
             created_ids.extend(new_ids)
             name = validate_creation(new_ids, state, bridge)
             if name and not section_name:
@@ -968,11 +1183,31 @@ def converse_step(
                 result["note"] = _existing_nodes_note(created_ids, section_name)
             messages.append(_tool_result_message(call.id, result))
 
+        if refusals >= MAX_REFUSALS_PER_STEP:
+            logger.info(
+                "%s: %d refused calls in a row -- ending the step rather than looping",
+                label, refusals,
+            )
+            break
+
+    if ran_a_script:
+        # Work landed; the step just never said it was finished. That is a
+        # completed step with a terse summary, not a failure.
+        return StepResult(
+            step.description, ok=True, created_node_ids=created_ids,
+            summary="built, then ran out of turns", section_name=section_name,
+        )
     return StepResult(
         step.description, ok=False, created_node_ids=created_ids,
         summary="step did not conclude within the tool-call budget",
     )
 
+
+_REPEATED_CALL_REFUSAL = (
+    "REFUSED: you already ran this exact call in this step and it was handled. Repeating "
+    "it cannot tell you anything new. Either do the next part of the step with a DIFFERENT "
+    "call, or stop now and reply with a one-line summary and no tool call."
+)
 
 _WRONG_TOOL_REFUSAL = (
     "REFUSED: that tool is not available for this step. Build this section with "
@@ -1034,6 +1269,15 @@ def _describe_call(name: str, args: dict) -> str:
     if name in ("get_metadata", "get_screenshot"):
         node = args.get("node_id") or "current page"
         return f"{name}({node})"
+    if name == "render_ui":
+        # The argument keys are the whole diagnosis when a spec is rejected:
+        # "render_ui" alone made twenty-five malformed calls in one run look
+        # identical to twenty-five good ones.
+        spec = args.get("spec")
+        if isinstance(spec, dict):
+            kids = len(spec.get("children") or [])
+            return f"render_ui({spec.get('kind', '?')} '{spec.get('name', '')}', {kids} children)"
+        return f"render_ui(args: {', '.join(sorted(args)) or 'none'})"
     return name
 
 
@@ -1161,25 +1405,226 @@ def augment_with_error(docs: str, error: str) -> str:
     return f"{docs}\n\n{addendum}" if docs else addendum
 
 
-def final_validation(state: RunState, bridge: Bridge) -> None:
-    """Whole-design review. Fix what is mechanically fixable, then report the rest."""
+def final_validation(
+    state: RunState, bridge: Bridge, llm: ModelClient | None = None
+) -> None:
+    """Whole-design review. Fix everything fixable, then report what is left."""
     enforce_root_hug(state, bridge)          # fix clipping BEFORE judging the layout
     audit_variable_bindings(state, bridge)   # rebind hardcoded colours to tokens
+    repair_remaining_defects(state, bridge, llm)  # then have another go at what is wrong
 
-    # With several screens the interesting picture is the PAGE -- all the frames
-    # side by side. Rendering only the first would hide most of the design.
-    target = state.root_frame_id if len(_built_screens(state)) <= 1 else None
-    shot = get_screenshot(bridge, target)
-    if shot["ok"]:
-        state.final_screenshot_base64 = shot["image_base64"]
-    else:
-        state.warnings.append(f"Final screenshot failed: {shot['error']}")
-
+    capture_screens(state, bridge)
     final_layout_review(state, bridge)
+
+
+def capture_screens(state: RunState, bridge: Bridge) -> None:
+    """Render each screen on its own, plus one picture of the whole page.
+
+    Per screen rather than one wide strip: five frames side by side render at a
+    size where nothing is legible, and the dashboard pages through these one at
+    a time. Costs one round trip per screen, which is cheap next to a run.
+    """
+    screens = _built_screens(state)
+    for screen in screens:
+        shot = get_screenshot(bridge, screen.frame_id)
+        if shot["ok"] and shot["image_base64"]:
+            state.screen_shots.append(
+                {"name": screen.name, "image_base64": shot["image_base64"]}
+            )
+        else:
+            logger.info("Could not render '%s': %s", screen.name, shot.get("error"))
+
+    # The thumbnail the history and the gallery use. With a single screen we
+    # already have exactly that picture, so asking Figma to render it a second
+    # time is a wasted round trip.
+    if len(screens) <= 1 and state.screen_shots:
+        state.final_screenshot_base64 = state.screen_shots[0]["image_base64"]
+        return
+
+    # With several screens, one shot of the PAGE shows how they sit together.
+    shot = get_screenshot(bridge, None if len(screens) > 1 else state.root_frame_id)
+    if shot["ok"] and shot["image_base64"]:
+        state.final_screenshot_base64 = shot["image_base64"]
+    elif state.screen_shots:
+        state.final_screenshot_base64 = state.screen_shots[0]["image_base64"]
+    elif not shot["ok"]:
+        # Only a genuine failure is worth a warning. A render that succeeds and
+        # returns nothing (an empty page) reported "Final screenshot failed:
+        # None", which reads like a bug in the agent rather than an empty canvas.
+        state.warnings.append(f"Final screenshot failed: {shot['error']}")
 
 
 def _built_screens(state: RunState) -> list:
     return [s for s in state.screens if s.frame_id]
+
+
+# How many times the whole design is re-examined and corrected at the end. Two
+# is enough for a fix to be checked; more turns a build into a grind.
+FINAL_REPAIR_PASSES = 2
+# Hard ceiling on repair calls per run, so a design with many small blemishes
+# cannot quietly cost more than the build did.
+MAX_FINAL_REPAIRS = 8
+
+
+def repair_remaining_defects(
+    state: RunState, bridge: Bridge, llm: ModelClient | None
+) -> None:
+    """Have another go at everything the finished design still gets wrong.
+
+    Until now the whole-screen review only REPORTED: a run ended with "2 layout
+    issues" and "6 design-system notes" listed in the dashboard and nothing done
+    about them, and a step that exhausted its retries left a `TODO` placeholder
+    that stayed a placeholder. Every one of those is repairable -- the section
+    exists, we know precisely what is wrong with it, and `render_ui` can replace
+    it -- so the run now tries, rather than handing the user a list.
+
+    Bounded on both axes (`FINAL_REPAIR_PASSES`, `MAX_FINAL_REPAIRS`), because
+    an unbounded polish loop is how a five-minute build becomes a twenty-minute
+    one.
+    """
+    if llm is None:
+        return
+
+    repairs = 0
+    for pass_number in range(1, FINAL_REPAIR_PASSES + 1):
+        targets = _sections_needing_repair(state, bridge)
+        if not targets:
+            if pass_number > 1:
+                logger.info("Repair pass %d: everything reported is now fixed.", pass_number)
+            return
+
+        logger.info(
+            "Repair pass %d: %d section(s) still need work.", pass_number, len(targets)
+        )
+        before = sum(len(problems) for _, _, problems in targets)
+        for screen_index, section, problems in targets:
+            if repairs >= MAX_FINAL_REPAIRS:
+                logger.info("Repair budget spent; reporting what is left.")
+                return
+            repairs += 1
+            _repair_section(state, bridge, llm, screen_index, section, problems, repairs)
+
+        # A second pass is only worth its model calls if the first one actually
+        # helped. A defect that survives an honest attempt is usually one the
+        # model cannot see how to fix, and grinding on it is pure cost.
+        after = sum(len(p) for _, _, p in _sections_needing_repair(state, bridge))
+        if after >= before:
+            logger.info("Repair pass %d changed nothing; reporting the rest.", pass_number)
+            return
+
+
+def _sections_needing_repair(
+    state: RunState, bridge: Bridge
+) -> list[tuple[int, dict, list[str]]]:
+    """Every top-level section that is broken, unfinished, or a placeholder."""
+    targets: list[tuple[int, dict, list[str]]] = []
+    for index, screen in enumerate(state.screens):
+        if not screen.frame_id:
+            continue
+        tree = read_layout(screen.frame_id, bridge)
+        if tree is None:
+            continue
+
+        problems: dict[str, list[str]] = {}
+        found = (
+            critic.find_layout_defects(tree)
+            + critic.find_duplicate_sections(tree)
+            + critic.find_design_defects(tree)
+        )
+        for defect in found:
+            section = _section_owning(tree, defect.node_id)
+            if section is not None:
+                problems.setdefault(section["id"], []).append(str(defect))
+
+        # A `TODO` placeholder is a section that was never built. It has no
+        # defects of its own -- it is a tidy little frame -- so nothing else
+        # would ever come back to it.
+        for child in tree.get("children") or []:
+            if str(child.get("name", "")).strip().upper().startswith("TODO"):
+                problems.setdefault(child["id"], []).append(
+                    "this is an empty TODO placeholder: build the real section it stands "
+                    "in for, with complete content"
+                )
+
+        by_id = {c["id"]: c for c in tree.get("children") or [] if c.get("id")}
+        for section_id, issues in problems.items():
+            if section_id in by_id:
+                targets.append((index, by_id[section_id], issues))
+    return targets
+
+
+def _section_owning(tree: dict, node_id: str) -> dict | None:
+    """The top-level section a defective node sits inside.
+
+    Repairs are scoped to a whole section because that is the unit `render_ui`
+    replaces -- correcting one text node in isolation is not something it can
+    express.
+    """
+    for child in tree.get("children") or []:
+        if _contains(child, node_id):
+            return child
+    return None
+
+
+def _contains(node: dict, node_id: str) -> bool:
+    if node.get("id") == node_id:
+        return True
+    return any(_contains(child, node_id) for child in node.get("children") or [])
+
+
+def _repair_section(
+    state: RunState,
+    bridge: Bridge,
+    llm: ModelClient,
+    screen_index: int,
+    section: dict,
+    problems: list[str],
+    number: int,
+) -> None:
+    """Rebuild one section with its specific problems as the instruction."""
+    screen = state.screen_at(screen_index)
+    name = str(section.get("name", "section"))
+    label = f"Repair {number}"
+    logger.info("%s [%s]: %s -- %s", label, screen.name if screen else "?", name, problems[0])
+
+    step = PlanStep(
+        description=f"Fix the '{name}' section so it is complete and correct",
+        screen_index=screen_index,
+        render_only=True,   # declared, so this never depends on the wording
+    )
+    outcome = converse_step(
+        step,
+        docs="",
+        state=state,
+        bridge=bridge,
+        llm=llm,
+        label=label,
+        index=0,
+        prior_node_ids=[section["id"]],
+        prior_defects=problems[:6],
+        seen_calls=set(),
+        frame_id=state.frame_for(screen_index),
+    )
+    if outcome.ok and outcome.created_node_ids:
+        state.add_node_ids(outcome.created_node_ids)
+        logger.info("%s: rebuilt '%s'.", label, name)
+    else:
+        # The repair already REPLACED the section before it ran out of turns,
+        # so its half-built output is on the page and nothing else will ever
+        # come back for it. Discard it and put the placeholder back, so the
+        # screen shows one honest gap rather than a stack of partial rebuilds.
+        logger.info("%s: could not fix '%s' -- %s", label, name, outcome.summary)
+        discard_nodes(outcome.created_node_ids, state, bridge, label)
+        if outcome.created_node_ids and state.frame_for(screen_index):
+            execute_figma_js(
+                bridge,
+                scaffold.build_placeholder_section_script(
+                    state.frame_for(screen_index),
+                    _section_label(name),
+                    surface_style=_placeholder_styles(state)[0],
+                    text_style=_placeholder_styles(state)[1],
+                ),
+            )
 
 
 def final_layout_review(state: RunState, bridge: Bridge) -> None:
@@ -1204,6 +1649,7 @@ def final_layout_review(state: RunState, bridge: Bridge) -> None:
     review_design_system(state, trees)
     review_requirements(state, trees)
     defects = [d for tree in trees for d in critic.find_layout_defects(tree)]
+    defects += [d for tree in trees for d in critic.find_duplicate_sections(tree)]
     state.layout_defects = [str(d) for d in defects]
     if defects:
         logger.info("Final review found %d layout issue(s).", len(defects))

@@ -8,6 +8,7 @@ agent/loop.py; this module just wires a browser UI to it.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import threading
@@ -15,11 +16,12 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import uuid
 
-from agent import loop, scaffold
-from agent.llm import ModelClient, build_critic_client
+from agent import edit_loop, loop, reference, scaffold
+from agent.llm import ModelClient, build_critic_client, build_vision_client
 from agent.metrics import RunMetrics
 from bridge.server import Bridge
 from tools.figma_exec import execute_figma_js
@@ -70,12 +72,20 @@ class DashboardServer:
         self._llm_factory = llm_factory
         self._lock = threading.Lock()
         self._run_status = "idle"  # idle | waiting_for_file | running | done | error
+        self._run_mode = "create"  # create | edit -- declared by the user, never inferred
         self._run_log: list[str] = []
         self._run_result: dict | None = None
         # The live recorder for the run in progress. The dashboard polls it for
         # step progress, so the UI shows "step 4 of 9" instead of asking the
         # user to read a scrolling log.
         self._run_metrics: RunMetrics | None = None
+        # One rendered PNG per screen. Kept OUT of the status payload and served
+        # from its own endpoint: /api/status is polled every 1.5s, and shipping
+        # five full-page screenshots on every poll is megabytes a minute.
+        self._run_screens: list[dict] = []
+        # Set when the user asks to stop. A threading.Event because it is set
+        # from the HTTP thread and read from the run thread.
+        self._stop = threading.Event()
         self._last_captured_generation = -1
 
     # -- connection watcher: builds the gallery over time, unattended -------
@@ -140,7 +150,40 @@ class DashboardServer:
 
     # -- run orchestration ---------------------------------------------------
 
-    def start_run(self, file_key: str, instruction: str) -> tuple[bool, str]:
+    def stop_run(self) -> tuple[bool, str]:
+        """Ask the run in progress to stop.
+
+        Cooperative: a model call or a Figma round trip already in flight
+        cannot be interrupted, so this promises that no NEW work starts. In
+        practice the run ends within one model call, and whatever it built so
+        far is kept -- a half-finished design is still the user's design.
+        """
+        with self._lock:
+            # "stopping" counts as in progress: a second click on a button that
+            # has not caught up yet should say so, not claim nothing is running.
+            if self._run_status not in ("waiting_for_file", "running", "stopping"):
+                return False, "There is no run in progress."
+            if self._stop.is_set():
+                return True, "Already stopping."
+            self._stop.set()
+            self._run_status = "stopping"
+            self._run_log.append("Stopping -- waiting for the current step to finish...")
+        return True, "Stopping after the current step."
+
+    def start_run(
+        self,
+        file_key: str,
+        instruction: str,
+        mode: str = "create",
+        attachments: list | None = None,
+    ) -> tuple[bool, str]:
+        """`mode` is "create" (build a new design) or "edit" (change this one).
+
+        Declared by the user, never inferred from the wording. Guessing would
+        mean an edit request misread as a build stamps a second screen beside
+        the design it was supposed to change -- and undoing that is manual work
+        in someone else's file.
+        """
         if not self.settings_store.effective().is_model_configured:
             return False, "No model configured. Open Settings and add your API details first."
         with self._lock:
@@ -150,17 +193,34 @@ class DashboardServer:
             if entry is None:
                 return False, f"Unknown file: {file_key}"
             self._run_status = "waiting_for_file"
+            self._run_screens = []
+            self._stop.clear()   # a new run is never born already stopping
+            self._run_mode = "edit" if mode == "edit" else "create"
             self._run_log = [
                 f"Waiting for '{entry.file_name}' to connect -- open it in Figma Desktop "
                 "and run the plugin if it isn't already."
             ]
+            if self._run_mode == "edit":
+                self._run_log.append(
+                    "Edit mode: select what you want changed in Figma, or leave nothing "
+                    "selected and the agent will find it."
+                )
             self._run_result = None
         threading.Thread(
-            target=self._run_worker, args=(file_key, entry.file_name, instruction), daemon=True
+            target=self._run_worker,
+            args=(file_key, entry.file_name, instruction, self._run_mode, list(attachments or [])),
+            daemon=True,
         ).start()
         return True, "started"
 
-    def _run_worker(self, file_key: str, file_name: str, instruction: str) -> None:
+    def _run_worker(
+        self,
+        file_key: str,
+        file_name: str,
+        instruction: str,
+        mode: str = "create",
+        attachments: list | None = None,
+    ) -> None:
         started_at = _now()
         run_metrics = RunMetrics()
         with self._lock:
@@ -170,6 +230,15 @@ class DashboardServer:
         # dominates wall clock and gets blamed on the agent without this.
         waiting_since = time.monotonic()
         connected = self._wait_for_file(file_key)
+        if self._stop.is_set():
+            with self._lock:
+                self._run_status = "stopped"
+                self._run_log.append("Stopped before the run started.")
+            self._record_history(
+                file_key, file_name, instruction, started_at, None,
+                error="Stopped before the run started.",
+            )
+            return
         run_metrics.plugin_wait_seconds = time.monotonic() - waiting_since
         if not connected:
             timeout_message = f"Timed out waiting for '{file_name}' to connect."
@@ -199,16 +268,45 @@ class DashboardServer:
             llm = self._llm_factory(
                 settings.model_base_url, settings.model_api_key, settings.model_name
             )
-            result = loop.run(
-                instruction,
-                self.bridge,
-                llm,
-                int(prefs["max_retries"]),
-                int(prefs["max_steps"]),
-                visual_gate=bool(prefs["visual_gate"]),
-                critic_llm=build_critic_client(settings),
-                run_metrics=run_metrics,
-            )
+            # Read the attachments BEFORE anything is built. An image needs a
+            # model that can see it, and finding that out halfway through a run
+            # means the design was already built without the reference.
+            references = ""
+            if attachments:
+                reference.check_readable(attachments, settings.has_vision)
+                logger.info("Reading %d attachment(s)...", len(attachments))
+                references, attach_warnings = reference.describe(
+                    attachments, build_vision_client(settings)
+                )
+                for warning in attach_warnings:
+                    logger.info("%s", warning)
+            if mode == "edit":
+                # No vision critic and no repair pass: those judge whether a
+                # design is good, and an edit run is not being asked to have an
+                # opinion about the user's design -- only to make the change.
+                result = edit_loop.run(
+                    instruction,
+                    self.bridge,
+                    llm,
+                    int(prefs["max_retries"]),
+                    run_metrics=run_metrics,
+                    should_stop=self._stop.is_set,
+                    references=references,
+                )
+            else:
+                result = loop.run(
+                    instruction,
+                    self.bridge,
+                    llm,
+                    int(prefs["max_retries"]),
+                    int(prefs["max_steps"]),
+                    visual_gate=bool(prefs["visual_gate"]),
+                    critic_llm=build_critic_client(settings),
+                    run_metrics=run_metrics,
+                    final_repair=bool(prefs["final_repair"]),
+                    should_stop=self._stop.is_set,
+                    references=references,
+                )
             # Best-effort: the design is already built, so a failed thumbnail
             # refresh must not report the whole run as crashed and throw the
             # result away.
@@ -217,9 +315,18 @@ class DashboardServer:
             except Exception as exc:
                 logger.info("Could not refresh the file thumbnail: %s", exc)
             with self._lock:
-                self._run_status = "done"
+                self._run_status = "stopped" if getattr(result, "stopped", False) else "done"
+                self._run_mode = mode
+                self._run_screens = list(getattr(result, "screen_shots", []) or [])
                 self._run_result = _result_payload(result)
             self._record_history(file_key, file_name, instruction, started_at, result)
+        except reference.ReferenceError as exc:
+            # Nothing was built, and the reason is entirely actionable: say it
+            # plainly rather than as a crash the user has to interpret.
+            with self._lock:
+                self._run_status = "error"
+                self._run_log.append(str(exc))
+            self._record_history(file_key, file_name, instruction, started_at, None, error=str(exc))
         except Exception as exc:  # the UI must hear about this, not spin forever
             with self._lock:
                 self._run_status = "error"
@@ -253,7 +360,7 @@ class DashboardServer:
                     instruction=instruction,
                     file_key=file_key,
                     file_name=file_name,
-                    status="done" if result is not None else "error",
+                    status=_history_status(result, error),
                     success=bool(result.success) if result is not None else False,
                     created_node_count=len(result.created_node_ids) if result is not None else 0,
                     failed_step_count=len(result.failed_steps) if result is not None else 0,
@@ -274,6 +381,8 @@ class DashboardServer:
     def _wait_for_file(self, file_key: str) -> bool:
         deadline = time.monotonic() + MAX_WAIT_FOR_FILE_SECONDS
         while time.monotonic() < deadline:
+            if self._stop.is_set():
+                return False   # waiting is the easiest thing of all to abandon
             identity = self.bridge.current_file
             if identity is not None and identity.file_key == file_key:
                 return True
@@ -349,6 +458,7 @@ class DashboardServer:
             identity = self.bridge.current_file
             return {
                 "status": self._run_status,
+                "mode": self._run_mode,
                 "log": list(self._run_log),
                 "result": self._run_result,
                 "connected_file": (
@@ -358,6 +468,17 @@ class DashboardServer:
                 "model_configured": self.settings_store.effective().is_model_configured,
                 "metrics": self._live_metrics(),
             }
+
+    def screen_image(self, index: int) -> bytes | None:
+        """The PNG for one screen, or None if there is no such screen."""
+        with self._lock:
+            shots = list(self._run_screens)
+        if not 0 <= index < len(shots):
+            return None
+        try:
+            return base64.b64decode(shots[index].get("image_base64") or "")
+        except (ValueError, TypeError):
+            return None
 
     def _live_metrics(self) -> dict | None:
         """A snapshot of the run in progress, for the progress display.
@@ -382,6 +503,8 @@ class DashboardServer:
         return {
             "model_base_url": s.model_base_url,
             "model_name": s.model_name,
+            "vision_model_name": s.vision_model_name or s.critic_model_name,
+            "has_vision": s.has_vision,
             "model_api_key_masked": mask(s.model_api_key),  # never send the real key
             "has_api_key": bool(s.model_api_key),
             "sources": view.sources,
@@ -477,6 +600,13 @@ class DashboardServer:
         }
 
 
+def _history_status(result, error: str) -> str:
+    """`stopped` is neither a success nor a crash, and reads as neither."""
+    if result is None:
+        return "stopped" if "Stopped" in (error or "") else "error"
+    return "stopped" if getattr(result, "stopped", False) else "done"
+
+
 def _result_payload(result) -> dict:
     """The finished run, as the dashboard's JSON.
 
@@ -488,15 +618,25 @@ def _result_payload(result) -> dict:
     making.
     """
     optional = (
-        "layout_defects", "design_notes", "requirements_met", "requirements_missing", "screens",
+        "layout_defects", "design_notes", "requirements_met", "requirements_missing",
+        "screens",
     )
+    shots = getattr(result, "screen_shots", []) or []
     payload = {
         "success": result.success,
+        "stopped": bool(getattr(result, "stopped", False)),
+        # The plugin went away mid-run. Reported separately from a failure,
+        # because "Figma disconnected" and "the design is wrong" are different
+        # things to be told -- and the nodes it did build are really there.
+        "ended_early": bool(getattr(result, "ended_early", False)),
         "created_node_count": len(result.created_node_ids),
         "failed_steps": result.failed_steps,
         "warnings": result.warnings,
         "metrics": getattr(result, "metrics", {}) or {},
-        "final_screenshot_base64": result.final_screenshot_base64,
+        # NAMES only. The images are fetched one at a time from /api/screens, so
+        # a finished run does not re-send every screenshot on every 1.5s poll --
+        # five full-page PNGs in the status payload is megabytes a minute.
+        "screen_names": [str(shot.get("name", "Screen")) for shot in shots],
     }
     payload.update({name: list(getattr(result, name, []) or []) for name in optional})
     return payload
@@ -534,6 +674,10 @@ def _make_handler(dashboard: DashboardServer) -> type[BaseHTTPRequestHandler]:
                 "/api/setup": dashboard.setup_snapshot,
                 "/api/history": dashboard.history_snapshot,
             }
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/screens":
+                self._send_screen(parsed.query)
+                return
             if self.path in ("/", "/index.html"):
                 self._send_static("index.html", "text/html")
             elif self.path in routes:
@@ -541,8 +685,38 @@ def _make_handler(dashboard: DashboardServer) -> type[BaseHTTPRequestHandler]:
             else:
                 self._send_json(404, {"error": "not found"})
 
+        def _send_screen(self, query: str) -> None:
+            """One screen's PNG, by index. Cacheable, so paging back and forth
+            through a finished design does not re-fetch anything."""
+            try:
+                index = int((parse_qs(query).get("i") or ["0"])[0])
+            except ValueError:
+                index = 0
+            image = dashboard.screen_image(index)
+            if image is None:
+                self._send_json(404, {"error": "no such screen"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(image)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(image)
+
+        # An attached screenshot arrives base64-encoded inside the JSON body, so
+        # the limit has to allow for one -- but it still has to BE a limit: this
+        # server reads the whole body into memory before parsing it.
+        MAX_BODY_BYTES = reference.MAX_TOTAL_BYTES * 2
+
         def _read_json(self) -> dict | None:
-            length = int(self.headers.get("Content-Length", 0))
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._send_json(400, {"error": "bad Content-Length"})
+                return None
+            if length > self.MAX_BODY_BYTES:
+                self._send_json(413, {"ok": False, "message": "That request is too large."})
+                return None
             try:
                 return json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
@@ -561,6 +735,9 @@ def _make_handler(dashboard: DashboardServer) -> type[BaseHTTPRequestHandler]:
                 payload = self._read_json()
                 if payload is not None:
                     self._send_json(200, dashboard.update_prefs(payload))
+            elif self.path == "/api/run/stop":
+                ok, message = dashboard.stop_run()
+                self._send_json(200 if ok else 409, {"ok": ok, "message": message})
             elif self.path == "/api/files/delete":
                 self._handle_delete_file()
             elif self.path == "/api/history/clear":
@@ -578,7 +755,16 @@ def _make_handler(dashboard: DashboardServer) -> type[BaseHTTPRequestHandler]:
             if not file_key or not instruction:
                 self._send_json(400, {"error": "file_key and instruction are required"})
                 return
-            ok, message = dashboard.start_run(file_key, instruction)
+            mode = "edit" if (payload.get("mode") or "create") == "edit" else "create"
+            # Attachments are decoded and size-checked HERE, so an unusable one
+            # is a 400 the user can read rather than a run that starts, spends
+            # model calls and then reports it could not open the file.
+            try:
+                attachments = reference.from_payload(payload.get("attachments") or [])
+            except reference.ReferenceError as exc:
+                self._send_json(400, {"ok": False, "message": str(exc)})
+                return
+            ok, message = dashboard.start_run(file_key, instruction, mode, attachments)
             self._send_json(202 if ok else 409, {"ok": ok, "message": message})
 
         def _handle_delete_file(self) -> None:

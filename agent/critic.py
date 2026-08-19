@@ -32,42 +32,51 @@ logger = logging.getLogger(__name__)
 # costs nothing extra -- it is the same single round trip -- and it is what
 # lets contrast, spacing scale and type ramp be checked as arithmetic instead
 # of being asserted in a prompt and hoped for.
-LAYOUT_SCRIPT = """const root = await figma.getNodeByIdAsync({node_id});
-if (!root) {{ throw new Error('node not found'); }}
+# How deep the read goes. It was 4, and a form field sits at depth 5:
+#   screen -> section -> col -> Field -> Input -> placeholder text
+# so every `Input` came back with `children: []` and was reported as
+# "372x56 frame is empty, leaving a blank region". That defect is unfixable by
+# construction, so in a real run EVERY step that rendered a form field failed
+# its visual gate three times and was demoted to a TODO placeholder.
+MAX_TREE_DEPTH = 8
 
+# The node reader itself, shared with `agent/inventory.py`. Edit mode needs
+# exactly the same view of the canvas the gate has -- a second, drifting
+# reader is how "what the agent sees" stops matching "what is checked".
+NODE_READER_JS = """
 // The first opaque SOLID fill, as plain numbers. Figma hands back a read-only
 // array, and `fills` is the `mixed` SYMBOL on a node with differing fills --
 // neither is safe to index without checking.
-function solidFill(node) {{
-  if (!('fills' in node)) {{ return null; }}
+function solidFill(node) {
+  if (!('fills' in node)) { return null; }
   const fills = node.fills;
-  if (!Array.isArray(fills)) {{ return null; }}
-  for (const paint of fills) {{
-    if (!paint || paint.type !== 'SOLID' || paint.visible === false) {{ continue; }}
+  if (!Array.isArray(fills)) { return null; }
+  for (const paint of fills) {
+    if (!paint || paint.type !== 'SOLID' || paint.visible === false) { continue; }
     const opacity = typeof paint.opacity === 'number' ? paint.opacity : 1;
-    if (opacity < 0.9) {{ continue; }}   // see-through: not the effective colour
-    return {{ r: paint.color.r, g: paint.color.g, b: paint.color.b }};
-  }}
+    if (opacity < 0.9) { continue; }   // see-through: not the effective colour
+    return { r: paint.color.r, g: paint.color.g, b: paint.color.b };
+  }
   return null;
-}}
+}
 
 // Token-backed means "changing the token changes this node": either it uses one
 // of our paint styles, or its paint is bound to a variable directly.
-function tokenBacked(node) {{
-  if ('fillStyleId' in node && typeof node.fillStyleId === 'string' && node.fillStyleId) {{
+function tokenBacked(node) {
+  if ('fillStyleId' in node && typeof node.fillStyleId === 'string' && node.fillStyleId) {
     return true;
-  }}
-  if (!('fills' in node)) {{ return false; }}
+  }
+  if (!('fills' in node)) { return false; }
   const fills = node.fills;
-  if (!Array.isArray(fills)) {{ return false; }}
-  for (const paint of fills) {{
-    if (paint && paint.boundVariables && paint.boundVariables.color) {{ return true; }}
-  }}
+  if (!Array.isArray(fills)) { return false; }
+  for (const paint of fills) {
+    if (paint && paint.boundVariables && paint.boundVariables.color) { return true; }
+  }
   return false;
-}}
+}
 
-function describe(node, depth) {{
-  const info = {{
+function describe(node, depth) {
+  const info = {
     id: node.id, name: node.name, type: node.type,
     x: Math.round(node.x), y: Math.round(node.y),
     width: Math.round(node.width), height: Math.round(node.height),
@@ -76,24 +85,30 @@ function describe(node, depth) {{
     fill: solidFill(node),
     tokenBacked: tokenBacked(node),
     children: []
-  }};
-  if (info.layoutMode && info.layoutMode !== 'NONE') {{
+  };
+  if (info.layoutMode && info.layoutMode !== 'NONE') {
     info.itemSpacing = Math.round(node.itemSpacing);
     info.padding = [
       Math.round(node.paddingTop), Math.round(node.paddingRight),
       Math.round(node.paddingBottom), Math.round(node.paddingLeft)
     ];
-  }}
-  if (node.type === 'TEXT') {{
+  }
+  if (node.type === 'TEXT') {
     info.characters = String(node.characters).slice(0, 120);
     info.fontSize = typeof node.fontSize === 'number' ? node.fontSize : null;
     info.fontStyle = (node.fontName && node.fontName.style) ? String(node.fontName.style) : '';
-  }}
-  if ('children' in node && depth < 4) {{
-    info.children = node.children.slice(0, 40).map(function (c) {{ return describe(c, depth + 1); }});
-  }}
+  }
+  if ('children' in node && depth < MAX_TREE_DEPTH) {
+    info.children = node.children.slice(0, 40).map(function (c) { return describe(c, depth + 1); });
+  }
   return info;
-}}
+}
+"""
+
+LAYOUT_SCRIPT = """const MAX_TREE_DEPTH = __MAX_DEPTH__;
+const root = await figma.getNodeByIdAsync({node_id});
+if (!root) {{ throw new Error('node not found'); }}
+__READER__
 return {{ createdNodeIds: [], tree: describe(root, 0) }};
 """
 
@@ -187,6 +202,70 @@ def find_design_defects(tree: dict, scope_ids: list[str] | None = None) -> list[
     return _condense([d for d in analyze(tree, scope_ids) if d.advisory])
 
 
+# How much of a new section's text must already exist in a sibling before it is
+# a rebuild rather than a coincidence. Two nav bars share every label; a hero
+# and a footer sharing one word do not.
+DUPLICATE_TEXT_OVERLAP = 0.7
+# Below this there is not enough content to judge -- two sections that each say
+# "Save" are not duplicates of each other.
+MIN_TEXTS_TO_COMPARE = 3
+
+
+def section_texts(node: dict) -> set[str]:
+    """Every piece of visible copy in a subtree, normalised for comparison."""
+    found: set[str] = set()
+    characters = (node.get("characters") or "").strip().lower()
+    if characters:
+        found.add(characters)
+    for child in node.get("children") or []:
+        found |= section_texts(child)
+    return found
+
+
+def find_duplicate_sections(tree: dict, scope_ids: list[str] | None = None) -> list[Defect]:
+    """Sections that rebuild content a sibling already has.
+
+    A real dashboard run built its sidebar twice: one step added the sidebar,
+    and the next step -- meant to add only the header -- rebuilt the whole
+    shell around it. Both copies were individually well-formed, so every
+    existing check passed them. The only evidence is that two siblings say the
+    same things.
+
+    Compared against EARLIER siblings only, so the duplicate reported is the
+    later one -- the copy that should not have been built.
+
+    `scope_ids` limits the report to sections a particular step created, so a
+    step is only ever blamed for its own duplication.
+    """
+    children = tree.get("children") or []
+    wanted = set(scope_ids) if scope_ids else None
+    texts = [(child, section_texts(child)) for child in children]
+
+    defects: list[Defect] = []
+    for index, (child, own) in enumerate(texts):
+        if len(own) < MIN_TEXTS_TO_COMPARE:
+            continue
+        if wanted is not None and child.get("id") not in wanted:
+            continue
+        for earlier, other in texts[:index]:
+            if len(other) < MIN_TEXTS_TO_COMPARE:
+                continue
+            shared = own & other
+            if len(shared) / min(len(own), len(other)) < DUPLICATE_TEXT_OVERLAP:
+                continue
+            defects.append(
+                Defect(
+                    child.get("id", "?"), child.get("name", "?"), "duplicate-section",
+                    f"repeats content already in '{earlier.get('name', '?')}' "
+                    f"({len(shared)} of {len(own)} texts are the same, e.g. "
+                    f"{', '.join(sorted(shared)[:3])}). Build only what is MISSING "
+                    f"from this screen -- never rebuild a region that already exists",
+                )
+            )
+            break
+    return _condense(defects)
+
+
 def analyze(tree: dict, scope_ids: list[str] | None = None) -> list[Defect]:
     """Every defect in ONE walk, blocking and advisory together.
 
@@ -252,6 +331,11 @@ def _walk(node: dict, defects: list[Defect], background: tuple | None) -> None:
     # necessarily its direct parent.
     inherited = fill_rgb(node) or background
     for child in children:
+        if _is_placeholder(node):
+            # Inside a TODO marker: still worth knowing if it renders, but its
+            # colours and sizes are the harness's, not the design's.
+            _check_self(child, defects, inherited)
+            continue
         _walk(child, defects, inherited)
 
 
@@ -318,10 +402,18 @@ def _check_self(node: dict, defects: list[Defect], background: tuple | None = No
         _check_contrast(node, defects, background)
 
     if node.get("type") == "FRAME" and not (node.get("children") or []):
-        if width > 40 and height > 40:
+        # A childless frame is only a BLANK region if nothing is painted in it.
+        # The renderer's own `box` primitive -- chart areas, image placeholders,
+        # the glowing shapes in a hero panel -- is a deliberately childless
+        # filled block, so this rule was failing the harness's own output and
+        # demoting finished sections to TODO placeholders over it.
+        own = fill_rgb(node)
+        blank = own is None or (background is not None and own == background)
+        if width > 40 and height > 40 and blank:
             defects.append(
                 Defect(node_id, name, "empty-frame",
-                       f"{width}x{height} frame is empty, leaving a blank region")
+                       f"{width}x{height} frame is empty and the same colour as what "
+                       f"is behind it, leaving a blank region")
             )
 
 
@@ -373,6 +465,16 @@ def _check_contrast(node: dict, defects: list[Defect], background: tuple | None)
         )
 
 
+# Frames the harness itself drops in to mark a step it could not build. They
+# are scaffolding, so holding them to the design system reports the harness's
+# own stand-ins back to the user as design problems.
+PLACEHOLDER_PREFIX = "TODO"
+
+
+def _is_placeholder(node: dict) -> bool:
+    return str(node.get("name") or "").strip().upper().startswith(PLACEHOLDER_PREFIX)
+
+
 def _check_design(node: dict, defects: list[Defect]) -> None:
     """Spacing scale, type ramp and token backing -- the rules that were prose.
 
@@ -381,6 +483,8 @@ def _check_design(node: dict, defects: list[Defect]) -> None:
     correct but 4px off the scale is still a working page.
     """
     node_id, name = node.get("id", "?"), node.get("name", "?")
+    if _is_placeholder(node):
+        return
 
     if node.get("layoutMode") in ("VERTICAL", "HORIZONTAL"):
         off_scale = sorted(
@@ -652,4 +756,10 @@ def summarize(defects: list[Defect], model_defects: list[str], limit: int = 6) -
 
 
 def layout_script(node_id: str) -> str:
-    return LAYOUT_SCRIPT.format(node_id=json.dumps(node_id))
+    # Substitute the reader LAST: it is real JavaScript full of braces, and
+    # running it through `.format()` would treat every one of them as a field.
+    return (
+        LAYOUT_SCRIPT.replace("__MAX_DEPTH__", str(MAX_TREE_DEPTH))
+        .format(node_id=json.dumps(node_id))
+        .replace("__READER__", NODE_READER_JS)
+    )

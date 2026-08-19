@@ -229,3 +229,112 @@ def test_buttons_and_badges_hug_their_label_instead_of_stretching():
     assert f"setFill({row})" in js
     assert f"setFill({button})" not in js
     assert f"setFill({badge})" not in js
+
+
+# ---- a real trace: 25 calls rejected for the wrong envelope ---------------
+#
+# The schema wants {"spec": {...}}, the prompt taught the bare tree, and a 20B
+# model sent the tree as the arguments object. Every one of those calls was a
+# correct UI tree rejected as "Missing required argument 'spec'" -- roughly
+# half of every step's tool-call budget, in a 5-step run.
+
+import json as _json
+
+from tools.registry import coerce_spec
+
+_TREE = {"kind": "section", "name": "Sign in", "children": [{"kind": "text", "value": "hi"}]}
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"spec": _TREE},                       # the documented shape
+        _TREE,                                 # the tree AS the arguments
+        {"spec": _json.dumps(_TREE)},          # spec handed over as JSON text
+        {"spec": {"spec": _TREE}},             # wrapped twice
+        {"ui": _TREE},                         # a plausible other key
+        {"spec": [_TREE]},                     # a bare list of sections
+        _json.dumps({"spec": _TREE}),          # the whole argument blob as text
+    ],
+)
+def test_every_envelope_a_model_actually_sends_finds_the_tree(arguments):
+    assert coerce_spec(arguments) is not None
+
+
+def test_something_that_is_not_a_ui_tree_is_still_rejected():
+    """Tolerance must not become guessing -- an unreadable call has to come
+    back as a readable error, not a silently invented section."""
+    assert coerce_spec({"code": "figma.createFrame()"}) is None
+    assert coerce_spec({"query": "how do I set a fill"}) is None
+    assert coerce_spec("not json at all") is None
+    assert coerce_spec(None) is None
+
+
+def test_the_kinds_the_model_kept_asking_for_now_render():
+    """`unknown kind 'ellipse'` / `'frame'` / `'checkbox'` / `'image'` cost a
+    turn each. They are all things the renderer can already draw."""
+    spec = {"kind": "frame", "name": "Auth", "children": [
+        {"kind": "ellipse", "size": 32},
+        {"kind": "heading", "style": "Heading", "value": "Welcome back"},
+        {"kind": "image", "name": "Glow", "height": 120},
+        {"kind": "checkbox", "label": "Remember me"},
+        {"kind": "separator"},
+        {"kind": "cta", "label": "Log in"}]}
+
+    code, created = renderer.compile_spec(spec, "1:2", {"accent": "color/a"})
+
+    assert len(created) >= 6
+    assert "Remember me" in code
+
+
+def test_a_spec_may_name_a_real_token_when_no_role_expresses_it():
+    """`background` is by definition the LIGHTEST colour, so a dark panel was
+    unbuildable: the model asked for it and got white."""
+    spec = {"kind": "section", "name": "Hero", "background": "color/deep-background",
+            "children": [{"kind": "text", "value": "AI at work"}]}
+
+    code, _ = renderer.compile_spec(
+        spec, "1:2", {"text": "color/ink"}, token_names=["color/deep-background"]
+    )
+
+    assert '"color/deep-background"' in code
+
+
+def test_a_role_is_never_aliased_onto_something_it_vanishes_against():
+    """border -> surface -> background painted every divider white on white."""
+    info = [("color/paper", "#FFFFFF", "background (the page fill)"),
+            ("color/ink", "#111111", "text (body copy)")]
+
+    roles = renderer.role_map(info)
+
+    assert roles.get("border") != "color/paper"
+
+
+def test_a_label_is_not_written_twice_above_its_own_input():
+    """`input` renders its own label, so a spec that also writes the label out
+    produces "Email" stacked on "Email". The vision critic caught it correctly
+    -- and then a whole repair budget went on a judgement call that cannot fail
+    a step, so nothing was ever fixed."""
+    spec = {"kind": "col", "name": "Form", "children": [
+        {"kind": "text", "style": "Caption", "value": "Email"},
+        {"kind": "input", "label": "Email", "placeholder": "you@company.com"},
+        {"kind": "text", "style": "Caption", "value": "Password"},
+        {"kind": "input", "label": "Password", "placeholder": "........"},
+        {"kind": "text", "style": "Caption", "value": "Forgot password?"}]}
+
+    code, _ = renderer.compile_spec(spec, "1:2", {})
+
+    assert code.count('"Email"') == 1
+    assert code.count('"Password"') == 1
+    # A link that merely sits near a field is not a duplicate label.
+    assert '"Forgot password?"' in code
+
+
+def test_a_label_before_a_DIFFERENT_input_is_kept():
+    spec = {"kind": "col", "children": [
+        {"kind": "text", "value": "Account details"},
+        {"kind": "input", "label": "Email"}]}
+
+    code, _ = renderer.compile_spec(spec, "1:2", {})
+
+    assert '"Account details"' in code and '"Email"' in code

@@ -48,20 +48,29 @@ Rules you must follow:
    needs to be. Do not split a section across calls, and do not stop after a
    container -- an empty frame is reported as a defect.
 
-   {"kind":"section","name":"Sign in","gap":"lg","children":[
-     {"kind":"text","style":"Heading","value":"Welcome back"},
-     {"kind":"text","style":"Body","color":"text-muted","value":"Sign in to continue"},
-     {"kind":"input","label":"Email","placeholder":"you@company.com"},
-     {"kind":"button","label":"Sign in","variant":"primary"}]}
+   THE CALL TAKES ONE ARGUMENT NAMED `spec`, whose value is the tree:
+
+     render_ui({"spec": {"kind":"section","name":"Sign in","gap":"lg","children":[
+       {"kind":"text","style":"Heading","value":"Welcome back"},
+       {"kind":"text","style":"Body","color":"text-muted","value":"Sign in to continue"},
+       {"kind":"input","label":"Email","placeholder":"you@company.com"},
+       {"kind":"checkbox","label":"Remember me"},
+       {"kind":"button","label":"Sign in","variant":"primary"}]}})
 
    kinds: section, card, row, col (containers, take `children`) | text
    (style: Display/Heading/Subheading/Body/Caption/Button, color: a ROLE
    below, wrap: true for paragraphs) | button (variant primary/secondary)
-   | badge (tone success/warning/error/info) | input | avatar | divider
-   | box (height: N, for chart/image areas).
+   | badge (tone success/warning/error/info) | input | checkbox (label,
+   checked) | avatar (size: N, a circle) | divider | box (height: N, for
+   chart/image/gradient areas).
    gap and padding are NAMES: xs sm md lg xl 2xl. radius: sm md lg xl.
-   colour is a ROLE, never a hex: background, surface, border, text,
-   text-muted, accent, on-accent, success, warning, error, info.
+   colour is a ROLE, never a hex: background, background-alt, surface, border,
+   text, text-muted, text-on-alt, accent, on-accent, success, warning, error,
+   info. You may also name a real TOKEN from the palette table below directly
+   (e.g. "background":"color/deep-background") when no role expresses what you
+   want -- that is how a dark half of a split screen gets its colour.
+   `background-alt` is the inverse/dark panel; put `text-on-alt` copy on it,
+   never `text`.
    A container may also take `width: N` (a FIXED width, e.g. a 240px sidebar)
    and `height: N`. Use `"direction":"row"` for anything side by side.
 
@@ -70,6 +79,19 @@ Rules you must follow:
        {"kind":"col","name":"Sidebar","width":240,"padding":"lg","gap":"sm",
         "background":"surface","children":[ ...nav items... ]},
        {"kind":"col","name":"Main","padding":"xl","gap":"lg","children":[ ... ]}]}
+
+   A SPLIT SCREEN (a visual half beside a form half) is the SAME shape, with an
+   explicit `height` on the row so both halves are full height. Build it in ONE
+   call -- two calls append two stacked bands, and the form lands UNDER the
+   artwork instead of beside it:
+     {"kind":"row","name":"Sign in","height":900,"gap":"none","padding":"none",
+      "children":[
+       {"kind":"col","name":"Visual","width":790,"padding":"2xl",
+        "background":"background-alt","align":"CENTER","children":[
+          {"kind":"text","style":"Display","color":"text-on-alt","value":"..."}]},
+       {"kind":"col","name":"Form","width":650,"padding":"2xl","gap":"lg",
+        "align":"CENTER","children":[ ...the whole form... ]}]}
+   Give the two columns widths that ADD UP to the screen width you were told.
 
    A TABLE is rows of text inside a col; a KPI grid is a row of cards.
    Write REAL sample content ("$128,430", "Acme Corp", "2 hours ago") -- never
@@ -477,6 +499,13 @@ Rules:
   header" then "add the main content" is wrong: they are one layout, so the
   second step rebuilds the sidebar and the screen ends up with two of them.
   A screen with a sidebar is always ONE step.
+- **A SIDE-BY-SIDE screen is ALWAYS ONE STEP.** Anything described as left/right
+  halves, a split screen, a two-column layout, a visual panel beside a form --
+  that is one row containing two columns, and it can only be built in a single
+  call. Planning "add the left panel" then "add the right panel" cannot work:
+  each step appends a full-width band beneath the last, so the two halves come
+  out stacked vertically with the form under the artwork instead of beside it.
+  Plan it as: "Build the whole <screen> screen: <left> beside <right>." 
 - Each step must describe a region that no other step touches.
 - **Keep each step to ONE SHORT SENTENCE, under about 20 words.** Name the
   section and what it contains; do not specify exact pixel values, hex
@@ -727,3 +756,252 @@ def planning_user_message(
         existing_work=existing_work,
         inspection_summary=inspection_summary or "(empty page)",
     )
+
+
+# ---- EDIT MODE -------------------------------------------------------------
+#
+# Create mode builds into a frame it made itself, so the only ids it needs are
+# the ones it just returned. Editing is the opposite: every instruction is
+# about a node that already exists, and the single thing that decides whether
+# an edit lands is whether the model copies the right id. So the canvas listing
+# is the centre of both prompts below, and both say the same thing about it --
+# copy an id, never invent one.
+
+EDIT_SYSTEM_PROMPT = """\
+You are a senior product designer working on an EXISTING Figma file. Your job is
+to make the changes the user asked for -- nothing more.
+
+You have ONE build tool: `edit_ui`. It takes a list of small, explicit edits.
+The harness compiles them into correct Plugin API calls, so font loading, paint
+cloning, sizing modes and enum values cannot go wrong. `render_ui` and raw
+JavaScript are NOT available: building a fresh section is how "make the button
+purple" turns into a second copy of the whole screen.
+
+Rules that decide whether an edit lands:
+
+1. **Copy node ids from the canvas listing, exactly.** Every `target` is checked
+   against the real canvas before anything runs. An id you invented is refused.
+   If you cannot find the node in the listing, say so -- do not guess.
+2. **Change only what was asked.** An instruction about a button's colour is not
+   permission to restyle the card around it. Unrequested changes are damage:
+   this is the user's own work, and they did not ask you to improve it.
+3. **Colours are ROLES, never hex.** Use the roles listed below, or a real token
+   name from the palette table. A hex value is refused.
+4. **One `edit_ui` call should carry the whole change.** Batch the edits; do not
+   make one call per node.
+5. **`delete` is the only destructive op.** Nothing else removes anything, and
+   nothing implies it. Use it only when the user asked for something to go.
+6. Use `get_metadata` if the listing does not tell you enough. Do not read the
+   same node twice.
+
+The ops, and what each needs:
+
+    {"op":"set_fill",       "target":"1:9",  "color":"accent"}
+    {"op":"set_text",       "target":"1:10", "value":"Sign in"}
+    {"op":"set_text_style", "target":"1:10", "style":"Heading"}
+    {"op":"set_size",       "target":"1:9",  "width":440, "height":48}
+    {"op":"set_spacing",    "target":"1:3",  "gap":"lg", "padding":"xl"}
+    {"op":"set_radius",     "target":"1:3",  "radius":"lg"}
+    {"op":"set_visible",    "target":"1:9",  "visible":false}
+    {"op":"set_name",       "target":"1:9",  "name":"Primary Button"}
+    {"op":"reorder",        "target":"1:9",  "index":0}
+    {"op":"delete",         "target":"1:9"}
+    {"op":"insert",         "parent":"1:3",  "index":2, "spec":{...}}
+    {"op":"replace",        "target":"1:9",  "spec":{...}}
+
+`target` may also be a list of ids, or a selector the harness resolves for you:
+`{"name":"Button"}`, `{"text":"Log in"}`, `{"type":"TEXT"}`, `{"screen":"Login"}`
+(combinable, plus `"limit":N`). Use a selector when the change is genuinely
+"all of these"; use ids when it is specific.
+
+`gap`/`padding` are names: xs sm md lg xl 2xl. `radius`: sm md lg xl.
+`style` is one of the text styles listed below.
+
+`spec` (for `insert` and `replace`) is a UI tree:
+  {"kind":"card","name":"Notice","padding":"lg","gap":"md","children":[
+    {"kind":"text","style":"Subheading","value":"Heads up"},
+    {"kind":"text","style":"Body","color":"text-muted","value":"..."},
+    {"kind":"button","label":"Got it","variant":"primary"}]}
+  kinds: section, card, row, col (containers, take `children`) | text | button |
+  badge | input | checkbox | avatar | divider | box.
+
+When the change is done, reply with one short sentence and NO tool call.
+"""
+
+
+EDIT_PLANNING_SYSTEM_PROMPT = """\
+You are planning changes to an EXISTING Figma design. You will be shown what is
+on the canvas and what the user asked for.
+
+Break the request into an ordered list of SMALL steps, each a plain sentence
+describing one coherent change. Another agent carries each one out.
+
+Rules:
+- **DEFAULT TO ONE STEP.** Most edit requests are one step: "make every primary
+  button purple", "change the heading to 'Welcome back'". Only split when the
+  request genuinely contains separate changes to different parts of the design.
+- Never more than 5 steps.
+- Each step must name WHAT changes and WHERE, in the user's terms. Do not put
+  node ids, hex values or Figma API names in a step -- the agent doing the work
+  has the canvas listing and the palette.
+- Never plan a step the user did not ask for. No "and while we're here, tidy up
+  the spacing". This is the user's own work.
+- Never plan to rebuild or recreate a screen. If something must change
+  structurally, say what to replace or insert and where.
+  - GOOD: "Change every primary button's fill to the accent colour."
+  - GOOD: "Add a 'Forgot password?' link under the password field on Login."
+  - BAD:  "Rebuild the login card with better spacing."
+
+Respond with ONLY a JSON array of short step strings. No prose, no fences.
+"""
+
+
+def edit_planning_user_message(instruction: str, listing: str, selection_note: str = "") -> str:
+    return (
+        f"The user asked for:\n{instruction}\n\n"
+        f"{selection_note}"
+        f"What is on the canvas now:\n{listing}\n\n"
+        "Give the ordered list of steps."
+    )
+
+
+EDIT_SELECTION_NOTE = """\
+THE USER HAS SELECTED {count} NODE(S) IN FIGMA: {ids}
+Unless they clearly meant otherwise, the change applies to these and to what is
+inside them. A selection is the user pointing at something -- treat it as the
+answer to "which one?".
+
+"""
+
+EDIT_FAILED_NOTE = """\
+YOUR LAST ATTEMPT DID NOT FULLY LAND. What went wrong:
+{problems}
+
+Fix exactly these. Do not re-apply the edits that already worked.
+
+"""
+
+EDIT_APPLIED_NOTE = """\
+ALREADY APPLIED IN THIS STEP -- do not repeat these:
+{applied}
+
+"""
+
+
+def edit_step_user_message(
+    step: str,
+    instruction: str,
+    listing: str,
+    plan: list[str] | None = None,
+    step_index: int = 0,
+    selection: list[str] | None = None,
+    palette_info: list[tuple[str, str, str]] | None = None,
+    text_style_names: list[str] | None = None,
+    pairings: list[str] | None = None,
+    applied: list[str] | None = None,
+    problems: list[str] | None = None,
+) -> str:
+    """Everything the editing agent needs to make one change correctly.
+
+    The canvas listing is re-sent every step because the ids are the whole game
+    and an edit changes what the listing says -- a stale one would have the
+    agent targeting a node it already replaced.
+    """
+    parts = [f"The user asked for:\n{instruction}\n"]
+
+    if plan and len(plan) > 1:
+        outline = "\n".join(
+            f"  {i}. {s}" + ("   <<< THIS STEP" if i == step_index else "")
+            for i, s in enumerate(plan, start=1)
+        )
+        parts.append(f"The full set of changes:\n{outline}\n")
+
+    parts.append(f"THIS STEP: {step}\n")
+
+    if selection:
+        parts.append(
+            EDIT_SELECTION_NOTE.format(count=len(selection), ids=", ".join(selection[:12]))
+        )
+    if problems:
+        parts.append(EDIT_FAILED_NOTE.format(problems="\n".join(f"  - {p}" for p in problems[:8])))
+    if applied:
+        parts.append(EDIT_APPLIED_NOTE.format(applied="\n".join(f"  - {a}" for a in applied[:12])))
+
+    if palette_info:
+        colors = "\n".join(
+            f"    {name:<26} {hex_value}  {role}" for name, hex_value, role in palette_info
+        )
+        parts.append(
+            "Colour roles you may use (name a ROLE, or a token from the left column):\n"
+            f"{colors}\n"
+        )
+    if pairings:
+        parts.append(
+            "Readable text/background pairs (measured, not guessed):\n"
+            + "\n".join(f"  - {p}" for p in pairings[:6])
+            + "\n"
+        )
+    if text_style_names:
+        parts.append(f"Text styles: {', '.join(text_style_names)}\n")
+
+    parts.append(f"THE CANVAS RIGHT NOW (copy ids from here exactly):\n{listing}\n")
+    parts.append("Make this change with one `edit_ui` call.")
+    return "\n".join(parts)
+
+
+# ---- ATTACHMENTS -----------------------------------------------------------
+
+TEXT_REFERENCE_HEADER = """\
+REFERENCE MATERIAL the user attached. Build what these show, in the user's own
+words above where the two differ -- the attachment is what they want it to LOOK
+like, the instruction is what they want it to BE.
+
+"""
+
+IMAGE_REFERENCE_PROMPT = """\
+You are a design director writing down exactly what you see, so another
+designer can rebuild it in Figma without ever seeing the original.
+
+Describe ONLY what is actually in the image. Do not invent sections, copy or
+colours that are not there, and do not improve on it -- the person reading this
+is trying to reproduce it, and a detail you made up becomes a design decision
+nobody asked for.
+
+Answer in this shape, and nothing else:
+
+SCREENS
+One line per distinct screen or artboard visible, with its rough pixel size.
+If the image is one screen, say so.
+
+LAYOUT
+The structure top to bottom (or left to right, if it is split): the regions,
+their rough proportions, and what sits in each. Say where things are aligned
+and how generous the spacing is.
+
+COLORS
+One colour per line, as `Name: #RRGGBB`, with a name that says what the colour
+is FOR. Use exactly these names where they apply, because they decide what the
+colour is used for later:
+  Background: #......      the page fill
+  Surface: #......         cards, inputs, raised areas
+  Border: #......          dividers and outlines
+  Text: #......            body copy
+  Text muted: #......      secondary copy
+  Accent: #......          buttons, links, emphasis
+Add any others you see with a descriptive name (`Success: #22C55E`). Estimate
+the hex from the image; approximate is fine, missing is not.
+
+TYPOGRAPHY
+The type scale you can see: rough sizes and weights for headings, body, labels,
+buttons. Name the typeface only if you can genuinely tell.
+
+CONTENT
+Every piece of visible text, quoted exactly. Headings, labels, placeholder
+text, button labels, links, small print. This is the part most worth getting
+right: real copy is the difference between a rebuild and a wireframe.
+
+COMPONENTS
+The interactive parts you can see: inputs, buttons, checkboxes, toggles, tabs,
+avatars, icons, charts. Note the shape of each (corner radius, height, whether
+it is outlined or filled).
+"""

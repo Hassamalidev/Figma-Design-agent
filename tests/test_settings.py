@@ -546,3 +546,252 @@ def test_the_delete_endpoint_reports_refusals(tmp_path, monkeypatch):
     assert ok
     ok_again, message = dash.forget_file("fk-a")
     assert not ok_again and message      # a second delete says why, rather than pretending
+
+
+# ---- the dashboard pages through screens instead of embedding them --------
+
+
+def test_the_status_payload_carries_screen_NAMES_not_images(tmp_path, monkeypatch):
+    """/api/status is polled every 1.5s. Five full-page PNGs in that payload is
+    megabytes a minute for pictures that never change."""
+    from types import SimpleNamespace
+
+    import web.app as app_module
+
+    result = SimpleNamespace(
+        success=True, created_node_ids=["1:1"], failed_steps=[], warnings=[],
+        layout_defects=[], design_notes=[], requirements_met=[], requirements_missing=[],
+        screens=["Login", "Dashboard"], metrics={},
+        screen_shots=[
+            {"name": "Login", "image_base64": "AAAA"},
+            {"name": "Dashboard", "image_base64": "BBBB"},
+        ],
+        final_screenshot_base64="AAAA",
+    )
+
+    payload = app_module._result_payload(result)
+
+    assert payload["screen_names"] == ["Login", "Dashboard"]
+    assert "AAAA" not in json.dumps(payload)
+
+
+def test_each_screen_is_served_on_its_own(tmp_path, monkeypatch):
+    import base64
+
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash._run_screens = [
+        {"name": "Login", "image_base64": base64.b64encode(b"login-png").decode()},
+        {"name": "Dashboard", "image_base64": base64.b64encode(b"dash-png").decode()},
+    ]
+
+    assert dash.screen_image(0) == b"login-png"
+    assert dash.screen_image(1) == b"dash-png"
+    assert dash.screen_image(2) is None      # past the end
+    assert dash.screen_image(-1) is None     # and before the start
+
+
+def test_a_corrupt_screen_image_does_not_raise(tmp_path, monkeypatch):
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash._run_screens = [{"name": "Login", "image_base64": "not base64 at all!!"}]
+
+    assert dash.screen_image(0) is None
+
+
+def test_starting_a_run_clears_the_previous_runs_screens(tmp_path, monkeypatch):
+    """Otherwise the pager shows the last design while the new one builds."""
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash.update_settings(
+        {"model_base_url": "http://x/v1", "model_api_key": "k", "model_name": "m"}
+    )
+    dash.registry.upsert(
+        FileEntry(file_key="fk", file_name="Untitled", thumbnail_base64=None, last_seen="2026-01-01")
+    )
+    dash._run_screens = [{"name": "Old", "image_base64": "AAAA"}]
+    monkeypatch.setattr(dash, "_wait_for_file", lambda _key: False)
+
+    dash.start_run("fk", "a new design")
+    import time
+
+    for _ in range(50):                      # the worker runs on its own thread
+        if not dash._run_screens:
+            break
+        time.sleep(0.02)
+
+    assert dash._run_screens == []
+
+
+# ---- stopping a run from the dashboard ------------------------------------
+
+
+def test_stopping_when_nothing_is_running_is_refused(tmp_path, monkeypatch):
+    dash = make_dashboard(tmp_path, monkeypatch)
+
+    ok, message = dash.stop_run()
+
+    assert not ok and "no run in progress" in message
+
+
+def test_stopping_sets_the_signal_the_run_reads(tmp_path, monkeypatch):
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash._run_status = "running"
+
+    ok, message = dash.stop_run()
+
+    assert ok and "Stopping" in message
+    assert dash._stop.is_set()
+    assert dash.status_snapshot()["status"] == "stopping"
+
+
+def test_stopping_twice_is_harmless(tmp_path, monkeypatch):
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash._run_status = "running"
+    dash.stop_run()
+
+    ok, message = dash.stop_run()
+
+    assert ok and "Already stopping" in message
+
+
+def test_a_new_run_is_never_born_already_stopping(tmp_path, monkeypatch):
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash.update_settings(
+        {"model_base_url": "http://x/v1", "model_api_key": "k", "model_name": "m"}
+    )
+    dash.registry.upsert(
+        FileEntry(file_key="fk", file_name="Untitled", thumbnail_base64=None, last_seen="2026-01-01")
+    )
+    dash._run_status = "running"
+    dash.stop_run()
+    dash._run_status = "idle"          # the previous run finished
+    monkeypatch.setattr(dash, "_wait_for_file", lambda _key: False)
+
+    dash.start_run("fk", "a new design")
+
+    assert not dash._stop.is_set()
+
+
+def test_waiting_for_a_file_can_be_stopped(tmp_path, monkeypatch):
+    """The easiest thing of all to abandon -- nothing has happened yet."""
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash._stop.set()
+
+    assert dash._wait_for_file("fk") is False
+
+
+def test_a_stopped_run_is_recorded_as_stopped_not_failed(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import web.app as app_module
+
+    stopped = SimpleNamespace(
+        success=False, stopped=True, created_node_ids=["1:1"], failed_steps=[], warnings=[],
+        layout_defects=[], design_notes=[], requirements_met=[], requirements_missing=[],
+        screens=["Login"], screen_shots=[], metrics={}, final_screenshot_base64=None,
+    )
+
+    assert app_module._history_status(stopped, "") == "stopped"
+    assert app_module._result_payload(stopped)["stopped"] is True
+
+    finished = SimpleNamespace(**{**stopped.__dict__, "stopped": False, "success": True})
+    assert app_module._history_status(finished, "") == "done"
+    assert app_module._result_payload(finished)["stopped"] is False
+
+
+def test_a_crash_is_still_recorded_as_an_error(tmp_path, monkeypatch):
+    import web.app as app_module
+
+    assert app_module._history_status(None, "TypeError: boom") == "error"
+    assert app_module._history_status(None, "Stopped before the run started.") == "stopped"
+
+
+# ---- attachments through the dashboard ------------------------------------
+
+
+def test_the_vision_model_can_be_set_from_the_dashboard(tmp_path, monkeypatch):
+    """The refusal message for an unreadable image points at Settings, so
+    Settings has to actually have the control."""
+    dash = make_dashboard(tmp_path, monkeypatch)
+
+    dash.update_settings({"vision_model_name": "gemma4:cloud"})
+
+    snapshot = dash.settings_snapshot()
+    assert snapshot["vision_model_name"] == "gemma4:cloud"
+    assert snapshot["has_vision"] is True
+    assert snapshot["sources"]["vision_model_name"] == "ui"
+
+
+def test_a_configured_critic_already_counts_as_vision(tmp_path, monkeypatch):
+    """Someone who set up screenshot critique should not have to configure a
+    second model to attach a screenshot."""
+    from config import Settings
+
+    settings = Settings("http://x", "k", "m", critic_base_url="http://v",
+                        critic_model_name="gemma4:cloud")
+
+    assert settings.has_vision
+    assert settings.vision_settings()[2] == "gemma4:cloud"
+
+
+def test_an_attachment_that_cannot_be_decoded_is_a_400_not_a_started_run():
+    """Starting a run, spending model calls and then reporting that the file
+    could not be opened is the worst ordering available."""
+    from agent import reference
+
+    with pytest.raises(reference.ReferenceError):
+        reference.from_payload([{"name": "x.png", "data_base64": "!!!!"}])
+
+
+def test_an_attachment_reaches_the_run(tmp_path, monkeypatch):
+    """The whole path: posted bytes -> decoded -> described -> into the loop."""
+    import base64
+    import time
+
+    from agent import loop as loop_module
+    from agent import reference
+
+    dash = make_dashboard(tmp_path, monkeypatch)
+    dash.update_settings(
+        {"model_base_url": "http://x/v1", "model_api_key": "k", "model_name": "m",
+         "vision_model_name": "seeing-model"}
+    )
+    dash.registry.upsert(
+        FileEntry(file_key="fk", file_name="Untitled", thumbnail_base64=None, last_seen="2026-01-01")
+    )
+    monkeypatch.setattr(dash, "_wait_for_file", lambda _key: True)
+
+    seen: dict = {}
+
+    def capture(*args, **kwargs):
+        seen["references"] = kwargs.get("references")
+        return _blank_result()
+
+    monkeypatch.setattr(loop_module, "run", capture)
+    monkeypatch.setattr(
+        "web.app.build_vision_client",
+        lambda _s: SimpleNamespace(
+            complete=lambda messages, tools=None: SimpleNamespace(
+                content="COLORS\nAccent: #6C5CE7", tool_calls=None
+            )
+        ),
+    )
+
+    attachments = reference.from_payload(
+        [{"name": "shot.png", "data_base64": base64.b64encode(b"png bytes").decode()}]
+    )
+    dash.start_run("fk", "rebuild this", "create", attachments)
+    for _ in range(100):
+        if "references" in seen:
+            break
+        time.sleep(0.02)
+
+    assert "Accent: #6C5CE7" in (seen.get("references") or "")
+    assert dash.status_snapshot()["status"] == "done"
+
+
+def _blank_result():
+    from agent.state import RunResult
+
+    return RunResult(
+        instruction="rebuild this", success=True, created_node_ids=["1:1"],
+        failed_steps=[], warnings=[],
+    )

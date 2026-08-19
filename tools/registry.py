@@ -6,9 +6,10 @@ else -- the loop just dispatches by name.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Callable
 
-from agent import renderer
+from agent import editor, renderer
 from bridge.server import Bridge
 from tools.docs import query_docs
 from tools.figma_exec import execute_figma_js
@@ -43,6 +44,42 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     }
                 },
                 "required": ["spec"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_ui",
+            "description": (
+                "Change nodes that ALREADY EXIST on the canvas. Pass a list of small, "
+                "explicit edits; the harness compiles them into correct Figma API calls, "
+                "verifies every target id against the canvas first, and reports which "
+                "edits took and which did not. This is the only way to modify an "
+                "existing design -- never rebuild a screen to change one thing about it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "description": (
+                            "Each edit is {op, target, ...}. `target` is a node id copied "
+                            "EXACTLY from the canvas listing (or a list of ids, or "
+                            '{"name": "...", "type": "TEXT"} to match several). Ops: '
+                            'set_fill {color: a ROLE or token}, set_text {value}, '
+                            "set_text_style {style}, set_size {width, height}, "
+                            "set_spacing {gap, padding}, set_radius {radius}, "
+                            "set_visible {visible}, set_name {name}, reorder {index}, "
+                            "delete, insert {parent, spec, index}, replace {target, spec}. "
+                            "`spec` is a render_ui UI tree. Example: "
+                            '[{"op":"set_fill","target":"1:9","color":"accent"},'
+                            '{"op":"set_text","target":"1:10","value":"Sign in"}]'
+                        ),
+                        "items": {"type": "object"},
+                    }
+                },
+                "required": ["edits"],
             },
         },
     },
@@ -131,9 +168,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 _READ_TOOLS = [t for t in TOOL_SCHEMAS if t["function"]["name"] in ("get_metadata", "get_screenshot")]
 _RENDER_TOOL = [t for t in TOOL_SCHEMAS if t["function"]["name"] == "render_ui"]
+_EDIT_TOOL = [t for t in TOOL_SCHEMAS if t["function"]["name"] == "edit_ui"]
 _EXEC_TOOL = [t for t in TOOL_SCHEMAS if t["function"]["name"] == "execute_figma_js"]
 
 SECTION_TOOLS: list[dict[str, Any]] = _RENDER_TOOL + _READ_TOOLS
+# Edit mode gets `edit_ui` and the read-only tools -- and NOT `render_ui`,
+# because building a fresh section is how "make the button purple" turns into a
+# second copy of the whole screen. Structural changes go through edit_ui's own
+# `insert` and `replace`, which are anchored to a node that already exists.
+EDIT_TOOLS: list[dict[str, Any]] = _EDIT_TOOL + _READ_TOOLS
 ALL_TOOLS: list[dict[str, Any]] = TOOL_SCHEMAS
 
 
@@ -168,6 +211,8 @@ def dispatch(
     """
     if name == "render_ui":
         return _render_ui(arguments, bridge, render_context or {})
+    if name == "edit_ui":
+        return _edit_ui(arguments, bridge, render_context or {})
     if name == "execute_figma_js" and not arguments.get("code"):
         return {"ok": False, "error": "Missing required argument 'code'. Pass the script as the 'code' argument of the tool call."}
     if name == "query_docs" and not arguments.get("query"):
@@ -185,6 +230,49 @@ def dispatch(
     return handler()
 
 
+def coerce_spec(arguments: Any) -> dict | None:
+    """Find the UI tree in whatever envelope the model wrapped it in.
+
+    The schema asks for `{"spec": {...}}`, but the prompt teaches the shape by
+    showing the bare tree `{"kind":"section", ...}` -- so a small model sends
+    the tree AS the arguments object. In a real 5-step run that produced
+    "Missing required argument 'spec'" twenty-five times and consumed roughly
+    half of every step's tool-call budget, for a call that was otherwise
+    perfectly correct.
+
+    Being strict about the envelope buys nothing: the tree is unmistakable
+    (`kind` at the top, or `children`), so every shape that unambiguously
+    contains one is accepted. Anything genuinely unreadable still comes back as
+    a normal error the model can correct.
+    """
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(arguments, dict):
+        return None
+
+    # The documented shape, including a spec handed over as a JSON string.
+    for key in ("spec", "ui", "tree", "node", "root"):
+        value = arguments.get(key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = None
+        if isinstance(value, dict):
+            return coerce_spec(value) if "spec" in value else value
+        if isinstance(value, list) and value:
+            # A bare list of sections: wrap it, rather than losing all but one.
+            return {"kind": "col", "name": "Section", "children": value}
+
+    # The tree sent as the arguments object itself.
+    if "kind" in arguments or "children" in arguments:
+        return arguments
+    return None
+
+
 def _render_ui(arguments: dict[str, Any], bridge: Bridge, context: dict[str, Any]) -> dict[str, Any]:
     """Compile a UI tree and run it.
 
@@ -192,9 +280,13 @@ def _render_ui(arguments: dict[str, Any], bridge: Bridge, context: dict[str, Any
     correct it -- and crucially it never reaches Figma, so a bad spec cannot
     leave half a section on the canvas.
     """
-    spec = arguments.get("spec")
-    if not isinstance(spec, dict):
-        return _bad_spec("Missing required argument 'spec' (a UI tree object).")
+    spec = coerce_spec(arguments)
+    if spec is None:
+        return _bad_spec(
+            "Missing the UI tree. Call render_ui with one argument named `spec` whose "
+            'value is the tree object, e.g. {"spec": {"kind": "section", "name": "...", '
+            '"children": [...]}}.'
+        )
     parent_id = context.get("parent_id")
     if not parent_id:
         return _bad_spec("No parent frame is available for render_ui.")
@@ -204,10 +296,53 @@ def _render_ui(arguments: dict[str, Any], bridge: Bridge, context: dict[str, Any
             parent_id,
             context.get("color_roles") or {},
             replace_ids=context.get("replace_ids"),
+            token_names=context.get("token_names"),
         )
     except renderer.SpecError as exc:
         return _bad_spec(f"Invalid UI spec: {exc}")
     return execute_figma_js(bridge, code)
+
+
+def _edit_ui(arguments: dict[str, Any], bridge: Bridge, context: dict[str, Any]) -> dict[str, Any]:
+    """Compile a batch of edits against the CURRENT canvas and run it.
+
+    Every target is checked against the inventory here, in Python, before a
+    single Plugin API call is made. Figma's own error for a bad id says nothing
+    about which id was wrong or what the real ones are, so a model that gets it
+    just invents another; the message this returns names the mistake and points
+    back at the listing.
+    """
+    edits = arguments.get("edits")
+    if isinstance(edits, dict):
+        edits = [edits]  # one edit, unwrapped -- an obvious intent, not an error
+    if isinstance(edits, str):
+        try:
+            edits = json.loads(edits)
+        except json.JSONDecodeError:
+            edits = None
+    if not isinstance(edits, list) or not edits:
+        return _bad_spec(
+            "Missing required argument 'edits' (a non-empty list of edit objects, "
+            'e.g. [{"op": "set_fill", "target": "1:9", "color": "accent"}]).'
+        )
+    resolve = context.get("resolve")
+    if resolve is None:
+        return _bad_spec("No canvas inventory is available for edit_ui.")
+    try:
+        code, touched = editor.compile_edits(
+            edits,
+            resolve,
+            context.get("color_roles") or {},
+            token_names=context.get("token_names"),
+            protected_ids=context.get("protected_ids"),
+        )
+    except renderer.SpecError as exc:
+        return _bad_spec(f"Invalid edit: {exc}")
+    result = execute_figma_js(bridge, code)
+    if result["ok"]:
+        result = dict(result)
+        result["touchedNodeIds"] = touched
+    return result
 
 
 def _bad_spec(message: str) -> dict[str, Any]:

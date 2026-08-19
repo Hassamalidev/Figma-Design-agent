@@ -476,3 +476,173 @@ def test_the_layout_script_compiles_as_the_plugin_evaluates_it():
     from tests.test_scaffold import compiles_as_async_body
 
     assert compiles_as_async_body(critic.layout_script("1:23"))
+
+
+# ---- the harness must not report its own scaffolding as design problems ----
+#
+# A finished run listed six "design system notes" and every one was about the
+# TODO frames the HARNESS had dropped in for steps it could not build: 14px
+# text off the type ramp, two hardcoded greys, 4.2:1 contrast. The harness was
+# failing its own checks and billing the user for it.
+
+
+def test_a_todo_placeholder_is_not_judged_as_design():
+    placeholder = {
+        "id": "9:1", "name": "TODO — login form", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 160, "visible": True, "layoutMode": "VERTICAL",
+        "itemSpacing": 17, "padding": [13, 13, 13, 13], "fill": fill("#F7F7F8"),
+        "children": [text(id="9:2", name="Label", characters="TODO: login form",
+                          fontSize=14, width=200, fill=fill("#95979E"))],
+    }
+
+    assert critic.find_design_defects(placeholder) == []
+
+
+def test_a_real_section_is_still_judged():
+    """The exemption is for TODO markers only, not for anything nearby."""
+    section = {
+        "id": "9:3", "name": "Hero", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 160, "visible": True, "layoutMode": "VERTICAL",
+        "itemSpacing": 17, "padding": [13, 13, 13, 13], "fill": fill("#F7F7F8"),
+        "children": [text(id="9:4", name="Label", characters="Hi", fontSize=14, width=200)],
+    }
+
+    kinds = {d.kind for d in critic.find_design_defects(section)}
+    assert "off-scale-spacing" in kinds
+    assert "off-ramp-type" in kinds
+
+
+def test_a_placeholder_that_does_not_render_is_still_reported():
+    """Excusing its colours must not excuse it being invisible."""
+    placeholder = {
+        "id": "9:5", "name": "TODO — hero", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 160, "visible": True, "layoutMode": "VERTICAL",
+        "children": [text(id="9:6", name="Label", characters="TODO: hero", width=0, height=0)],
+    }
+
+    assert "collapsed" in {d.kind for d in critic.find_layout_defects(placeholder)}
+
+
+# ---- duplicated regions -----------------------------------------------------
+
+
+def test_a_section_that_rebuilds_a_sibling_is_caught():
+    """A dashboard run built its sidebar twice: one step added the sidebar, the
+    next rebuilt the whole shell around it. Both copies were well-formed, so
+    only their identical text gives them away."""
+    def sidebar(node_id, name):
+        return {
+            "id": node_id, "name": name, "type": "FRAME", "x": 0, "y": 0,
+            "width": 240, "height": 400, "visible": True, "layoutMode": "VERTICAL",
+            "children": [
+                text(id=node_id + ":a", characters="Acme"),
+                text(id=node_id + ":b", characters="Dashboard"),
+                text(id=node_id + ":c", characters="Profile"),
+                text(id=node_id + ":d", characters="Settings"),
+            ],
+        }
+
+    tree = frame(id="root", name="Dashboard", width=1440, height=900, layoutMode="VERTICAL",
+                 children=[sidebar("s1", "Sidebar"), sidebar("s2", "Shell")])
+
+    defects = critic.find_duplicate_sections(tree)
+
+    assert [d.kind for d in defects] == ["duplicate-section"]
+    assert defects[0].node_id == "s2"          # the LATER copy is the duplicate
+    assert "Sidebar" in defects[0].detail      # and it names what it repeats
+
+
+def test_sections_that_merely_share_a_word_are_not_duplicates():
+    def band(node_id, name, words):
+        return {
+            "id": node_id, "name": name, "type": "FRAME", "x": 0, "y": 0,
+            "width": 1440, "height": 200, "visible": True, "layoutMode": "VERTICAL",
+            "children": [text(id=f"{node_id}:{i}", characters=w) for i, w in enumerate(words)],
+        }
+
+    tree = frame(id="root", name="Landing", width=1440, height=900, layoutMode="VERTICAL",
+                 children=[
+                     band("b1", "Hero", ["Get started", "Plan your week", "Sign up"]),
+                     band("b2", "Footer", ["Get started", "Careers", "Privacy"]),
+                 ])
+
+    assert critic.find_duplicate_sections(tree) == []
+
+
+def test_a_step_is_only_blamed_for_its_own_duplicate():
+    def nav(node_id):
+        return {
+            "id": node_id, "name": "Nav", "type": "FRAME", "x": 0, "y": 0,
+            "width": 1440, "height": 80, "visible": True, "layoutMode": "HORIZONTAL",
+            "children": [text(id=node_id + ":a", characters="Home"),
+                         text(id=node_id + ":b", characters="Pricing"),
+                         text(id=node_id + ":c", characters="Contact")],
+        }
+
+    tree = frame(id="root", name="Page", width=1440, height=900, layoutMode="VERTICAL",
+                 children=[nav("n1"), nav("n2")])
+
+    # Scoped to the FIRST copy: it duplicates nothing before it.
+    assert critic.find_duplicate_sections(tree, scope_ids=["n1"]) == []
+    assert len(critic.find_duplicate_sections(tree, scope_ids=["n2"])) == 1
+
+
+# ---- a real trace: every form step became a TODO placeholder ---------------
+#
+# The tree read stopped at depth 4. A form field sits at depth 5:
+#   screen -> section -> col -> Field -> Input -> placeholder text
+# so `Input` always came back childless and was reported as an empty frame --
+# a defect no attempt could fix. Three steps in a row failed their visual gate
+# three times each and were demoted to TODO placeholders.
+
+
+def test_the_layout_read_reaches_a_form_field_placeholder():
+    script = critic.layout_script("1:2")
+    assert critic.MAX_TREE_DEPTH >= 6, "a form field's text sits at depth 5"
+    assert f"const MAX_TREE_DEPTH = {critic.MAX_TREE_DEPTH};" in script
+    assert "depth < MAX_TREE_DEPTH" in script
+
+
+def _nest(depth: int) -> dict:
+    """A screen -> section -> col -> Field -> Input -> text chain."""
+    text = {"id": "n:5", "name": "Placeholder", "type": "TEXT", "x": 0, "y": 0,
+            "width": 120, "height": 20, "visible": True, "characters": "you@company.com",
+            "fontSize": 15, "fill": {"r": 0.4, "g": 0.4, "b": 0.4}, "children": []}
+    node = text
+    for level in reversed(range(depth)):
+        node = {"id": f"n:{level}", "name": ["Screen", "Section", "Col", "Field", "Input"][level],
+                "type": "FRAME", "x": 0, "y": 0, "width": 372, "height": 56,
+                "visible": True, "layoutMode": "VERTICAL", "fill": {"r": 1, "g": 1, "b": 1},
+                "children": [node]}
+    return node
+
+
+def test_a_populated_input_is_not_reported_as_an_empty_frame():
+    assert critic.find_layout_defects(_nest(5)) == []
+
+
+def test_a_filled_decorative_block_is_not_a_blank_region():
+    """The renderer's own `box` -- a chart area, an image placeholder, a glowing
+    shape -- is a deliberately childless FILLED frame. Flagging it meant the
+    harness failed its own output."""
+    tree = {"id": "1:1", "name": "Hero", "type": "FRAME", "x": 0, "y": 0,
+            "width": 800, "height": 600, "visible": True, "fill": {"r": 1, "g": 1, "b": 1},
+            "children": [
+                {"id": "1:2", "name": "Glow", "type": "FRAME", "x": 0, "y": 0,
+                 "width": 240, "height": 120, "visible": True,
+                 "fill": {"r": 0.49, "g": 0.23, "b": 0.93}, "children": []}]}
+
+    assert [d.kind for d in critic.find_layout_defects(tree)] == []
+
+
+def test_an_empty_frame_the_colour_of_its_background_IS_still_a_blank_region():
+    """The exemption must not swallow the real defect: a white section on a
+    white page is the 1440x900 void a failed run actually produced."""
+    tree = {"id": "1:1", "name": "Screen", "type": "FRAME", "x": 0, "y": 0,
+            "width": 1440, "height": 900, "visible": True, "fill": {"r": 1, "g": 1, "b": 1},
+            "children": [
+                {"id": "1:2", "name": "Left Visual", "type": "FRAME", "x": 0, "y": 0,
+                 "width": 792, "height": 900, "visible": True,
+                 "fill": {"r": 1, "g": 1, "b": 1}, "children": []}]}
+
+    assert any(d.kind == "empty-frame" for d in critic.find_layout_defects(tree))

@@ -250,3 +250,109 @@ def test_the_token_script_tracks_names_it_creates_during_the_loop():
     script = scaffold.build_token_script([("a", "#112233")])
     assert "varByName[varName] = variable" in script
     assert "styleByName[varName] = style" in script
+
+
+# ---- a real trace: nine requested colours became three tokens --------------
+#
+# The user asked for a nine-colour palette in a clean list. The run created
+# THREE tokens, because the palette was only ever read out of the model's
+# rewritten brief -- which had scattered the same colours into table cells.
+# `border` and `surface` then aliased onto the page fill, so every divider was
+# white on white and the input boxes had no visible edge.
+
+NEXORA_INSTRUCTION = """
+### Color Palette
+* Deep background: `#0B1020`
+* Primary purple: `#7C3AED`
+* Secondary blue: `#2563EB`
+* Accent: `#A78BFA`
+* Form background: `#FFFFFF`
+* Main text: `#111827`
+* Secondary text: `#6B7280`
+* Border: `#E5E7EB`
+* Input background: `#F9FAFB`
+"""
+
+NEXORA_BRIEF = """
+- Background: `#0B1020`.
+- Gradient: Linear from `#7C3AED` to `#2563EB`.
+| Input field | 48 px | 1 px solid `#E5E7EB` | `#F9FAFB` |
+- Background: `#FFFFFF`.
+"""
+
+
+def test_the_users_instruction_is_read_before_the_models_brief():
+    """Reading only the brief lost six of the nine colours that were asked for."""
+    from_brief_only = scaffold.extract_palette(NEXORA_BRIEF)
+    assert len(from_brief_only) < 4  # the bug, reproduced
+
+    palette = scaffold.extract_palette(NEXORA_BRIEF, NEXORA_INSTRUCTION)
+
+    hexes = {h for _, h in palette}
+    for asked_for in ("#0B1020", "#7C3AED", "#2563EB", "#A78BFA",
+                      "#FFFFFF", "#111827", "#6B7280", "#E5E7EB", "#F9FAFB"):
+        assert asked_for in hexes, f"{asked_for} was requested and dropped"
+
+
+def _roles_for(instruction: str) -> dict[str, str]:
+    """role key -> hex, exactly as the renderer resolves it."""
+    from agent import renderer
+
+    palette = scaffold.complete_palette(scaffold.extract_palette("", instruction))
+    info = scaffold.describe_palette(palette)
+    hexes = {name: hex_value for name, hex_value, _ in info}
+    return {role: hexes[token] for role, token in renderer.role_map(info).items()}
+
+
+def test_a_name_that_declares_its_role_beats_luminance_ordering():
+    """`Border: #E5E7EB` has told us the answer. Ranking it by luminance made it
+    a "surface", made #111827 "text-muted", and called the near-black page
+    background "text"."""
+    roles = _roles_for(NEXORA_INSTRUCTION)
+
+    assert roles["border"] == "#E5E7EB"
+    assert roles["text"] == "#111827"
+    assert roles["text-muted"] == "#6B7280"
+    assert roles["surface"] == "#F9FAFB"
+
+
+def test_the_background_role_is_one_the_text_can_be_read_on():
+    """Two colours claim to be backgrounds. Picking the dark one puts near-black
+    text on a near-black page -- every gate passes it and nothing is legible."""
+    roles = _roles_for(NEXORA_INSTRUCTION)
+
+    assert scaffold.contrast_ratio(roles["background"], roles["text"]) >= scaffold.MIN_TEXT_CONTRAST
+
+
+def test_the_second_background_stays_available_as_an_inverse_panel():
+    """A dark-to-light split screen needs the dark half. With only one
+    `background` role it asked for the page fill, got white, and rendered a
+    1440x900 blank void."""
+    roles = _roles_for(NEXORA_INSTRUCTION)
+
+    assert roles["background-alt"] == "#0B1020"
+    # ...and copy placed on it is readable, measured rather than assumed.
+    assert scaffold.contrast_ratio(
+        roles["text-on-alt"], roles["background-alt"]
+    ) >= scaffold.MIN_TEXT_CONTRAST
+
+
+def test_a_missing_role_is_derived_rather_than_aliased_onto_the_page_fill():
+    """The old chain was border -> surface -> background, so a two-colour
+    palette painted dividers white on white."""
+    palette = scaffold.complete_palette([("ink", "#111111"), ("paper", "#FFFFFF")])
+    roles = {
+        role: hex_value
+        for role, hex_value in (
+            (r.split(" ")[0], h) for _, h, r in scaffold.describe_palette(palette)
+        )
+    }
+
+    assert roles["border"] != roles["background"]
+    assert roles["surface"] != roles["border"]
+    assert scaffold.contrast_ratio(roles["border"], roles["background"]) > 1.0
+
+
+def test_completing_a_palette_that_needs_nothing_changes_nothing():
+    complete = scaffold.complete_palette(PALETTE)
+    assert complete[: len(PALETTE)] == PALETTE

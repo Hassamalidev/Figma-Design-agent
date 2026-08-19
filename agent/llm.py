@@ -131,6 +131,23 @@ def build_critic_client(settings) -> "ModelClient | None":
     return ModelClient(base_url, api_key, model)
 
 
+def build_vision_client(settings) -> "ModelClient | None":
+    """The model that reads attached screenshots, or None if none is configured.
+
+    Falls through VISION_* -> CRITIC_* -> nothing, so a user who already set up
+    a vision critic gets screenshot input for free. Returning None is a
+    first-class outcome: the run then REFUSES the attachment with a clear
+    message instead of quietly ignoring it and building something generic,
+    which is the worst way this could fail.
+    """
+    if not getattr(settings, "has_vision", False):
+        return None
+    base_url, api_key, model = settings.vision_settings()
+    if not model:
+        return None
+    return ModelClient(base_url, api_key, model)
+
+
 def _recover_tool_call_from_content(message: ChatCompletionMessage, tools: list[dict]) -> Any:
     """Fallback for local models with unreliable tool-calling (CLAUDE.md section 5:
     "tool-call reliability drops on small models... this is the single biggest
@@ -145,15 +162,39 @@ def _recover_tool_call_from_content(message: ChatCompletionMessage, tools: list[
         return message
 
     known_names = {t["function"]["name"] for t in tools}
+    by_argument = _tools_by_sole_argument(tools)
     calls = []
     for block in _json_candidates(message.content):
-        calls.extend(_calls_from(block, known_names))
+        calls.extend(_calls_from(block, known_names, by_argument))
     if not calls:
         return message
     return SimpleNamespace(content=None, tool_calls=calls)
 
 
-def _calls_from(parsed: Any, known_names: set[str]) -> list[Any]:
+def _tools_by_sole_argument(tools: list[dict]) -> dict[str, str]:
+    """`{"spec": "render_ui", "code": "execute_figma_js"}` -- but only where the
+    mapping is unambiguous.
+
+    A model that emits a tool call as text often drops the envelope with it and
+    prints just the ARGUMENTS: a ```json block holding `{"spec": {...}}` and no
+    `name` field anywhere. It is a complete, correct call missing only its own
+    label, and the label is recoverable because exactly one tool takes a
+    required argument called `spec`. A run lost its whole correcting pass to
+    this -- the loop saw text, decided the step was finished, and the fix the
+    model had just written was never executed.
+    """
+    claims: dict[str, set[str]] = {}
+    for tool in tools:
+        function = tool.get("function") or {}
+        required = ((function.get("parameters") or {}).get("required")) or []
+        if len(required) == 1 and function.get("name"):
+            claims.setdefault(str(required[0]), set()).add(str(function["name"]))
+    return {argument: next(iter(names)) for argument, names in claims.items() if len(names) == 1}
+
+
+def _calls_from(
+    parsed: Any, known_names: set[str], by_argument: dict[str, str] | None = None
+) -> list[Any]:
     """Pull tool calls out of one parsed JSON block.
 
     Handles both the bare `{"name": ..., "arguments": {...}}` shape and the
@@ -166,13 +207,22 @@ def _calls_from(parsed: Any, known_names: set[str]) -> list[Any]:
     if isinstance(parsed.get("calls"), list):
         found: list[Any] = []
         for entry in parsed["calls"]:
-            found.extend(_calls_from(entry, known_names))
+            found.extend(_calls_from(entry, known_names, by_argument))
         return found
 
     name = parsed.get("name")
     arguments = parsed.get("arguments")
     if name not in known_names or not isinstance(arguments, dict):
-        return []
+        # No envelope: is this block itself a tool's arguments? Only when one
+        # tool -- and one only -- takes a required argument by that name.
+        named = {
+            (by_argument or {}).get(key) for key in parsed if key in (by_argument or {})
+        }
+        if len(named) != 1 or not isinstance(parsed.get(next(iter(named), "")), object):
+            return []
+        name, arguments = next(iter(named)), parsed
+        if name not in known_names:
+            return []
     return [
         SimpleNamespace(
             id=uuid.uuid4().hex,

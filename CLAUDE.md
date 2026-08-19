@@ -20,6 +20,15 @@ You type "a mobile sign-in screen with email + password and a Google button," an
 system builds it on a real Figma canvas — tokens, components, and layout, not a flat pile
 of rectangles.
 
+It also **edits** a design that already exists: connect to a file, say "make every primary
+button use the accent colour", and it changes those nodes in place. Same harness, separate
+pipeline — see section 20 for why they are not the same job.
+
+And you do not have to type any of it. **Attach a screenshot** and it rebuilds what the
+screenshot shows; attach a spec document and it builds to that; **dictate** the instruction
+instead of typing it. All three become the same thing — words the pipeline already knows
+how to build from — see section 21.
+
 The agent does **not** know Figma from memory. It becomes competent through the harness:
 docs are retrieved into context on demand (section 9), work happens in small atomic steps,
 and every step is checked against ground truth — the file's metadata and its real geometry
@@ -134,6 +143,10 @@ Each part has one responsibility:
 | **Knowledge** (`knowledge/`) | Plugin API gotchas + typings; retrieves the relevant slice per step (section 9). |
 | **Bridge** (`bridge/`) | WebSocket server + message protocol. Sends JS to the plugin, matches responses by id, tracks which file is connected. |
 | **State** (`agent/state.py`) | Holds the plan, created node IDs, tokens, per-step results. Feeds the model concise summaries, never full history. |
+| **Reference** (`agent/reference.py`) | Attachments -> text: a screenshot read by a vision model, a spec read as-is. One conversion at the front, so nothing downstream needs to know about images (section 21). |
+| **Editor** (`agent/editor.py`) | The mirror of the renderer, for changing nodes that already exist: a declarative edit list compiled into correct Plugin API calls (section 20). |
+| **Inventory** (`agent/inventory.py`) | The canvas as an addressable index, so an edit can name a real node instead of guessing a selector (section 20). |
+| **Edit loop** (`agent/edit_loop.py`) | The edit pipeline: read the canvas -> adopt its styles -> plan changes -> apply and verify one at a time. |
 | **Web dashboard** (`web/`) | Optional browser UI: file gallery, credentials, setup guide, live run log. No agent logic. |
 
 The **Figma plugin** (`figma_plugin/`) is the only non-Python part. Keep it thin: execute
@@ -155,7 +168,11 @@ figma-agent/
 |
 |-- agent/
 |   |-- llm.py               # ModelClient — THE model swap point (section 5)
-|   |-- loop.py              # the orchestration loop (section 6)
+|   |-- loop.py              # the orchestration loop, CREATE mode (section 6)
+|   |-- edit_loop.py         # the orchestration loop, EDIT mode (section 20)
+|   |-- editor.py            # declarative edits -> Figma JS (section 20)
+|   |-- inventory.py         # the existing canvas, as addressable ids (section 20)
+|   |-- reference.py         # attachments -> reference text (section 21)
 |   |-- planner.py           # instruction -> design brief -> ordered plan
 |   |-- scaffold.py          # Python-authored Figma scripts (section 6a)
 |   |-- critic.py            # the visual gate + design-system checks (section 8)
@@ -201,6 +218,10 @@ figma-agent/
 |
 |-- tests/                   # no Figma, no network, no model — all fakes
     |-- test_bridge.py       # protocol round-trips + handshake + disconnects
+    |-- test_edit_loop.py    # edit mode end to end (section 20)
+    |-- test_editor.py       # the edit compiler, weighted to what it REFUSES
+    |-- test_inventory.py    # the canvas index, listing and id resolution
+    |-- test_reference.py    # attachments: decoding, refusing, describing (section 21)
     |-- test_loop.py         # loop logic with a fake ModelClient + fake bridge
     |-- test_critic.py      # the visual gate's geometry, contrast + design checks
     |-- test_requirements.py# requirement coverage, and its false-positive rules
@@ -271,7 +292,7 @@ which is exactly what the swap point is for.
 ### Cost discipline
 
 Debug the **harness** (does the loop close, do tools fire, do the gates block) against the
-fakes in `tests/` — 354 tests run with no network, no Figma and no model. Spend real model
+fakes in `tests/` — 367 tests run with no network, no Figma and no model. Spend real model
 calls on genuine design runs.
 
 ---
@@ -354,6 +375,9 @@ All of these exist because a live run burned a whole step budget without them:
 | `MAX_TOOL_TURNS_PER_STEP = 8` | A confused model can otherwise loop forever. |
 | Repeated-call guard | Identical calls are refused — one step ran the same `createPaintStyle` script 8×; another created 7 duplicate footer frames. **The guard is owned by `run_step`, so it spans every attempt**; when it lived in `converse_step` it reset with each retry's fresh conversation, which is how those 7 footers happened. |
 | Repair-mode retries | A retry that has nodes on the canvas is told to modify them, never to rebuild. See the note under the loop above. |
+| `MAX_RENDERS_PER_STEP = 3` | A second `render_ui` in one step REPLACES the first rather than being refused — a model that says "the previous render was missing the card background" is self-correcting, and refusing it meant the fix it had already written could never run. Bounded, because an endless rebuild is the other failure mode. |
+| `MAX_REFUSALS_PER_STEP = 3` | A refusal only teaches the model something if it then does something else. One live step was refused the same `get_metadata` five times and re-issued it every turn until the budget ran out. |
+| Ran a script, never said "done" | Counts as a **completed** step, not a failure. Failing it would delete a finished section over a missing sign-off. |
 | ~~`MAX_DOC_QUERIES_PER_STEP`~~ | Gone. It existed to stop steps burning their turns on `query_docs`; removing the tool removed the problem (section 9). |
 | "You replied with text" | If a step ends with no script ever executed, it is a FAILURE, not a success. |
 | `ERROR_HINTS` | Recurring errors map to their exact fix, fed back on retry (section 7). |
@@ -370,7 +394,7 @@ deterministic, unit-tested, and compiled as JavaScript in CI.
 |---|---|
 | **Screen frames** (`create_screens`) | The model tried `layoutSizingHorizontal = 'FILL'` on a child of the PAGE — never legal — and failed 3× in a row. Every "append into root frame" step then had no parent, so 7 of 10 steps failed. It also has no way to place several screens without overlapping them; positions are arithmetic, so Python owns them. |
 | **Reuse of an existing screen** | Re-running must *continue* a design, not stamp a second copy on top. Screens are matched to existing frames **by name**; a single-screen run additionally falls back to the old shape heuristic (an auto-layout frame, preferring one we made, then matching width). Anything new is placed clear of existing content. |
-| **Design tokens** (`bootstrap_tokens`) | Token steps failed more than any other: `createVariableSet`, `figma.createStyle`, collection-id-vs-object, invented mode ids. The palette is already spelled out in the model's own brief, so we parse the hex codes and write the API calls ourselves. |
+| **Design tokens** (`bootstrap_tokens`) | Token steps failed more than any other: `createVariableSet`, `figma.createStyle`, collection-id-vs-object, invented mode ids. The palette is spelled out in the request, so we parse the hex codes and write the API calls ourselves. **The USER'S instruction is read first, the brief only fills the gaps** — a run that read only the brief turned a nine-colour instruction into three tokens, because the brief had scattered the same colours into table cells (`1 px solid #E5E7EB`) that no `name: #hex` pattern can see. |
 | **Text styles** | Same story, plus font-style guessing. A fixed Inter type scale is created instead. |
 | **Layout auditing** (`agent/critic.py`) | Overlap and overflow are geometry, not judgement — section 7 says do arithmetic in Python. |
 | **Placeholder recovery** | When a section step exhausts its retries, a labelled `TODO — <section>` frame keeps the page's structure and makes the gap visible, instead of leaving a hole. Tokens/components get no placeholder: a fake component is worse than none. |
@@ -378,6 +402,10 @@ deterministic, unit-tested, and compiled as JavaScript in CI.
 | **Colour roles + contrast** (`describe_palette`, `readable_pairings`) | Token *names* come from the brief, so they can be `deep-navy`, `cta`, `soft-cream` — nothing tells the model which is a background and which is a foreground. It bound text to whatever sounded right and produced invisible copy that passed every gate, because geometry cannot see contrast. Roles are now derived from WCAG luminance and the legal fg/bg pairs are *measured* and handed over as fact. |
 | **The Plugin API itself** (`agent/renderer.py`) | The decisive one. A real 29-step run called `execute_figma_js` for EVERY step and lost most of them to `FILL can only be set on children of auto-layout frames`, `HUG can only be set on…`, `Reparenting would create a component inside a component`, `counterAxisAlignItems … received 'END'` and `findAll callback crashed`. None of those is a design mistake; all are mistakes about an API that never changes. A section step is now given `render_ui` and NOT `execute_figma_js`, so they are unreachable. Telling the model to prefer the renderer did not work — removing the alternative did. |
 | **Refusing component steps** (`planner._drop_component_steps`) | The same run planned five "Create a Button component" steps across five screens. Each either failed outright or left a loose component on the canvas that no section ever used. Components add nothing to a static mockup: consistency comes from the styles the harness already made and the renderer already applies. |
+| **Palette roles** (`assign_roles`, `complete_palette`) | Pure luminance ordering scrambled a nine-colour brief: `#E5E7EB` was ranked a *surface*, `#111827` became *text-muted*, and the near-black page fill was labelled *text*. A token whose NAME declares its job (`Border: #E5E7EB`) now wins over the arithmetic, two backgrounds are disambiguated by which one the text is readable on, and any role the brief left unfilled is MIXED from the two colours we do have rather than aliased onto the page fill. |
+| **Removing work that failed** (`discard_nodes`) | Every build is additive, so the attempt that ENDS a step left its output on the canvas with nothing to remove it. A run shipped a 1440x900 white void, a `TODO` band marking the gap that void already filled, and four stacked copies of one sign-in form. |
+| **Refusing to split a screen sideways** (`_collapse_side_by_side`) | A screen frame is a VERTICAL auto-layout, so "add the left panel" then "add the right panel" appends two full-width bands and the form lands UNDER the artwork. Both bands are individually well-formed, so no gate can see it. The planning prompt says this; the prompt was ignored. |
+| **Field labels** (`_without_duplicate_labels`) | `input` renders its own label, so a spec that also writes the label out produced "Email" stacked on "Email". The vision critic caught it correctly — but judgement cannot fail a step, so a whole repair budget went on it and nothing was fixed. The renderer owns field layout, so the renderer resolves the collision. |
 | **Tracking what's been built** (`record_section`) | `existing_sections` was filled in once, only when reusing a root frame — so on a fresh run every step was told the page was empty and duly rebuilt what was already there. Each completed section (and each TODO placeholder) is now recorded as it lands. |
 
 Consequence for the planner: it is told the root frame and all styles **already exist** and
@@ -428,7 +456,7 @@ backwards is how a critic starts replacing working sections with `TODO` placehol
 ### 8a. Deterministic geometry analysis (always on, free)
 
 `find_layout_defects(tree)` reads the real node tree — position, size, visibility, text and
-font size, four levels deep — and computes what is visibly wrong. No model, no tokens, and
+font size, `critic.MAX_TREE_DEPTH` (8) levels deep — and computes what is visibly wrong. No model, no tokens, and
 it cannot hallucinate a defect:
 
 | Defect | What it catches |
@@ -437,8 +465,9 @@ it cannot hallucinate a defect:
 | `collapsed-text` | Text under 8px wide — needs `textAutoResize` and an explicit width. |
 | `clipped-text` | Node height smaller than its own font size, so glyphs are cut off. |
 | `overflow` | A child extending outside its parent's bounds. |
+| `duplicate-section` | A section that rebuilds what a sibling already has. A dashboard run built its sidebar twice — once alone, then again inside the shell — and both copies were individually well-formed, so only their identical text gives them away. |
 | `overlap` | Two siblings overlapping by more than 2px — **only** checked when the parent is not auto-layout, since auto-layout cannot produce overlap (avoids false positives). |
-| `empty-frame` | A frame over 40×40 with no children: a blank region. Smaller ones are icon placeholders and ignored. |
+| `empty-frame` | A frame over 40×40 with no children **and nothing painted in it** — or painted the same colour as what is behind it. The fill test matters: the renderer's own `box` (chart areas, image placeholders, the glowing shapes in a hero) is a deliberately childless FILLED block, so without it the harness failed its own output. Frames under 40×40 are icon placeholders and ignored. |
 | `invisible` / `empty-text` | Hidden nodes and text with no characters. |
 | `contrast` | Text under ~3:1 against its resolved background — **invisible copy**. See 8b. |
 
@@ -565,6 +594,35 @@ The false-positive column is the one that matters. A critic that fails good sect
 than no critic: it burns retries and, before the "never placeholder on a visual complaint"
 rule (above), it would have replaced real sections with `TODO` frames. Test any candidate
 against a *good* section, not just a broken one.
+
+### 8g. The run FIXES what it finds (`repair_remaining_defects`)
+
+Everything above only ever *reported* at the end: a finished run listed "2
+layout issues" and "6 design-system notes" in the dashboard and had done
+nothing about any of them, and a step that exhausted its retries left a `TODO`
+placeholder that stayed one. All of it is repairable — the section exists, we
+know exactly what is wrong with it, and `render_ui` replaces sections — so the
+final validation now has another go before reporting.
+
+- Defects are attributed to the **top-level section** that contains them,
+  because that is the unit `render_ui` can rebuild.
+- A `TODO` placeholder is itself a target. It has no defects of its own (it is
+  a tidy little frame), so nothing else would ever come back to it.
+- Bounded on both axes (`FINAL_REPAIR_PASSES`, `MAX_FINAL_REPAIRS`) and it
+  stops early when a pass changes nothing — an unbounded polish loop is how a
+  five-minute build becomes a twenty-minute one.
+
+Two related fixes, both cases of the harness marking its own homework:
+
+- **The placeholder failed the design checks.** It used 14px text (off the
+  ramp) and two hardcoded greys, so six of a run's "design system notes" were
+  about the harness's own scaffolding. It now uses the token styles and a ramp
+  size, and `TODO` frames are exempt from the design review — a gap marker is
+  not a design decision.
+- **An input with no placeholder rendered an empty text node**, so its box came
+  back as "408x56 frame is empty" — a defect the harness caused and reported.
+  The renderer now falls back to a hint derived from the label, and refuses an
+  empty `text` node outright.
 
 ### How it gates
 
@@ -953,7 +1011,7 @@ Do not start a phase until the previous one runs end to end.
 
 ## 16. Testing
 
-**354 tests, no network, no Figma, no model.** `pytest` runs the whole suite in ~7 seconds.
+**367 tests, no network, no Figma, no model.** `pytest` runs the whole suite in ~7 seconds.
 
 | File | Covers |
 |---|---|
@@ -1048,8 +1106,15 @@ which is evidence a password field was built, not proof it was built well. Read 
 |---|---|
 | Change the model / provider | `.env` or the dashboard's Settings (only `agent/llm.py` defines access) |
 | Turn on / change the vision critic | `CRITIC_*` in `.env` (section 8b) |
+| Set the model that reads attachments | Settings → Vision model, or `VISION_*` in `.env` (section 21) |
 | Handle a new provider quirk | `agent/llm.py` (section 5) |
-| Change how a run is orchestrated | `agent/loop.py` |
+| Change how a run is orchestrated | `agent/loop.py` (create) / `agent/edit_loop.py` (edit) |
+| Add an edit operation | `agent/editor.py` — `OPS` + the method, then the schema in `tools/registry.py` (section 20) |
+| Change how an edit finds its target | `agent/inventory.py` — `find` / `resolve` (section 20) |
+| Change what a screenshot is read for | `agent/prompts.py` — `IMAGE_REFERENCE_PROMPT` (section 21) |
+| Accept another attachment type | `agent/reference.py` — `IMAGE_TYPES` / `TEXT_TYPES` |
+| Change how a colour gets its ROLE | `agent/scaffold.py` — `assign_roles` / `_ROLE_WORDS` (section 6a) |
+| Add a `kind` the spec can use | `agent/renderer.py` — `node()` dispatch + `ALIASES` |
 | Change what the harness builds itself | `agent/scaffold.py` (section 6a) |
 | Tune the visual gate / add a defect check | `agent/critic.py` (section 8) |
 | Add a design-system rule (spacing, type, tokens) | `agent/critic.py` — `_check_design` (section 8c) |
@@ -1093,6 +1158,97 @@ which is evidence a password field was built, not proof it was built well. Read 
 
 ---
 
+## 18a. Stopping a run
+
+A run is minutes of model calls and Figma round trips, and until now the only
+way out was killing the process. `POST /api/run/stop` sets an event the loop
+checks at every safe point: between steps, between attempts, and between
+tool-calling turns.
+
+Stopping is **cooperative**, and the wording matters because the promise has to
+be one the code can keep. A model call or a Figma round trip already in flight
+cannot be interrupted, so what stopping guarantees is that no NEW work starts —
+in practice the run ends within one model call. The UI says "Stopping after the
+current step" rather than implying it halts instantly.
+
+Three properties make it safe rather than merely possible:
+
+- **The work is kept.** `Cancelled` unwinds the stack, and the nodes the
+  interrupted step had already created are recorded on the way out. A
+  half-finished design is still the user's design, and reporting it as having
+  built nothing while they can see the nodes is worse than useless.
+- **Only the cheap finishing work runs.** The screens are still photographed
+  and the layout still reviewed (both bridge-only), but the end-of-run repair
+  pass is skipped outright — spending model calls on a run somebody just asked
+  to stop is precisely what they asked not to happen.
+- **`stopped` is its own outcome**, not a failure. It is reported separately
+  from `success`, shown as its own badge, and recorded in history as `stopped`,
+  because "you stopped it" and "it broke" are different things to be told.
+
+---
+
+## 18a2. Fixing what the review finds (`repair_remaining_defects`)
+
+Every gate in this project ran *while* the design was being built, and judged
+only the section the current step had just made. So a defect could survive
+simply because the step that caused it had already passed — and the run ended
+by **reporting** it. A real run finished with "2 layout issues", "6
+design-system notes" and two `TODO` placeholders listed in the dashboard, and
+nothing done about any of them.
+
+All of that is repairable. The section exists, the defect names the node, and
+`render_ui` replaces a section rather than editing it. So after the last step:
+
+1. Re-read every screen and attribute each remaining defect to the **top-level
+   section** that contains it — that is the unit `render_ui` can rebuild.
+2. Rebuild those sections, with the specific problems as the instruction.
+3. A `TODO` placeholder counts as a target: it is a section that was never
+   built, and it has no defects of its own, so nothing else would revisit it.
+4. Re-check, and stop early if a pass changed nothing.
+
+Bounded on three axes, because a polish loop is how a five-minute build becomes
+a twenty-minute one: `FINAL_REPAIR_PASSES` (2), `MAX_FINAL_REPAIRS` (8), and a
+no-improvement early exit. It is a user preference (`final_repair`), on by
+default, because it costs model calls.
+
+---
+
+## 18b. One screen at a time (the dashboard's pager)
+
+A five-frame design photographed as one page renders at a size where nothing on
+any screen is legible — the picture you most want after a run was the least
+useful thing it produced. `capture_screens` renders each frame separately and
+the result view pages through them with ‹ › and dots.
+
+The images are **not** in the status payload. `/api/status` is polled every
+1.5s, so five full-page PNGs in it is megabytes a minute for pictures that never
+change; the payload carries `screen_names` (615 bytes for five screens) and each
+image is fetched once from `/api/screens?i=N`.
+
+---
+
+## 18c. When the plugin goes away
+
+Figma being closed, the file being switched, or the socket timing out is the
+common way a run ends — and it used to surface as `Run crashed`, with every node
+thrown away. A real run built two complete screens, lost the bridge during its
+final repair, and reported nothing.
+
+The nodes are on the user's canvas whether or not the run finished, so `_run`
+catches the transport failure and returns what was built. Three rules keep the
+report honest:
+
+- **Nothing in the wind-up touches the bridge.** Whatever killed the run has
+  usually taken the bridge with it, and a tidy-up that throws again lands back
+  where it started.
+- **`ended_early` is its own outcome**, like `stopped`. "Figma disconnected" and
+  "the design is wrong" are different things to be told, and the dashboard says
+  so ("Figma disconnected — this is what was built").
+- **It is never a success.** The work is real, but the run never reached its own
+  final validation, so nothing about it has been checked.
+
+---
+
 ## 19. Observability (`agent/metrics.py`)
 
 Every claim in this file used to be argued from reading the code. That is honest while there
@@ -1131,3 +1287,231 @@ run also logs one summary line, and `RunResult.metrics` is saved with benchmark 
 **A metric must never break the thing it measures.** The status endpoint reads the recorder
 from the HTTP thread while the run thread writes it; a torn read returns `None` rather than
 500ing, because a skipped progress frame is a far better outcome than a dead dashboard.
+
+---
+
+## 20. Edit mode — changing a design that already exists
+
+Everything above builds a design from nothing. Edit mode is the other half:
+connect to a file that already has work in it and say *"make every primary
+button use the accent colour"* or *"add a Forgot password link under the
+password field"*.
+
+```bash
+python main.py --edit "make every primary button use the accent colour"
+# or the dashboard's Create / Edit switch above the instruction box
+```
+
+### It is a separate pipeline on purpose
+
+Create and edit are the same shape — read, plan, one step at a time, gate — and
+merging them would make both worse:
+
+| | Create | Edit |
+|---|---|---|
+| Ownership | Owns its frame and every id in it | Owns nothing; every target is the user's work |
+| A mistake | Adds something ugly beside the good work | **Damages** something that was already right |
+| The gate asks | "Is this section well formed?" | "Is this node still well formed, and did the edits actually apply?" |
+| Screens | Plans them | Must never create one |
+
+What they share is *imported*, not copied: the model plumbing from `loop`, the
+palette roles from `scaffold`/`renderer`, the geometry and contrast checks from
+`critic`, and — for `insert` and `replace` — the renderer itself.
+
+### The mode is declared, never inferred
+
+Guessing from the wording means an edit request misread as a build stamps a
+second screen beside the design it was supposed to change, and undoing that is
+manual work in someone else's file. The dashboard has an explicit switch; the
+CLI has `--edit`.
+
+An **empty file is refused** rather than quietly falling back to create mode,
+without spending a single model call.
+
+### Targeting: the model names ids, the harness verifies them
+
+The one thing that decides whether an edit lands is whether it points at the
+right node, and a model has no way to refer to a node it cannot see. So
+`agent/inventory.py` reads the canvas into an addressable index and the prompt
+carries it as a listing, **id first on every line** — the id is the only part
+that must be copied exactly, and burying it after the name made it likelier to
+be paraphrased.
+
+```
+PAGE 'Nexora'
+  1:2  FRAME  "Login"  1440x900  #FFFFFF
+    1:3  FRAME  "Auth Card"  440x520  #FFFFFF
+      1:4  TEXT  "Heading"  text='Welcome back'  32px  300x40
+      1:9  FRAME  "Button / Log in"  372x48  #6C5CE7
+```
+
+- **The user's Figma selection is the answer to "which one?"** The inventory
+  read returns `figma.currentPage.selection`; when it is not empty the listing
+  is scoped to it (plus its descendants — selecting a card means its contents)
+  and the prompt says so.
+- **`resolve` checks every id before compiling.** An id the model invented never
+  reaches Figma. Figma's own error for a missing node names neither the bad id
+  nor the real ones, so a model that gets it simply invents another; the message
+  the harness returns names the mistake and points back at the listing.
+- **`find` is arithmetic, so Python does it.** `{"name": "Button", "screen":
+  "Login"}` is matched, ranked and expanded here. A selector the model cannot
+  express is a selector it cannot get wrong — and a selector matching nothing is
+  an *error*, never an empty edit, because applying zero changes and reporting
+  success is the most confusing possible outcome.
+- The reader is `critic.NODE_READER_JS`, the same one the visual gate uses. A
+  second reader would drift, and "what the agent sees" would stop matching
+  "what is checked".
+
+### `edit_ui` — the only build tool an edit step gets
+
+`render_ui` is **not** offered: building a fresh section is how "make the button
+purple" turns into a second copy of the whole screen. Structural changes go
+through `insert` and `replace`, which are anchored to a node that already
+exists and reuse the renderer to build their subtree.
+
+```json
+[{"op": "set_fill", "target": "1:9",  "color": "accent"},
+ {"op": "set_text", "target": "1:10", "value": "Sign in"},
+ {"op": "insert",   "parent": "1:3", "index": 3, "spec": {"kind": "text", "value": "..."}}]
+```
+
+Ops: `set_fill`, `set_text`, `set_text_style`, `set_size`, `set_spacing`,
+`set_radius`, `set_visible`, `set_name`, `reorder`, `delete`, `insert`,
+`replace`. Deliberately small — a vocabulary the model cannot overreach is worth
+more than one that covers every Figma property.
+
+`agent/editor.py` owns the API, exactly as the renderer does for building:
+
+- **`set_text` loads the font the node already uses.** Guessing a style string
+  killed a live run ("Inter SemiBold" — the real style has a space). Editing
+  never has to guess: the node knows. A `figma.mixed` font is handled rather
+  than crashed on.
+- **`set_size` on an auto-layout child sets a fixed sizing mode first**, or the
+  layout silently undoes the resize and the edit reports success while nothing
+  visibly changed.
+- **Colours are roles or real tokens; a hex is refused** (golden rule 5).
+- **Spacing stays on the 8px scale and text styles stay on the ramp**, by being
+  names rather than numbers.
+
+### Three safety properties
+
+1. **Nothing is destructive by default.** `delete` is the only op that removes
+   anything, nothing else implies it, and it **refuses to delete a top-level
+   screen frame** — far too much damage for one mis-parsed word. Delete the
+   section inside it instead.
+2. **The batch is not atomic, and says so.** Atomicity is right for building one
+   section and wrong for a batch of independent edits: one stale target would
+   discard nine good changes. Each edit is wrapped, and the script returns
+   `appliedEdits` and `failedEdits` separately — so a retry is told *exactly*
+   which edit failed and is told not to re-apply the ones that worked. A step
+   that only partly lands is reported as partly applied, because pretending
+   nothing happened sends the user looking for changes that are really there.
+3. **The gate judges only what the edit touched.** The file is the user's own
+   work and may well have had problems before the agent arrived. Failing an edit
+   for one of those would have the agent undoing a change it was asked to make
+   in order to fix something nobody mentioned.
+
+### It adopts the file's styles rather than imposing its own
+
+`adopt_existing_styles` reads the file's real paint and text styles and derives
+the palette roles from those. Creating a fresh set would mean "make the button
+purple" introduces a *second*, slightly different purple that no other node
+references — precisely the untokenised drift section 8c exists to catch. A file
+with no colour styles is a warning, not a silent hardcoded fill.
+
+The canvas is **re-read between steps**: an edit changes what the ids mean — a
+`replace` makes the old id dead — so a stale listing would have the next step
+targeting a node that is gone.
+
+### What edit mode deliberately does not do
+
+- No vision critic and no end-of-run repair pass. Both judge whether a design is
+  *good*; an edit run is not being asked for an opinion about the user's design,
+  only to make the change. Unrequested changes are damage.
+- No screens, no tokens, no scaffolding. It never adds to a file what the file
+  did not ask for.
+
+---
+
+## 21. Saying what you want: attachments and dictation
+
+A design request is not always something you can type. Sometimes you have a
+screenshot of the thing you want, or a spec document someone sent you, or your
+hands are busy. All three now reach the same place: the text the pipeline
+already knows how to build from.
+
+```bash
+python main.py --attach reference.png "rebuild this for Nexora AI"
+python main.py --attach brand.md --attach hero.png "a landing page to this spec"
+```
+
+In the dashboard: a paperclip and a microphone next to the Run button. You can
+also **drag a file onto the composer or paste a screenshot straight in**, which
+is how a screenshot usually arrives.
+
+### One conversion, at the front, into words
+
+The loop, the planner, the scaffold, the renderer and the critic already work
+from a written instruction, and none of them needed to learn about images:
+
+```
+screenshot.png ──► [vision model] ──┐
+spec.md        ──► [read as text] ──┴──► RunState.references ──► brief, screens, PALETTE
+```
+
+The vision prompt (`IMAGE_REFERENCE_PROMPT`) is shaped to feed the stages that
+come next, not to be nice prose. It asks for the colours as `Name: #RRGGBB`,
+using the exact role names `Background/Surface/Border/Text/Text muted/Accent` —
+**because that is the shape `scaffold.extract_palette` reads and
+`assign_roles` recognises** (section 6a). Get that wrong and a screenshot's
+colours never become tokens; the design would be laid out like the reference
+and coloured like nothing at all. It also asks for every visible string quoted
+exactly, because real copy is the difference between a rebuild and a wireframe.
+
+### `references` is not the instruction, and that distinction is load-bearing
+
+`RunState.instruction` stays the user's own words. `RunState.references` holds
+what came out of the attachments, and `design_source()` is the two together.
+
+| Reads | What it uses | Why |
+|---|---|---|
+| The brief, the screen plan, the palette | `design_source()` | An attached screenshot describes the design at least as well as the sentence does — and its colours are *facts about a real image*, the best palette source available. |
+| `agent/requirements.py` | `instruction` **only** | Section 8d. The vision output is the model's own words; letting it become the instruction would let the agent write its own homework and then mark it complete, quietly removing the one check it does not grade. |
+
+### Nothing is ever silently ignored
+
+The worst possible outcome here is not an error — it is a run that accepted
+your screenshot, ignored it, and built something generic while you watched. So:
+
+- **Type and size are checked before the run starts**, in `reference.from_payload`,
+  and an unusable attachment is a 400 the user can read rather than a run that
+  spends model calls and *then* reports it could not open the file. Limits:
+  6 files, 6MB each, 16MB total, text trimmed at 6k characters (the whole
+  conversation is resent every turn, so a long spec would crowd out the palette).
+- **An image with no vision model configured is refused**, naming the control
+  that fixes it. `Settings -> Vision model` really exists — `EDITABLE` in
+  `web/settings_store.py` includes `vision_model_name`, and
+  `Settings.vision_settings()` falls through `VISION_* -> CRITIC_* -> the main
+  model`, so naming a multimodal model is usually the only thing to do.
+- **A PDF is refused with the thing to do instead** ("export the page as PNG"),
+  rather than being parsed badly. Parsing PDFs needs a dependency this project
+  does not want, and a half-read spec is worse than a refused one.
+- **A vision model that errors on one image warns and continues.** One bad
+  attachment must not take down a run that has five good ones.
+
+### Dictation runs in the browser
+
+The microphone uses the Web Speech API — no audio upload, no transcription
+endpoint, no key, no dependency, and nothing added to the stdlib-only server.
+It appends to whatever is already typed rather than replacing it, because
+dictation is normally used to finish a sentence. Two things worth knowing:
+
+- It stops the moment a run starts. A microphone that stays live because you
+  looked away is not something to leave to chance.
+- Chrome, Edge and Safari implement it; Firefox does not. An unsupported
+  browser is told so, rather than given a button that does nothing. Note that
+  the browser's speech service is the vendor's, not local.
+
+Attachments work in **edit mode** too — "make it look like this" is a real
+request — and the reference text reaches both the edit planner and every edit
+step.

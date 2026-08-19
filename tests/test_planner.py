@@ -132,3 +132,41 @@ def test_a_single_screen_plan_carries_no_screen_framing():
     planner.make_plan("brief", RunState(instruction="x"), RecordingLLM())
 
     assert "THE SCREEN YOU ARE PLANNING" not in captured["user"]
+
+
+# ---- a real trace: a split screen came out as stacked bands ----------------
+
+
+def test_a_side_by_side_screen_is_collapsed_into_one_step():
+    """A screen frame is a VERTICAL auto-layout, so every step appends a
+    full-width band beneath the last. Planning "add the left panel" then "add
+    the right panel" produced the form UNDERNEATH the artwork -- and no gate can
+    see it, because both bands are individually well-formed."""
+    plan = [
+        "Add the left visual panel with gradient background and glowing shapes, into the frame.",
+        "Add the right auth panel form with logo, heading, and inputs, into the frame.",
+        "Add the right auth panel supporting text, divider and prompt, into the frame.",
+    ]
+
+    collapsed = planner._collapse_side_by_side(plan, "Login")
+
+    assert len(collapsed) == 1
+    for region in ("left visual panel", "right auth panel form", "supporting text"):
+        assert region in collapsed[0], f"{region!r} was dropped, not merged"
+
+
+def test_a_stacked_scrolling_page_is_left_alone():
+    """Bands really are stacked on a landing page -- collapsing them would undo
+    the one case where splitting a screen is correct."""
+    plan = [
+        "Add the hero section into the frame.",
+        "Add the features section into the frame.",
+        "Add the footer into the frame.",
+    ]
+
+    assert planner._collapse_side_by_side(plan, "Landing") == plan
+
+
+def test_a_single_step_screen_is_never_rewritten():
+    plan = ["Add the sign-in card with email and password, into the frame."]
+    assert planner._collapse_side_by_side(plan, "Login") == plan

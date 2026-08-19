@@ -166,6 +166,32 @@ h1 { font-size: 26px; font-weight: 600; letter-spacing: -.025em; margin: 0 0 6px
   border: 0; outline: 0; padding: 20px 20px 8px; font-size: 15px; line-height: 1.65;
 }
 #instruction::placeholder { color: var(--text-4); }
+.mode-switch { display: inline-flex; gap: 2px; padding: 3px; margin: 0 0 10px;
+  background: var(--bg-3); border-radius: var(--radius-md); }
+.mode-opt { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
+  border: 0; border-radius: calc(var(--radius-md) - 3px); background: transparent;
+  color: var(--text-3); font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
+.mode-opt svg { width: 14px; height: 14px; }
+.mode-opt:hover { color: var(--text-1); }
+.mode-opt.on { background: var(--bg-1); color: var(--text-1); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.mode-note { margin: -4px 0 10px; font-size: 12px; color: var(--text-3); }
+.icon-btn { display: inline-grid; place-items: center; width: 30px; height: 30px; flex: none;
+  border: 0; border-radius: var(--radius-md); background: transparent; color: var(--text-3);
+  cursor: pointer; }
+.icon-btn svg { width: 16px; height: 16px; }
+.icon-btn:hover { background: var(--bg-3); color: var(--text-1); }
+.icon-btn.on { background: rgba(239,68,68,.14); color: #ef4444; }
+.icon-btn.on svg { animation: micpulse 1.4s ease-in-out infinite; }
+@keyframes micpulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+.attach-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; max-width: 260px; padding: 4px 8px;
+  background: var(--bg-3); border-radius: var(--radius-md); font-size: 12px; color: var(--text-2); }
+.chip .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip .chip-size { color: var(--text-4); flex: none; }
+.chip button { border: 0; background: none; color: var(--text-4); cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 0 2px; flex: none; }
+.chip button:hover { color: var(--text-1); }
+.chip.bad { background: rgba(239,68,68,.12); color: #ef4444; }
 .composer-foot { display: flex; align-items: center; gap: 8px; padding: 10px 12px 12px 16px; border-top: 1px solid var(--border-subtle); }
 .composer-hint { flex: 1; font-size: 12px; color: var(--text-3); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -216,6 +242,9 @@ h1 { font-size: 26px; font-weight: 600; letter-spacing: -.025em; margin: 0 0 6px
 .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 99px; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
 .badge.waiting_for_file, .badge.running { background: rgba(245,158,11,.14); color: var(--warning); }
 .badge.done  { background: rgba(34,197,94,.14); color: var(--success); }
+.badge.stopping, .badge.stopped { background: var(--bg-4); color: var(--text-2); }
+.status-badge.stopped { background: var(--bg-4); color: var(--text-2); }
+.result-hero.stopped .result-ico { background: var(--bg-4); }
 .badge.error { background: rgba(239,68,68,.14); color: var(--error); }
 .spin { width: 10px; height: 10px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -414,6 +443,29 @@ code { font-family: var(--mono); font-size: 11.5px; background: var(--bg-3); bor
 .stat-num { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
 .stat-lbl { font-size: 10.5px; color: var(--text-4); text-transform: uppercase; letter-spacing: .06em; margin-top: 1px; }
 
+/* One screen at a time. Five frames rendered side by side into a single strip
+   are too small to read anything in, which defeats the point of showing the
+   result at all. */
+.pager { padding: 15px 17px; }
+.pager-stage { position: relative; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); overflow: hidden; background: var(--bg-3); }
+/* A Figma page screenshot is routinely 1440x5200. At 100% width that renders
+   as a 2600px wall of image you have to scroll past to reach anything else, so
+   a screen is fitted into a viewport-sized stage instead. */
+.pager-stage img { display: block; width: 100%; max-height: 70vh; height: auto; object-fit: contain; }
+.pager-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 36px; height: 36px; display: grid; place-items: center; border-radius: 50%; cursor: pointer; border: 1px solid var(--border-focus); background: var(--glass); backdrop-filter: blur(12px); color: var(--text-1); transition: opacity .18s var(--ease), background .18s var(--ease); }
+.pager-nav:hover:not(:disabled) { background: var(--bg-4); }
+.pager-nav:disabled { opacity: .3; cursor: default; }
+.pager-nav svg { width: 16px; height: 16px; }
+.pager-nav.prev { left: 10px; }
+.pager-nav.next { right: 10px; }
+.pager-bar { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.pager-name { font-size: 13px; font-weight: 600; }
+.pager-count { font-size: 11.5px; color: var(--text-4); font-variant-numeric: tabular-nums; }
+.pager-dots { display: flex; gap: 6px; margin-left: auto; }
+.pager-dot { width: 7px; height: 7px; border-radius: 50%; border: 0; padding: 0; cursor: pointer; background: var(--bg-4); transition: background .18s var(--ease), transform .18s var(--ease); }
+.pager-dot:hover { background: var(--text-4); }
+.pager-dot.on { background: var(--accent); transform: scale(1.25); }
+
 .chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 17px 0; }
 .chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 99px; font-size: 11.5px; border: 1px solid var(--border-subtle); background: var(--bg-3); color: var(--text-2); }
 .chip.miss { border-color: rgba(239,68,68,.30); color: var(--error); background: rgba(239,68,68,.07); }
@@ -574,11 +626,44 @@ details.drawer > summary:hover { color: var(--text-1); }
         </div>
 
         <div class="composer">
+          <!-- Create vs Edit is DECLARED, never inferred from the wording:
+               an edit request misread as a build stamps a second screen beside
+               the design it was meant to change, and undoing that is manual
+               work in someone else's file. -->
+          <div class="mode-switch" role="tablist" aria-label="What this run does">
+            <button class="mode-opt on" id="mode-create" role="tab" aria-selected="true">
+              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              Create
+            </button>
+            <button class="mode-opt" id="mode-edit" role="tab" aria-selected="false">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+              Edit
+            </button>
+          </div>
           <textarea id="instruction" placeholder="Describe the screen to build — e.g. a desktop landing page for a scheduling app, with a nav bar, hero, three feature columns and a footer."></textarea>
+          <div class="attach-row" id="attach-row" style="display:none"></div>
           <div class="composer-foot">
+            <input type="file" id="attach-input" multiple accept=".png,.jpg,.jpeg,.webp,.gif,.txt,.md,.markdown,.json,.csv,.css,.scss,.html,.htm,.svg,.yaml,.yml,.ts,.tsx,.js,.jsx,.xml" style="display:none">
+            <!-- Attach a screenshot and the agent rebuilds what it shows; attach
+                 a spec and it builds to it. Read once, up front, into the same
+                 text the pipeline already knows how to build from. -->
+            <button class="icon-btn" id="attach-btn" title="Attach a screenshot or a spec" aria-label="Attach a file">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+            </button>
+            <!-- Dictation happens in the BROWSER (Web Speech API): no audio
+                 upload, no extra dependency, no key. Unsupported browsers get
+                 told so rather than a dead button. -->
+            <button class="icon-btn" id="mic-btn" title="Dictate the instruction" aria-label="Dictate">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4"/></svg>
+            </button>
             <span class="composer-hint" id="hint">Select a file, then describe what to build.</span>
             <button class="btn" id="run-btn" disabled>
               <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Run
+            </button>
+            <!-- Replaces Run while a run is in progress: one control, one job,
+                 in the place the user is already looking. -->
+            <button class="btn danger" id="stop-btn" style="display:none">
+              <svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg> Stop
             </button>
           </div>
         </div>
@@ -653,6 +738,14 @@ details.drawer > summary:hover { color: var(--text-1); }
             <label>Model <span class="tag" id="tag-model">unset</span></label>
             <input id="in-model" placeholder="gpt-oss:20b-cloud" autocomplete="off" spellcheck="false" />
             <div class="help"><strong>Must support tool calling.</strong> A multimodal model also enables screenshot critique.</div>
+          </div>
+          <div class="field">
+            <label>Vision model <span class="tag" id="tag-vision">unset</span></label>
+            <input id="in-vision" placeholder="gemma4:cloud" autocomplete="off" spellcheck="false" />
+            <div class="help">Optional. Needed to <strong>attach a screenshot</strong> and to critique
+              rendered screens. Uses the same endpoint and key as above unless you set VISION_BASE_URL in
+              <code>.env</code>. Verify a candidate with <code>python check_critic.py</code> — model names
+              retire, and one that silently ignores images invents every defect it reports.</div>
           </div>
           <div class="setting-row">
             <button class="btn" id="btn-save">Save</button>
@@ -908,13 +1001,39 @@ details.drawer > summary:hover { color: var(--text-1); }
     updateHint();
   }
 
+  var attachments = [];   // {name, size, data_base64, error}
+
   function updateHint() {
     var sel = filesByKey[selectedKey];
+    // While a run is in progress the composer is not the thing to talk about.
+    if (busy) {
+      $("hint").textContent = lastStatus && lastStatus.status === "stopping"
+        ? "Stopping once the current step finishes…"
+        : ((lastStatus && lastStatus.mode === "edit" ? "Editing" : "Building")
+           + "… you can stop this at any time.");
+      $("run-btn").disabled = true;
+      $("run-btn").style.display = "none";
+      $("stop-btn").style.display = "";
+      return;
+    }
     if (!settings || !settings.configured) $("hint").textContent = "Add your model credentials in Settings to get started.";
     else if (!sel) $("hint").textContent = "Select a file in the Files tab, then describe what to build.";
-    else if (sel.connected) $("hint").textContent = "Ready — “" + sel.file_name + "” is open with the plugin running.";
+    else if (attachments.length) {
+      var usable = attachments.filter(function (a) { return !a.error; }).length;
+      var bad = attachments.length - usable;
+      $("hint").textContent = bad
+        ? bad + " attachment(s) can’t be used — remove them to run."
+        : usable + " attachment(s) will be read first, then " +
+          (runMode === "edit" ? "used as the reference for your changes." : "built from.");
+    }
+    else if (sel.connected) $("hint").textContent = runMode === "edit"
+      ? "Editing “" + sel.file_name + "” — select what you want changed in Figma, or leave nothing selected."
+      : "Ready — “" + sel.file_name + "” is open with the plugin running.";
     else $("hint").textContent = "“" + sel.file_name + "” isn’t connected. Running will wait until you open it.";
-    $("run-btn").disabled = busy || !selectedKey || !settings || !settings.configured;
+    var hasBadAttachment = attachments.some(function (a) { return !!a.error; });
+    $("run-btn").disabled = busy || !selectedKey || !settings || !settings.configured || hasBadAttachment;
+    $("run-btn").style.display = busy ? "none" : "";
+    $("stop-btn").style.display = busy ? "" : "none";
     renderReady(null);   // selecting a file can unblock the next step
   }
 
@@ -990,6 +1109,7 @@ details.drawer > summary:hover { color: var(--text-1); }
   /* One honest verdict per run. "Success" on a run that created nothing is the
      kind of green tick that makes every other number here untrustworthy. */
   function historyVerdict(r) {
+    if (r.status === "stopped") return { cls: "stopped", label: "Stopped" };
     if (r.status === "error") return { cls: "bad", label: "Failed" };
     if (!r.created_node_count) return { cls: "bad", label: "Nothing built" };
     if (r.failed_step_count) return { cls: "warn", label: "Partial" };
@@ -1010,6 +1130,8 @@ details.drawer > summary:hover { color: var(--text-1); }
 
   /* The one thing worth saying about a run that did not go cleanly. */
   function historyNote(r) {
+    if (r.status === "stopped")
+      return { cls: "", text: "You stopped this run, so the design is unfinished." };
     if (r.status === "error")
       return { cls: "bad", text: r.error || "The run stopped before it finished." };
     if (!r.created_node_count)
@@ -1095,7 +1217,9 @@ details.drawer > summary:hover { color: var(--text-1); }
       : "Stored on this machine only, sent nowhere but your endpoint.";
 
     var labels = { env: "from .env", ui: "saved here", unset: "unset" };
-    [["tag-base", "model_base_url"], ["tag-key", "model_api_key"], ["tag-model", "model_name"]].forEach(function (p) {
+    $("in-vision").value = s.vision_model_name || "";
+    [["tag-base", "model_base_url"], ["tag-key", "model_api_key"], ["tag-model", "model_name"],
+     ["tag-vision", "vision_model_name"]].forEach(function (p) {
       var src = (s.sources || {})[p[1]] || "unset";
       $(p[0]).className = "tag " + (src === "unset" ? "" : src);
       $(p[0]).textContent = labels[src];
@@ -1119,6 +1243,8 @@ details.drawer > summary:hover { color: var(--text-1); }
       "After each section, check the real geometry for collapsed text, overlap and overflow \u2014 and retry to fix what it finds."],
     auto_select: ["Auto-select connected file",
       "Preselect whichever file is currently open with the plugin running."],
+    final_repair: ["Fix issues at the end",
+      "After the design is built, go back over every screen and rebuild the sections that are still broken, unfinished or duplicated. Costs a few extra model calls."],
     max_retries: ["Retries per step",
       "Attempts before a step falls back to a labelled placeholder."],
     max_steps: ["Max steps",
@@ -1171,7 +1297,11 @@ details.drawer > summary:hover { color: var(--text-1); }
   }
 
   $("btn-save").onclick = function () {
-    var payload = { model_base_url: $("in-base").value.trim(), model_name: $("in-model").value.trim() };
+    var payload = {
+      model_base_url: $("in-base").value.trim(),
+      model_name: $("in-model").value.trim(),
+      vision_model_name: $("in-vision").value.trim()
+    };
     var key = $("in-key").value.trim();
     if (key) payload.model_api_key = key;
     $("btn-save").disabled = true; $("test-result").textContent = "";
@@ -1259,12 +1389,21 @@ details.drawer > summary:hover { color: var(--text-1); }
       ? "Connected" + (s.connected_file ? " — " + s.connected_file.file_name : "") : "Not connected";
 
     var panel = $("run-panel");
-    busy = s.status === "waiting_for_file" || s.status === "running";
-    $("foot-status").textContent = busy ? "Running…" : "Ready";
+    busy = s.status === "waiting_for_file" || s.status === "running" || s.status === "stopping";
+    if (s.status !== "stopping") {
+      // Re-arm for the next run once this one is no longer stopping.
+      $("stop-btn").disabled = false;
+      $("stop-btn").innerHTML =
+        '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg> Stop';
+    }
+    $("foot-status").textContent = s.status === "stopping" ? "Stopping…" : (busy ? "Running…" : "Ready");
     if (s.status === "idle") { panel.classList.remove("show"); updateHint(); return; }
     panel.classList.add("show");
 
-    var LABEL = { waiting_for_file: "waiting for file", running: "building", done: "finished", error: "failed" };
+    var LABEL = {
+      waiting_for_file: "waiting for file", running: "building",
+      stopping: "stopping", stopped: "stopped", done: "finished", error: "failed",
+    };
     $("status-badge").className = "badge " + s.status;
     $("status-badge").innerHTML = (busy ? '<span class="spin"></span>' : "") + (LABEL[s.status] || s.status);
     $("status-file").textContent = s.connected_file ? s.connected_file.file_name : "";
@@ -1290,6 +1429,8 @@ details.drawer > summary:hover { color: var(--text-1); }
       $("result").innerHTML = s.status === "error" && !s.result
         ? renderRunError(s)
         : (s.result ? renderResult(s.result) : "");
+      var names = (s.result || {}).screen_names || [];
+      if (names.length) mountPager(names);
     }
     updateHint();
   }
@@ -1344,9 +1485,11 @@ details.drawer > summary:hover { color: var(--text-1); }
     var m = r.metrics || {};
     var missing = r.requirements_missing || [], met = r.requirements_met || [];
     var failed = (r.failed_steps || []).length;
-    var tone = r.success ? "ok" : (failed ? "bad" : "warn");
-    var title = r.success ? "Design complete"
-      : (failed ? failed + " step(s) could not be built" : "Finished with issues");
+    var tone = (r.stopped || r.ended_early) ? "stopped" : (r.success ? "ok" : (failed ? "bad" : "warn"));
+    var title = r.stopped ? "Stopped — this design is unfinished"
+      : (r.ended_early ? "Figma disconnected — this is what was built"
+        : (r.success ? "Design complete"
+          : (failed ? failed + " step(s) could not be built" : "Finished with issues")));
 
     var sub = [];
     // Screens first: a design of three frames is a different thing from one
@@ -1358,7 +1501,7 @@ details.drawer > summary:hover { color: var(--text-1); }
     if (m.elapsed_seconds) sub.push(fmtDuration(m.elapsed_seconds));
 
     var h = '<div class="result-hero ' + tone + '"><div class="result-ico">' +
-      (r.success ? "\u2705" : (failed ? "\u26a0\ufe0f" : "\ud83d\udfe1")) + "</div><div>" +
+      ((r.stopped || r.ended_early) ? "\u23f9\ufe0f" : (r.success ? "\u2705" : (failed ? "\u26a0\ufe0f" : "\ud83d\udfe1"))) + "</div><div>" +
       '<div class="result-title">' + esc(title) + "</div>" +
       '<div class="result-sub">' + esc(sub.join(" \u00b7 ")) + "</div></div></div>";
 
@@ -1386,10 +1529,62 @@ details.drawer > summary:hover { color: var(--text-1); }
     h += drawer("Design system notes", r.design_notes);
     h += drawer("Warnings", r.warnings);
 
-    if (r.final_screenshot_base64)
-      h += '<div style="padding:15px 17px"><img style="max-width:100%;border-radius:var(--radius-md);border:1px solid var(--border-subtle);display:block" src="data:image/png;base64,' +
-        r.final_screenshot_base64 + '" alt="The finished design"></div>';
+    if ((r.screen_names || []).length) {
+      h += '<div class="pager" id="pager"></div>';
+    }
     return h;
+  }
+
+  /* ---------------- the screen pager ---------------- */
+  var ARROW_LEFT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>';
+  var ARROW_RIGHT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>';
+  /* Names only -- the images come from /api/screens one at a time. Embedding
+     them in the status payload meant re-sending every screenshot on every 1.5s
+     poll, which for a five-screen design is megabytes a minute. */
+  var pagerShots = [], pagerIndex = 0;
+
+  function mountPager(names) {
+    pagerShots = names;
+    pagerIndex = Math.min(pagerIndex, names.length - 1);
+    var host = $("pager");
+    if (!host) return;
+    host.innerHTML =
+      '<div class="pager-stage">' +
+        '<img id="pager-img" alt="">' +
+        '<button class="pager-nav prev" id="pager-prev" aria-label="Previous screen">' + ARROW_LEFT + '</button>' +
+        '<button class="pager-nav next" id="pager-next" aria-label="Next screen">' + ARROW_RIGHT + '</button>' +
+      '</div>' +
+      '<div class="pager-bar">' +
+        '<span class="pager-name" id="pager-name"></span>' +
+        '<span class="pager-count" id="pager-count"></span>' +
+        '<span class="pager-dots" id="pager-dots"></span>' +
+      '</div>';
+    $("pager-prev").onclick = function (e) { e.stopPropagation(); showScreen(pagerIndex - 1); };
+    $("pager-next").onclick = function (e) { e.stopPropagation(); showScreen(pagerIndex + 1); };
+    showScreen(pagerIndex);
+  }
+
+  function showScreen(index) {
+    if (!pagerShots.length) return;
+    pagerIndex = Math.max(0, Math.min(index, pagerShots.length - 1));
+    var name = pagerShots[pagerIndex];
+    $("pager-img").src = "/api/screens?i=" + pagerIndex;
+    $("pager-img").alt = name;
+    $("pager-name").textContent = name;
+    $("pager-count").textContent = (pagerIndex + 1) + " of " + pagerShots.length;
+    // A single screen has nowhere to go, so the controls stay out of the way.
+    var alone = pagerShots.length < 2;
+    $("pager-prev").style.display = alone ? "none" : "";
+    $("pager-next").style.display = alone ? "none" : "";
+    $("pager-prev").disabled = pagerIndex === 0;
+    $("pager-next").disabled = pagerIndex === pagerShots.length - 1;
+    $("pager-dots").innerHTML = alone ? "" : pagerShots.map(function (screenName, i) {
+      return '<button class="pager-dot' + (i === pagerIndex ? " on" : "") +
+        '" data-i="' + i + '" title="' + esc(screenName) + '" aria-label="' + esc(screenName) + '"></button>';
+    }).join("");
+    $("pager-dots").querySelectorAll(".pager-dot").forEach(function (dot) {
+      dot.onclick = function (e) { e.stopPropagation(); showScreen(+dot.dataset.i); };
+    });
   }
 
   function stat(value, label) {
@@ -1436,15 +1631,214 @@ details.drawer > summary:hover { color: var(--text-1); }
     });
   }
 
+  /* ---------------- attachments ---------------- */
+  // (declared up top too, because updateHint reads it on first paint)
+  // A screenshot the agent rebuilds, or a spec it builds to. Files are read in
+  // the browser and posted with the run, so there is no upload endpoint and
+  // nothing is stored on disk between runs.
+  var MAX_FILE_BYTES = 6 * 1024 * 1024, MAX_TOTAL_BYTES = 16 * 1024 * 1024, MAX_FILES = 6;
+  var IMAGE_EXT = ["png", "jpg", "jpeg", "webp", "gif"];
+  var TEXT_EXT = ["txt", "md", "markdown", "json", "csv", "css", "scss", "html", "htm",
+                  "svg", "yaml", "yml", "ts", "tsx", "js", "jsx", "xml"];
+
+  function fmtSize(n) {
+    return n >= 1048576 ? (n / 1048576).toFixed(1) + "MB" : Math.max(1, Math.round(n / 1024)) + "KB";
+  }
+  function extOf(name) {
+    var i = name.lastIndexOf(".");
+    return i < 0 ? "" : name.slice(i + 1).toLowerCase();
+  }
+  function totalBytes() {
+    return attachments.reduce(function (sum, a) { return sum + a.size; }, 0);
+  }
+
+  function renderAttachments() {
+    var row = $("attach-row");
+    row.style.display = attachments.length ? "flex" : "none";
+    row.innerHTML = attachments.map(function (a, i) {
+      return '<span class="chip' + (a.error ? " bad" : "") + '" title="' + esc(a.error || a.name) + '">' +
+        '<span class="chip-name">' + esc(a.name) + "</span>" +
+        '<span class="chip-size">' + (a.error ? esc(a.error) : fmtSize(a.size)) + "</span>" +
+        '<button data-i="' + i + '" aria-label="Remove">×</button></span>';
+    }).join("");
+    Array.prototype.forEach.call(row.querySelectorAll("button"), function (b) {
+      b.onclick = function () { attachments.splice(+b.dataset.i, 1); renderAttachments(); };
+    });
+    updateHint();
+  }
+
+  function addFiles(files) {
+    Array.prototype.forEach.call(files, function (file) {
+      if (attachments.length >= MAX_FILES) return;
+      var ext = extOf(file.name), known = IMAGE_EXT.indexOf(ext) >= 0 || TEXT_EXT.indexOf(ext) >= 0;
+      // Reject in the browser for the same reason the server does: an
+      // attachment that cannot be read must never quietly become a run that
+      // ignored it and built something generic.
+      if (!known) {
+        attachments.push({ name: file.name, size: file.size, error: "unsupported — use an image or a text file" });
+        renderAttachments();
+        return;
+      }
+      if (file.size > MAX_FILE_BYTES) {
+        attachments.push({ name: file.name, size: file.size, error: "too large (max " + fmtSize(MAX_FILE_BYTES) + ")" });
+        renderAttachments();
+        return;
+      }
+      if (totalBytes() + file.size > MAX_TOTAL_BYTES) {
+        attachments.push({ name: file.name, size: file.size, error: "over the total size limit" });
+        renderAttachments();
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function () {
+        var s = String(reader.result);
+        attachments.push({ name: file.name, size: file.size, data_base64: s.slice(s.indexOf(",") + 1) });
+        renderAttachments();
+      };
+      reader.onerror = function () {
+        attachments.push({ name: file.name, size: file.size, error: "could not be read" });
+        renderAttachments();
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  $("attach-btn").onclick = function () { $("attach-input").click(); };
+  $("attach-input").onchange = function (e) { addFiles(e.target.files); e.target.value = ""; };
+
+  // Drop a screenshot straight onto the composer, and paste one from the
+  // clipboard -- which is how a screenshot usually arrives.
+  var composer = document.querySelector(".composer");
+  ["dragover", "drop"].forEach(function (name) {
+    composer.addEventListener(name, function (e) {
+      e.preventDefault();
+      if (name === "drop" && e.dataTransfer) addFiles(e.dataTransfer.files);
+    });
+  });
+  $("instruction").addEventListener("paste", function (e) {
+    var items = (e.clipboardData || {}).items || [];
+    var files = [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].kind === "file") {
+        var f = items[i].getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) { e.preventDefault(); addFiles(files); }
+  });
+
+  /* ---------------- dictation ---------------- */
+  // The browser's own Web Speech API: no audio leaves this page except through
+  // the browser's built-in speech service, no dependency, no key to configure.
+  // Note it does use the browser vendor's transcription service.
+  var Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var recogniser = null, listening = false, dictationBase = "";
+
+  function stopDictation() {
+    listening = false;
+    $("mic-btn").classList.remove("on");
+    $("mic-btn").title = "Dictate the instruction";
+    if (recogniser) { try { recogniser.stop(); } catch (err) {} }
+  }
+
+  $("mic-btn").onclick = function () {
+    if (!Recognition) {
+      $("hint").textContent = "Dictation needs Chrome, Edge or Safari — type the instruction instead.";
+      return;
+    }
+    if (listening) { stopDictation(); updateHint(); return; }
+
+    recogniser = new Recognition();
+    recogniser.continuous = true;
+    recogniser.interimResults = true;
+    recogniser.lang = navigator.language || "en-US";
+    // Append to whatever is already typed rather than replacing it: dictation
+    // is usually used to finish a sentence, not to start over.
+    dictationBase = $("instruction").value.replace(/\s+$/, "");
+
+    recogniser.onresult = function (e) {
+      var settled = "", pending = "";
+      for (var i = 0; i < e.results.length; i++) {
+        (e.results[i].isFinal ? (settled += e.results[i][0].transcript)
+                              : (pending += e.results[i][0].transcript));
+      }
+      var joined = (dictationBase + " " + settled + pending).trim();
+      $("instruction").value = joined;
+      updateHint();
+    };
+    recogniser.onerror = function (e) {
+      stopDictation();
+      $("hint").textContent = e.error === "not-allowed"
+        ? "Microphone access was blocked — allow it in your browser to dictate."
+        : "Dictation stopped (" + e.error + ").";
+    };
+    recogniser.onend = function () { if (listening) stopDictation(); };
+
+    try {
+      recogniser.start();
+      listening = true;
+      $("mic-btn").classList.add("on");
+      $("mic-btn").title = "Stop dictating";
+      $("hint").textContent = "Listening… click the microphone again when you're done.";
+    } catch (err) {
+      stopDictation();
+      $("hint").textContent = "Could not start dictation.";
+    }
+  };
+
   /* ---------------- run ---------------- */
+  var runMode = "create";
+  var PLACEHOLDERS = {
+    create: "Describe the screen to build — e.g. a desktop landing page for a scheduling app, with a nav bar, hero, three feature columns and a footer.",
+    edit: "Describe the change — e.g. make every primary button use the accent colour, or add a ‘Forgot password?’ link under the password field. Select nodes in Figma first to point at exactly what you mean."
+  };
+  function setMode(mode) {
+    runMode = mode === "edit" ? "edit" : "create";
+    $("mode-create").classList.toggle("on", runMode === "create");
+    $("mode-edit").classList.toggle("on", runMode === "edit");
+    $("mode-create").setAttribute("aria-selected", String(runMode === "create"));
+    $("mode-edit").setAttribute("aria-selected", String(runMode === "edit"));
+    $("instruction").placeholder = PLACEHOLDERS[runMode];
+    updateHint();
+  }
+  $("mode-create").onclick = function () { setMode("create"); };
+  $("mode-edit").onclick = function () { setMode("edit"); };
+
   $("run-btn").onclick = function () {
     var text = $("instruction").value.trim();
     if (!selectedKey || !text) return;
+    if (listening) stopDictation();
     $("run-btn").disabled = true;
-    postJSON("/api/run", { file_key: selectedKey, instruction: text }).then(function (r) {
-      if (!r.body.ok) { $("hint").textContent = r.body.message || "Could not start the run."; updateHint(); }
+    var payload = {
+      file_key: selectedKey,
+      instruction: text,
+      mode: runMode,
+      attachments: attachments.filter(function (a) { return !a.error; })
+        .map(function (a) { return { name: a.name, data_base64: a.data_base64 }; })
+    };
+    postJSON("/api/run", payload).then(function (r) {
+      if (!r.body.ok) {
+        $("hint").textContent = r.body.message || "Could not start the run.";
+        updateHint();
+        return;
+      }
+      // The run owns them now; leaving them on the composer invites attaching
+      // the same screenshot twice to the next one.
+      attachments = [];
+      renderAttachments();
     });
   };
+  $("stop-btn").onclick = function () {
+    $("stop-btn").disabled = true;
+    $("stop-btn").textContent = "Stopping\u2026";
+    postJSON("/api/run/stop", {}).then(function (r) {
+      if (!r.body.ok) {
+        $("stop-btn").disabled = false;
+        $("hint").textContent = r.body.message || "Could not stop the run.";
+      }
+    });
+  };
+
   $("instruction").addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!$("run-btn").disabled) $("run-btn").click(); }
   });
@@ -1452,6 +1846,16 @@ details.drawer > summary:hover { color: var(--text-1); }
     if (e.key === "Escape") document.querySelectorAll(".scrim.show").forEach(function (m) { m.classList.remove("show"); });
     var typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
     if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (pagerShots.length > 1 && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      e.preventDefault();
+      showScreen(pagerIndex + (e.key === "ArrowRight" ? 1 : -1));
+      return;
+    }
+    if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && pagerShots.length > 1) {
+      e.preventDefault();
+      showScreen(pagerIndex + (e.key === "ArrowRight" ? 1 : -1));
+      return;
+    }
     if (e.key === "n" || e.key === "N") { e.preventDefault(); showTab("design"); $("instruction").focus(); }
     if (e.key === "i" || e.key === "I") { e.preventDefault(); showTab("files"); }
   });

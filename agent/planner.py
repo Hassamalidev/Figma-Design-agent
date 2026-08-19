@@ -147,11 +147,53 @@ def make_plan(
     ]
     message = llm.complete(messages, tools=None)
     steps = _drop_component_steps(_parse_steps(message.content or "")) or [_FALLBACK_STEP]
+    steps = _collapse_side_by_side(steps, screen)
     label = f" for '{screen}'" if screen else ""
     logger.info(
         "Plan%s (%d step%s):\n%s", label, len(steps), "" if len(steps) == 1 else "s", _format_plan(steps)
     )
     return steps
+
+
+# Words that place a region HORIZONTALLY. A step that names one is describing
+# half of a layout, not a band of a scrolling page.
+_SIDE_BY_SIDE = re.compile(
+    r"\b(left|right|side[- ]?bar|side panel|split|two[- ]column|split[- ]screen|"
+    r"beside|alongside|left-hand|right-hand)\b",
+    re.IGNORECASE,
+)
+
+
+def _collapse_side_by_side(steps: list[str], screen: str = "") -> list[str]:
+    """A screen laid out side by side can only be built in ONE step.
+
+    Every step appends a full-width band under the last, because a screen frame
+    is a VERTICAL auto-layout. So "add the left visual panel" then "add the
+    right auth panel" does not produce two halves -- it produces two stacked
+    bands, with the form underneath the artwork instead of next to it. That is
+    precisely what a live run shipped, and no later gate can see it: both bands
+    are individually well-formed.
+
+    The planning prompt says this too, and the prompt was ignored. This is the
+    harness taking the mistake off the table (CLAUDE.md section 6a).
+    """
+    if len(steps) < 2 or not any(_SIDE_BY_SIDE.search(step) for step in steps):
+        return steps
+    regions = "; ".join(_region_of(step) for step in steps)
+    merged = f"Build the whole {screen or 'screen'} in one side-by-side layout: {regions}"
+    logger.info("Collapsed %d side-by-side steps into one: %s", len(steps), merged)
+    return [merged]
+
+
+def _region_of(step: str) -> str:
+    """The part of a step that names its region, without the plumbing."""
+    text = re.sub(
+        r"^\s*(add|append|create|place|build)\s+(the\s+)?", "", step.strip(), flags=re.IGNORECASE
+    )
+    text = re.sub(
+        r"[,\s]*(in)?to the (screen )?frame\.?\s*$", "", text, flags=re.IGNORECASE
+    )
+    return text.strip(" .") or step.strip()
 
 
 # A step whose whole job is creating a Figma COMPONENT. Telling the planner not

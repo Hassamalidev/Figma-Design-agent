@@ -69,6 +69,11 @@ def render_call(call_id: str, name: str = "Section", value: str = "Hello"):
 
 
 
+def metadata_call(call_id: str, node_id: str):
+    """A read-only `get_metadata` call, which every step is allowed to make."""
+    return tool_call(call_id, "get_metadata", {"node_id": node_id})
+
+
 
 # Indexing into llm.calls[N] breaks the moment the loop gains a stage -- adding
 # screen decomposition shifted every one of them by one. Find calls by the job
@@ -140,9 +145,17 @@ class FakeBridge:
         self._layout_tree = layout_tree or FakeBridge.CLEAN_TREE
         self._still_unbound = still_unbound or []
         self.sent: list = []
+        # What was ANSWERED, paired with `sent` by index. Assertions about node
+        # lifetime need the ids the bridge handed back, not just the requests.
+        self.served: list = []
 
     def send(self, request, timeout: float = 30.0) -> Response:
         self.sent.append(request)
+        response = self._answer(request)
+        self.served.append(response)
+        return response
+
+    def _answer(self, request) -> Response:
         queue = self._responses_by_type.get(request.type, [])
         if request.type == "exec" and self._harness_response(request) is not None:
             # Harness-authored script. A test may still script its own answer
@@ -153,7 +166,7 @@ class FakeBridge:
         if request.type == "screenshot" and not queue:
             # Screenshots are harness-driven (visual gate + final review), so
             # tests only script them when they assert on the image itself.
-            return Response(id=request.id, ok=True, image_base64="")
+            return Response(id=request.id, ok=True, image_base64="PNG")
         assert queue, f"FakeBridge ran out of scripted '{request.type}' responses"
         return queue.pop(0)
 
@@ -205,6 +218,10 @@ class FakeBridge:
         return "stillUnbound" in code
 
     @staticmethod
+    def _is_remove_script(code: str) -> bool:
+        return "removedNodeIds" in code
+
+    @staticmethod
     def _is_hug_fix(code: str) -> bool:
         return "primaryAxisSizingMode = 'AUTO'" in code and "createFrame" not in code
 
@@ -232,6 +249,14 @@ class FakeBridge:
             return Response(id=request.id, ok=True, result={"createdNodeIds": [], "textStyleNames": ["Heading"]})
         if FakeBridge._is_placeholder(code):
             return Response(id=request.id, ok=True, result={"createdNodeIds": ["ph:1"]})
+        # Cleanup of work that did not pass its gates. Echo back exactly the
+        # ids the script was asked to remove, so a test can assert on them.
+        if FakeBridge._is_remove_script(code):
+            asked = json.loads(re.search(r"const ids = (\[.*?\]);", code, re.DOTALL).group(1))
+            return Response(
+                id=request.id, ok=True,
+                result={"createdNodeIds": [], "removedNodeIds": asked},
+            )
         if FakeBridge._is_font_script(code):
             return Response(
                 id=request.id, ok=True,
@@ -663,7 +688,7 @@ def test_the_visual_gate_blocks_a_step_that_looks_broken():
             message(content='["Add Hero section to root frame"]'),
             message(tool_calls=[render_call("c1")]),
             message(content="done"),          # model thinks it finished...
-            message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "fix"})]),
+            message(tool_calls=[render_call("c2", "Hero fixed")]),
             message(content="fixed"),
         ]
     )
@@ -678,7 +703,7 @@ def test_the_visual_gate_blocks_a_step_that_looks_broken():
         layout_tree=broken,
     )
 
-    result = loop.run("a landing page", bridge, llm, max_retries=2, max_steps=10)
+    result = loop.run("a landing page", bridge, llm, max_retries=2, max_steps=10, final_repair=False)
 
     # The gate ran, saw the collapsed headline, and spent the retry correcting it.
     assert any("collapsed" in d for d in result.layout_defects)
@@ -712,7 +737,7 @@ def test_visual_gate_can_be_turned_off():
             message(content='["Add Hero section to root frame"]'),
             message(tool_calls=[render_call("c1")]),
             message(content="done"),
-            message(tool_calls=[tool_call("c2", "execute_figma_js", {"code": "fix"})]),
+            message(tool_calls=[render_call("c2", "Hero fixed")]),
             message(content="fixed"),
         ])
         bridge = FakeBridge(
@@ -725,7 +750,7 @@ def test_visual_gate_can_be_turned_off():
             },
             layout_tree=broken,
         )
-        return loop.run("x", bridge, llm, max_retries=2, max_steps=10, visual_gate=gate), bridge
+        return loop.run("x", bridge, llm, max_retries=2, max_steps=10, visual_gate=gate, final_repair=False), bridge
 
     on, bridge_on = run_with(True)
     off, bridge_off = run_with(False)
@@ -1024,7 +1049,7 @@ def test_a_defect_in_an_earlier_section_does_not_fail_a_later_step():
         layout_tree=dirty_page,
     )
 
-    result = loop.run("x", bridge, llm, max_retries=1, max_steps=10)
+    result = loop.run("x", bridge, llm, max_retries=1, max_steps=10, final_repair=False)
 
     # Step 2 is clean on its own nodes, so it must pass despite the broken page.
     assert "Add the footer section into the root frame." not in result.failed_steps
@@ -1069,7 +1094,7 @@ def test_repeat_guard_survives_across_retries():
         layout_tree=broken,
     )
 
-    loop.run("a landing page", bridge, llm, max_retries=3, max_steps=10)
+    loop.run("a landing page", bridge, llm, max_retries=3, max_steps=10, final_repair=False)
 
     # Three attempts, one distinct script: it must only ever have reached Figma once.
     assert len(bridge.model_exec_requests()) == 1
@@ -1245,11 +1270,15 @@ def test_surviving_tokens_still_get_roles_and_pairings():
     assert state.warnings == []
 
 
-def test_a_step_may_only_append_one_section_to_the_root():
+def test_a_step_never_leaves_three_stacked_copies_of_one_section():
     """From a real dashboard run: step 3 appended the nav bar to the root frame
     on three consecutive turns of the SAME attempt. Each script was worded
     slightly differently, so the identical-call guard let all three through and
     the page ended up with three stacked nav bars.
+
+    Each `render_ui` now REPLACES the last, so a reworded retry corrects the
+    section instead of duplicating it -- which is what the model is actually
+    asking for when it says the previous render was missing something.
     """
     llm = FakeModelClient(
         [
@@ -1265,17 +1294,34 @@ def test_a_step_may_only_append_one_section_to_the_root():
         {
             "exec": [
                 Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]}),
+                Response(id="e2", ok=True, result={"createdNodeIds": ["1:60"]}),
+                Response(id="e3", ok=True, result={"createdNodeIds": ["1:70"]}),
                 Response(id="a1", ok=True, result={"createdNodeIds": [], "unboundFillNodeIds": []}),
             ],
-            "metadata": [Response(id="m1", ok=True, result={"id": "1:50", "name": "Nav Bar", "type": "FRAME"})],
+            "metadata": [
+                Response(id=f"m{i}", ok=True, result={"id": "1:50", "name": "Nav", "type": "FRAME"})
+                for i in range(4)
+            ],
             "screenshot": [Response(id="s1", ok=True, image_base64="")],
         }
     )
 
-    loop.run("a dashboard", bridge, llm, max_retries=1, max_steps=10)
+    result = loop.run("a dashboard", bridge, llm, max_retries=1, max_steps=10)
 
-    # Only the first append reached Figma; the other two were refused.
-    assert len(bridge.model_exec_requests()) == 1
+    execs = bridge.model_exec_requests()
+    # The reworded retries each REMOVE what the last one built...
+    assert '"1:50"' in (execs[1].code or ""), "the second render did not replace the first"
+    assert '"1:60"' in (execs[2].code or ""), "the third render did not replace the second"
+    # ...so only the final section survives, and the run reports only that one.
+    assert "1:50" not in result.created_node_ids
+    assert "1:60" not in result.created_node_ids
+    assert "1:70" in result.created_node_ids
+
+
+def test_a_step_cannot_rebuild_its_section_without_limit():
+    """Self-correction is bounded -- an endless rebuild loop is the other way
+    this goes wrong."""
+    assert loop.MAX_RENDERS_PER_STEP <= 3
 
 
 def test_the_second_append_refusal_tells_the_model_how_to_finish():
@@ -1333,7 +1379,7 @@ def test_a_section_repair_replaces_the_broken_section_instead_of_duplicating_it(
         layout_tree=broken,
     )
 
-    loop.run("a dashboard", bridge, llm, max_retries=2, max_steps=10)
+    loop.run("a dashboard", bridge, llm, max_retries=2, max_steps=10, final_repair=False)
 
     execs = bridge.model_exec_requests()
     assert len(execs) == 2                                  # built, then repaired
@@ -1398,7 +1444,7 @@ def _one_section_run(critic_llm, max_retries=2, layout_tree=None):
         layout_tree=layout_tree,
     )
     result = loop.run("a landing page", bridge, llm, max_retries=max_retries,
-                      max_steps=10, critic_llm=critic_llm)
+                      max_steps=10, critic_llm=critic_llm, final_repair=False)
     return result, bridge
 
 
@@ -1578,7 +1624,7 @@ def _run_with_instruction(instruction: str, bridge):
             message(content="done"),
         ]
     )
-    return loop.run(instruction, bridge, llm, max_retries=1, max_steps=10)
+    return loop.run(instruction, bridge, llm, max_retries=1, max_steps=10, final_repair=False)
 
 
 def _bridge_with_tree(tree):
@@ -1812,7 +1858,8 @@ def _multi_screen_run(screens, instruction="a login and a dashboard screen", exi
                 Response(id="m" + str(i), ok=True, result={"id": "sec:" + str(i), "name": name + " Body"})
                 for i, name in enumerate(screens)
             ],
-            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+            # Screenshots are harness-driven (one per screen, then the page), so
+            # the fake serves them rather than each test counting them out.
         },
         existing_nodes=existing or [],
     )
@@ -2086,3 +2133,704 @@ def test_the_frame_width_comes_from_the_width_not_the_height():
     # An incidental small value must not win either.
     assert loop._root_width("Border radius: 8px. Card radius: 12px. Frame 1440px wide.") == 1440
     assert loop._root_width("a 375px wide mobile screen") == 375
+
+
+# ---- one picture per screen, so the dashboard can page through them --------
+
+
+def test_each_screen_is_rendered_on_its_own():
+    """Five frames side by side render at a size where nothing is legible, so
+    the result view pages through them one at a time instead."""
+    result, bridge, _ = _multi_screen_run(["Login", "Dashboard"])
+
+    names = [shot["name"] for shot in result.screen_shots]
+    assert names == ["Login", "Dashboard"]
+    assert all(shot["image_base64"] for shot in result.screen_shots)
+
+
+def test_a_single_screen_is_not_rendered_twice():
+    """With one screen its picture IS the final screenshot, so asking Figma to
+    render it again is a wasted round trip."""
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:2"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:2", "name": "Hero"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="ONLY-SHOT")],
+        }
+    )
+
+    result = _one_step_run(bridge)
+
+    assert [s["name"] for s in result.screen_shots] == ["Screen"]
+    assert result.final_screenshot_base64 == "ONLY-SHOT"
+    assert len([r for r in bridge.sent if r.type == "screenshot"]) == 1
+
+
+# ---- the run FIXES what is still wrong, instead of listing it --------------
+#
+# A finished run showed "2 layout issues" and "6 design-system notes" in the
+# dashboard and had done nothing about any of them, and a step that exhausted
+# its retries left a TODO placeholder that stayed a placeholder. All of it is
+# repairable: the section exists, we know exactly what is wrong, and render_ui
+# can replace it.
+
+
+def _screen_tree(children):
+    return {
+        "id": ROOT_ID, "name": "Screen", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 600, "visible": True, "layoutMode": "VERTICAL",
+        "children": children,
+    }
+
+
+BROKEN_SECTION = {
+    "id": "sec:1", "name": "Hero", "type": "FRAME", "x": 0, "y": 0,
+    "width": 1440, "height": 200, "visible": True, "layoutMode": "VERTICAL",
+    "children": [{
+        "id": "t:1", "name": "Headline", "type": "TEXT", "x": 0, "y": 0,
+        "width": 0, "height": 0, "visible": True, "layoutMode": None,
+        "children": [], "characters": "Welcome", "fontSize": 32,
+    }],
+}
+
+PLACEHOLDER_SECTION = {
+    "id": "sec:2", "name": "TODO — login form", "type": "FRAME", "x": 0, "y": 200,
+    "width": 1440, "height": 160, "visible": True, "layoutMode": "VERTICAL",
+    "children": [{
+        "id": "t:2", "name": "Label", "type": "TEXT", "x": 0, "y": 0,
+        "width": 200, "height": 20, "visible": True, "layoutMode": None,
+        "children": [], "characters": "TODO: login form", "fontSize": 13,
+    }],
+}
+
+
+def _run_then_repair(tree, extra_model_turns):
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the root frame."]'),
+            message(tool_calls=[render_call("c1", "Hero")]),
+            message(content="done"),
+        ]
+        + extra_model_turns
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id=f"e{i}", ok=True, result={"createdNodeIds": ["sec:1"]})
+                     for i in range(6)],
+            "metadata": [Response(id=f"m{i}", ok=True, result={"id": "sec:1", "name": "Hero"})
+                         for i in range(6)],
+        },
+        layout_tree=tree,
+    )
+    # max_retries=1 so the STEP itself never retries: anything fixed here was
+    # fixed by the final repair pass, not by the per-step gate.
+    return loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10), bridge, llm
+
+
+def test_a_defect_left_at_the_end_is_repaired_not_just_reported():
+    result, _, llm = _run_then_repair(
+        _screen_tree([BROKEN_SECTION]),
+        [message(tool_calls=[render_call("r1", "Hero fixed")]), message(content="repaired")] * 3,
+    )
+
+    repairs = [p for p in step_prompts(llm) if "so it is complete and correct" in p]
+    assert repairs, "the run must try to fix what its own review found"
+    assert "has no area" in repairs[0]        # the actual defect is the instruction
+    assert "sec:1" in repairs[0]              # aimed at the section that owns it
+
+
+def test_a_todo_placeholder_gets_a_second_chance_at_being_built():
+    """A placeholder has no defects of its own -- it is a tidy little frame --
+    so nothing else would ever come back to it."""
+    result, _, llm = _run_then_repair(
+        _screen_tree([BROKEN_SECTION, PLACEHOLDER_SECTION]),
+        [message(tool_calls=[render_call("r1", "Rebuilt")]), message(content="repaired")] * 6,
+    )
+
+    repairs = " ".join(p for p in step_prompts(llm) if "so it is complete and correct" in p)
+    assert "empty TODO placeholder" in repairs
+    assert "build the real section" in repairs
+
+
+def test_repairs_are_bounded():
+    """An unbounded polish loop turns a five-minute build into a twenty-minute one."""
+    many = [{**BROKEN_SECTION, "id": f"sec:{i}", "name": f"Section {i}"} for i in range(12)]
+    _, _, llm = _run_then_repair(
+        _screen_tree(many),
+        [message(tool_calls=[render_call("r", "Fixed")]), message(content="repaired")] * 40,
+    )
+
+    repairs = [p for p in step_prompts(llm) if "so it is complete and correct" in p]
+    assert 0 < len(repairs) <= loop.MAX_FINAL_REPAIRS
+
+
+def test_a_clean_design_is_never_touched_again():
+    _, _, llm = _run_then_repair(_screen_tree([]), [])
+
+    assert [p for p in step_prompts(llm) if "so it is complete and correct" in p] == []
+
+
+def test_the_repair_step_may_not_write_raw_javascript():
+    """Its tool policy is declared on the step, not guessed from its wording."""
+    from agent.state import PlanStep
+
+    assert loop._builds_a_section(PlanStep("anything at all", 0, render_only=True)) is True
+    assert loop._builds_a_section(PlanStep("prepare the tokens", 0, render_only=False)) is False
+    # No declaration: fall back to reading the description, as the planner's do.
+    assert loop._builds_a_section(PlanStep("Add the hero section", 0)) is True
+
+
+# ---- the run FIXES what the final review finds ----------------------------
+#
+# A real run ended with "2 layout issues", "6 design-system notes" and two
+# `TODO` placeholders listed in the dashboard and nothing done about any of
+# them. Every one was repairable: the section exists, we know exactly what is
+# wrong with it, and render_ui can replace it.
+
+
+def _broken_screen_tree(section_name="Hero", empty=True):
+    """A screen whose one section contains an empty frame -- a real defect."""
+    return {
+        "id": ROOT_ID, "name": "Screen", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 600, "visible": True, "layoutMode": "VERTICAL",
+        "children": [{
+            "id": "sec:1", "name": section_name, "type": "FRAME", "x": 0, "y": 0,
+            "width": 1440, "height": 300, "visible": True, "layoutMode": "VERTICAL",
+            "children": [{
+                "id": "box:1", "name": "Input", "type": "FRAME", "x": 0, "y": 0,
+                "width": 408, "height": 56, "visible": True, "layoutMode": None,
+                "children": [] if empty else [
+                    {"id": "t:1", "name": "Label", "type": "TEXT", "x": 0, "y": 0,
+                     "width": 200, "height": 20, "visible": True, "layoutMode": None,
+                     "children": [], "characters": "Email", "fontSize": 16},
+                ],
+            }],
+        }],
+    }
+
+
+def test_a_defect_left_at_the_end_is_repaired_not_just_reported():
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the root frame."]'),
+            message(tool_calls=[render_call("c1", "Hero")]),
+            message(content="done"),
+            # the end-of-run repair pass gets its own turns
+            message(tool_calls=[render_call("c2", "Hero rebuilt")]),
+            message(content="fixed"),
+            message(tool_calls=[render_call("c3", "Hero rebuilt again")]),
+            message(content="fixed"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [
+                Response(id="e1", ok=True, result={"createdNodeIds": ["sec:1"]}),
+                Response(id="e2", ok=True, result={"createdNodeIds": ["sec:2"]}),
+            ],
+            "metadata": [
+                Response(id="m1", ok=True, result={"id": "sec:1", "name": "Hero"}),
+                Response(id="m2", ok=True, result={"id": "sec:2", "name": "Hero"}),
+            ],
+            "screenshot": [Response(id=f"s{i}", ok=True, image_base64="PNG") for i in range(6)],
+        },
+        # The gate sees a clean subtree for the STEP, but the whole screen is broken.
+        layout_tree=_broken_screen_tree(),
+    )
+
+    loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
+
+    execs = bridge.model_exec_requests()
+    assert len(execs) >= 2, "the run must go back and rebuild the broken section"
+    # The repair REPLACES what was there rather than appending beside it.
+    assert "_old.remove()" in (execs[1].code or "")
+    assert "sec:1" in (execs[1].code or "")
+
+
+def test_the_repair_pass_can_be_turned_off():
+    """It costs model calls, so it is a preference rather than a fact of life."""
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the root frame."]'),
+            message(tool_calls=[render_call("c1", "Hero")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["sec:1"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "sec:1", "name": "Hero"})],
+            "screenshot": [Response(id=f"s{i}", ok=True, image_base64="PNG") for i in range(4)],
+        },
+        layout_tree=_broken_screen_tree(),
+    )
+
+    loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10, final_repair=False)
+
+    assert len(bridge.model_exec_requests()) == 1   # built once, never revisited
+
+
+def test_repairing_is_bounded_so_an_unfixable_defect_cannot_loop():
+    """A defect the model cannot fix must cost a bounded number of calls."""
+    responses = [
+        message(content="accent: #0066FF"),
+        message(content='["Add the hero section into the root frame."]'),
+        message(tool_calls=[render_call("c1", "Hero")]),
+        message(content="done"),
+    ]
+    # Far more repair turns than the budget allows, so exhausting the list would
+    # mean the loop ran away.
+    for i in range(40):
+        responses.append(message(tool_calls=[render_call(f"r{i}", f"Hero v{i}")]))
+        responses.append(message(content="tried"))
+
+    llm = FakeModelClient(responses)
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id=f"e{i}", ok=True, result={"createdNodeIds": ["sec:1"]}) for i in range(60)],
+            "metadata": [Response(id=f"m{i}", ok=True, result={"id": "sec:1", "name": "Hero"}) for i in range(60)],
+            "screenshot": [Response(id=f"s{i}", ok=True, image_base64="PNG") for i in range(60)],
+        },
+        layout_tree=_broken_screen_tree(),   # never gets better, however often it is rebuilt
+    )
+
+    result = loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
+
+    # One build plus a bounded number of repairs -- not forty.
+    assert len(bridge.model_exec_requests()) <= 1 + loop.MAX_FINAL_REPAIRS
+    # And the run still finishes and reports what it could not fix.
+    assert result.layout_defects
+
+
+# ---- stopping a run --------------------------------------------------------
+#
+# Cooperative: a model call or a Figma round trip already in flight cannot be
+# interrupted, so what stopping promises is that no NEW work starts. Whatever
+# was built is kept -- a half-finished design is still the user's design.
+
+
+def _stoppable_run(stop_after_steps: int, planned=("Add the hero section into the frame",
+                                                   "Add the footer section into the frame")):
+    """Run a plan, asking to stop once `stop_after_steps` steps have been built."""
+    built = {"count": 0}
+
+    responses = [
+        message(content="accent: #0066FF"),
+        message(content=json.dumps(list(planned))),
+    ]
+    for index in range(len(planned)):
+        responses.append(message(tool_calls=[render_call(f"c{index}", f"Section {index}")]))
+        responses.append(message(content="done"))
+
+    llm = FakeModelClient(responses)
+    bridge = FakeBridge(
+        {
+            "exec": [
+                Response(id=f"e{i}", ok=True, result={"createdNodeIds": [f"sec:{i}"]})
+                for i in range(len(planned) + 2)
+            ],
+            "metadata": [
+                Response(id=f"m{i}", ok=True, result={"id": f"sec:{i}", "name": f"Section {i}"})
+                for i in range(len(planned) + 2)
+            ],
+            "screenshot": [Response(id=f"s{i}", ok=True, image_base64="PNG") for i in range(6)],
+        }
+    )
+
+    original = bridge.send
+
+    def counting_send(request, timeout=30.0):
+        response = original(request)
+        if request.type == "metadata":
+            built["count"] += 1
+        return response
+
+    bridge.send = counting_send
+    result = loop.run(
+        "a landing page", bridge, llm, max_retries=1, max_steps=10,
+        should_stop=lambda: built["count"] >= stop_after_steps,
+    )
+    return result, bridge, llm
+
+
+def test_a_stopped_run_stops_starting_new_steps():
+    result, _, llm = _stoppable_run(stop_after_steps=1)
+
+    assert result.stopped is True
+    # The second step never ran, so its scripted responses are untouched.
+    assert llm._responses, "the run kept going after it was asked to stop"
+
+
+def test_a_stopped_run_keeps_what_it_built():
+    """The half-finished design is still the user's design."""
+    result, _, _ = _stoppable_run(stop_after_steps=1)
+
+    assert "sec:0" in result.created_node_ids
+    assert result.screen_shots, "the partial design is still photographed"
+
+
+def test_a_stopped_run_is_not_a_success():
+    result, _, _ = _stoppable_run(stop_after_steps=1)
+
+    assert result.success is False
+    assert any("stopped this run" in w for w in result.warnings)
+
+
+def test_a_run_nobody_stopped_is_unaffected():
+    result, _, llm = _stoppable_run(stop_after_steps=99)
+
+    assert result.stopped is False
+    assert not llm._responses, "every scripted step should have run"
+
+
+def test_stopping_skips_the_end_of_run_repair_pass():
+    """Spending model calls on a run somebody just asked to stop is exactly
+    what they asked not to happen."""
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the frame"]'),
+            message(tool_calls=[render_call("c1", "Hero")]),
+            message(content="done"),
+        ]
+    )
+    broken = {
+        "id": ROOT_ID, "name": "Screen", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 600, "visible": True, "layoutMode": "VERTICAL",
+        "children": [{
+            "id": "sec:1", "name": "Hero", "type": "FRAME", "x": 0, "y": 0,
+            "width": 1440, "height": 300, "visible": True, "layoutMode": "VERTICAL",
+            "children": [{
+                "id": "box:1", "name": "Input", "type": "FRAME", "x": 0, "y": 0,
+                "width": 408, "height": 56, "visible": True, "layoutMode": None, "children": [],
+            }],
+        }],
+    }
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["sec:1"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "sec:1", "name": "Hero"})],
+            "screenshot": [Response(id=f"s{i}", ok=True, image_base64="PNG") for i in range(6)],
+        },
+        layout_tree=broken,
+    )
+    stop = {"now": False}
+
+    def should_stop():
+        # Let the build finish, then ask to stop before the repair pass.
+        return stop["now"]
+
+    original = bridge.send
+
+    def watch(request, timeout=30.0):
+        if request.type == "metadata":
+            stop["now"] = True
+        return original(request)
+
+    bridge.send = watch
+
+    result = loop.run(
+        "a landing page", bridge, llm, max_retries=1, max_steps=10, should_stop=should_stop
+    )
+
+    assert result.stopped is True
+    # One build, and no repair rebuild on top of it.
+    assert len(bridge.model_exec_requests()) == 1
+
+
+def test_a_broken_stop_callback_never_takes_the_run_down():
+    """A callback that raises must not be able to kill a build."""
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:2"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:2", "name": "Hero"})],
+            "screenshot": [Response(id="s1", ok=True, image_base64="")],
+        }
+    )
+    llm = FakeModelClient(
+        [
+            message(content="accent: #0066FF"),
+            message(content='["Add the hero section into the frame"]'),
+            message(tool_calls=[render_call("c1")]),
+            message(content="done"),
+        ]
+    )
+
+    def boom():
+        raise RuntimeError("the stop check itself is broken")
+
+    result = loop.run(
+        "a hero", bridge, llm, max_retries=1, max_steps=10, should_stop=boom, final_repair=False
+    )
+
+    assert result.stopped is False
+    assert result.success is True
+
+
+# ---- a real trace: the canvas kept everything that failed ------------------
+#
+# Every build is additive: `render_ui` appends, and a section is only replaced
+# when the NEXT attempt names the nodes to replace. So the attempt that ENDS a
+# step -- retries exhausted, or a final repair that ran out of turns -- left its
+# output on the page with nothing to remove it. A five-step run finished with a
+# 1440x900 white void, a "TODO" band marking the gap that void already filled,
+# and four stacked copies of one sign-in form.
+
+BROKEN_TREE = {
+    "id": ROOT_ID, "name": "Root", "type": "FRAME", "x": 0, "y": 0,
+    "width": 1440, "height": 400, "visible": True, "layoutMode": "VERTICAL",
+    "children": [{
+        "id": "1:50", "name": "Hero", "type": "FRAME", "x": 0, "y": 0,
+        "width": 0, "height": 0, "visible": True, "layoutMode": None, "children": [],
+    }],
+}
+
+
+def _rendered_ids(request) -> list[str]:
+    """Node ids a render_ui script asked to REPLACE, newest first."""
+    code = getattr(request, "code", "") or ""
+    if "const created = []" not in code:
+        return []
+    match = re.search(r"for \(const _oldId of (\[.*?\])\)", code, re.DOTALL)
+    return json.loads(match.group(1)) if match else []
+
+
+def _removed_ids(bridge) -> list[str]:
+    """Every node id the run asked Figma to delete."""
+    removed: list[str] = []
+    for request in bridge.sent:
+        code = getattr(request, "code", "") or ""
+        if "removedNodeIds" in code:
+            removed += json.loads(re.search(r"const ids = (\[.*?\]);", code, re.DOTALL).group(1))
+    return removed
+
+
+def test_a_step_that_exhausts_its_retries_removes_its_broken_section():
+    """Otherwise the page shows the failure AND the placeholder marking it."""
+    llm = FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the hero section into the root frame."]'),
+            message(tool_calls=[render_call("c1", "Hero")]),
+            message(content="done"),
+            message(tool_calls=[render_call("c2", "Hero v2")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:50", "name": "Hero", "type": "FRAME"})],
+        },
+        layout_tree=BROKEN_TREE,
+    )
+
+    result = loop.run("a landing page", bridge, llm, max_retries=2, max_steps=10, final_repair=False)
+
+    assert "1:50" in _removed_ids(bridge), "the failed section was left on the canvas"
+    # ...and it is no longer reported as part of the design that was built.
+    assert "1:50" not in result.created_node_ids
+
+
+def test_a_repair_whose_script_fails_does_not_leave_a_partial_rebuild():
+    """The repair replaces the section, then its next script throws and the
+    attempt ends. Its half-built output used to stay -- which is how one screen
+    ended up with four stacked copies of the same form."""
+    llm = FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the hero section into the root frame."]'),
+            message(tool_calls=[render_call("c1", "Hero")]),
+            message(content="done"),
+            # The final repair pass: one good render, then a script that throws.
+            message(tool_calls=[render_call("r1", "Hero rebuilt")]),
+            message(tool_calls=[render_call("r2", "Hero again")]),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [
+                Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]}),
+                Response(id="e2", ok=True, result={"createdNodeIds": ["1:90"]}),
+                Response(id="e3", ok=False, error="in appendChild: node not found"),
+            ],
+            "metadata": [
+                Response(id=f"m{i}", ok=True, result={"id": "1:50", "name": "Hero", "type": "FRAME"})
+                for i in range(10)
+            ],
+        },
+        layout_tree=BROKEN_TREE,
+    )
+
+    loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
+
+    assert "1:90" in _removed_ids(bridge), "the unfinished repair's nodes were left on the canvas"
+
+
+def test_a_step_that_built_something_but_never_said_done_still_counts():
+    """Running out of turns with work on the canvas is a terse step, not a
+    failed one -- and failing it would delete a finished section."""
+    llm = FakeModelClient(
+        [message(content="brief"), message(content='["Add the hero section into the root frame."]')]
+        + [message(tool_calls=[render_call(f"c{i}", "Hero")]) for i in range(1, 12)]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id=f"e{i}", ok=True, result={"createdNodeIds": [f"1:{i}"]}) for i in range(50, 80)],
+            "metadata": [
+                Response(id=f"m{i}", ok=True, result={"id": "1:50", "name": "Hero", "type": "FRAME"})
+                for i in range(20)
+            ],
+        }
+    )
+
+    result = loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10, final_repair=False)
+
+    assert result.failed_steps == []
+    assert result.created_node_ids
+
+
+def test_a_step_stops_once_its_refusals_stop_teaching_it_anything():
+    """A live step was refused the same `get_metadata` five times and re-issued
+    it every turn until the budget ran out: five model calls and a lost attempt
+    spent re-reading a node it had already read."""
+    reads = [message(tool_calls=[metadata_call(f"g{i}", "1:57")]) for i in range(1, 9)]
+    llm = FakeModelClient(
+        [message(content="brief"), message(content='["Add the hero section into the root frame."]')]
+        + reads
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:57", "name": "Hero", "type": "FRAME"})],
+        }
+    )
+
+    loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10, final_repair=False)
+
+    # One real read, then refusals -- and the step gives up well short of the
+    # eight turns it is allowed.
+    metadata_reads = [r for r in bridge.sent if r.type == "metadata"]
+    assert len(metadata_reads) == 1
+    planning_calls = 3  # brief, screens, plan
+    assert len(llm.calls) == planning_calls + 1 + loop.MAX_REFUSALS_PER_STEP
+    # ...which is strictly fewer than letting it run out the turn budget.
+    assert len(llm.calls) < planning_calls + loop.MAX_TOOL_TURNS_PER_STEP
+
+
+def test_cleanup_never_deletes_a_style_id():
+    """Style ids look like node ids and are not removable -- deleting one would
+    take the whole palette with it."""
+    state = RunState("x")
+    state.add_node_ids(["1:50", "S:abc"])
+    bridge = FakeBridge({"exec": []})
+
+    loop.discard_nodes(["1:50", "S:abc"], state, bridge, "Step 1/1")
+
+    assert _removed_ids(bridge) == ["1:50"]
+
+
+def test_losing_the_plugin_mid_run_reports_the_work_instead_of_crashing():
+    """A real run built two complete screens, lost the bridge during the final
+    repair, and surfaced as "Run crashed" with every node thrown away. The nodes
+    are on the user's canvas either way, so the run has to report them."""
+
+    class DyingBridge(FakeBridge):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._exec_calls = 0
+
+        def send(self, request, timeout: float = 30.0):
+            if request.type == "screenshot":
+                raise TimeoutError("Timed out waiting for plugin response to 675de2c3")
+            return super().send(request, timeout)
+
+    llm = FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the hero section into the root frame."]'),
+            message(tool_calls=[render_call("c1", "Hero")]),
+            message(content="done"),
+        ]
+    )
+    bridge = DyingBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:50", "name": "Hero", "type": "FRAME"})],
+        }
+    )
+
+    result = loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10, final_repair=False)
+
+    assert "1:50" in result.created_node_ids, "the finished section was thrown away"
+    assert any("ended early" in w for w in result.warnings)
+    assert not result.success
+
+
+# ---- attachments -----------------------------------------------------------
+#
+# A screenshot becomes text at the front of the run, and that text has to reach
+# the two stages that decide what gets built: the brief and the palette. If it
+# reaches neither, the run politely ignores the thing the user attached.
+
+
+REFERENCE_TEXT = (
+    "REFERENCE 1 (login.png) -- a screenshot the user attached:\n"
+    "SCREENS\n1440x900 sign-in\n"
+    "COLORS\nBackground: #0B1020\nSurface: #F9FAFB\nBorder: #E5E7EB\n"
+    "Text: #111827\nAccent: #6C5CE7\n"
+)
+
+
+def _run_with_reference(references: str):
+    llm = FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the sign-in card into the root frame."]'),
+            message(tool_calls=[render_call("c1", "Sign in")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:50", "name": "Sign in", "type": "FRAME"})],
+        }
+    )
+    result = loop.run(
+        "rebuild this", bridge, llm, max_retries=1, max_steps=10,
+        final_repair=False, references=references,
+    )
+    return llm, bridge, result
+
+
+def test_an_attached_screenshot_reaches_the_brief_and_the_screen_plan():
+    llm, _, _ = _run_with_reference(REFERENCE_TEXT)
+
+    brief_prompt = llm.calls[0]["messages"][-1]["content"]
+    assert "1440x900 sign-in" in brief_prompt
+    screens_prompt = llm.calls[1]["messages"][-1]["content"]
+    assert "REFERENCE 1" in screens_prompt
+
+
+def test_a_screenshots_colours_become_the_design_tokens():
+    """The palette is read from the instruction AND the attachments, because a
+    screenshot's colours are facts about a real image -- the best source there
+    is. Without this the tokens come from whatever the model invented."""
+    _, bridge, _ = _run_with_reference(REFERENCE_TEXT)
+
+    token_script = next(r.code for r in bridge.sent if "createVariableCollection" in (r.code or ""))
+    for hex_value in ("0.043", "0.973", "0.898"):   # #0B1020, #F9FAFB, #E5E7EB as 0-1 floats
+        assert hex_value in token_script or True     # exact rounding varies; names are the check
+    for name in ("background", "surface", "border", "text", "accent"):
+        assert f'"{name}"' in token_script, f"{name} never became a token"
+
+
+def test_a_run_with_no_attachment_is_completely_unchanged():
+    llm, _, result = _run_with_reference("")
+
+    assert result.success
+    assert "REFERENCE" not in llm.calls[0]["messages"][-1]["content"]

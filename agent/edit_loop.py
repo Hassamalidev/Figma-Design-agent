@@ -42,6 +42,7 @@ from agent.loop import (
     _stop_if_asked,
     _tool_result_message,
     read_layout,
+    upload_assets,
 )
 from agent.prompts import (
     EDIT_PLANNING_SYSTEM_PROMPT,
@@ -72,18 +73,26 @@ def run(
     run_metrics=None,
     should_stop=None,
     references: str = "",
+    attachments: list | None = None,
 ) -> RunResult:
     """Apply the requested changes to whatever is already in the file."""
     with metrics.recording(run_metrics) as measured:
-        result = _run(instruction, bridge, llm, max_retries, max_steps, should_stop, references)
+        result = _run(
+            instruction, bridge, llm, max_retries, max_steps, should_stop, references,
+            attachments,
+        )
     result.metrics = measured.snapshot()
     logger.info("Edit cost: %s", measured.summary())
     return result
 
 
-def _run(instruction, bridge, llm, max_retries, max_steps, should_stop, references="") -> RunResult:
+def _run(
+    instruction, bridge, llm, max_retries, max_steps, should_stop, references="",
+    attachments=None,
+) -> RunResult:
     state = RunState(instruction=instruction)
     state.references = references
+    state.attachments = list(attachments or [])
     state.should_stop = should_stop
     state.visual_gate_enabled = False  # the edit gate is its own, below
     try:
@@ -123,6 +132,17 @@ def _apply(state: RunState, bridge: Bridge, llm: ModelClient, max_retries: int, 
         f", {len(canvas.selection)} selected" if canvas.selection else "",
     )
     adopt_existing_styles(state, bridge)
+    # "Put this photo in the header" is an edit like any other, so the pictures
+    # the user attached are uploaded here too -- once, before any step runs.
+    upload_assets(state, bridge)
+    # Every top-level frame, by name: what `set_interaction` may point at. Edit
+    # mode never CREATES a screen, so this is read from the canvas rather than
+    # from a plan.
+    state.screens = [
+        Screen(name=str(root.get("name") or "Screen"), frame_id=str(root.get("id")))
+        for root in canvas.roots
+        if root.get("id")
+    ]
 
     steps = plan_edits(state, canvas, llm)[:max_steps]
     state.plan = [PlanStep(description=s, screen_index=0, render_only=False) for s in steps]
@@ -381,6 +401,8 @@ def converse_edit(
                 pairings=state.readable_pairings,
                 applied=already_applied,
                 problems=problems,
+                assets=state.assets,
+                screens=state.screen_names(),
             ),
         },
     ]
@@ -390,6 +412,10 @@ def converse_edit(
         "token_names": list(state.token_names),
         # Top-level frames are whole screens. Nothing here may delete one.
         "protected_ids": {str(r.get("id")) for r in canvas.roots if r.get("id")},
+        # The user's attached pictures, and the screens a prototype link may
+        # point at -- the two things an edit can add that are not just colour.
+        "assets": list(state.assets),
+        "screens": state.screen_map(),
     }
 
     applied: list[str] = []

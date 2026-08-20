@@ -62,7 +62,12 @@ Rules you must follow:
    below, wrap: true for paragraphs) | button (variant primary/secondary)
    | badge (tone success/warning/error/info) | input | checkbox (label,
    checked) | avatar (size: N, a circle) | divider | box (height: N, for
-   chart/image/gradient areas).
+   chart/image/gradient areas) | image (asset: the file name of a picture the
+   user attached -- listed below when there is one; otherwise it is a
+   placeholder block).
+   Any node may take `"on_click": "<another screen's name>"` to make clicking
+   it navigate there in the prototype, or `"on_click": "back"`. The screens you
+   may link to are listed below when there is more than one.
    gap and padding are NAMES: xs sm md lg xl 2xl. radius: sm md lg xl.
    colour is a ROLE, never a hex: background, background-alt, surface, border,
    text, text-muted, text-on-alt, accent, on-accent, success, warning, error,
@@ -181,7 +186,7 @@ section, with real content and no placeholder text:
         {"kind":"input","label":"Email","placeholder":"you@company.com"},
         {"kind":"input","label":"Password","placeholder":"........"},
         {"kind":"text","style":"Caption","color":"accent","value":"Forgot password?"},
-        {"kind":"button","label":"Sign in","variant":"primary"},
+        {"kind":"button","label":"Sign in","variant":"primary","on_click":"Dashboard"},
         {"kind":"divider"},
         {"kind":"button","label":"Continue with Google","variant":"secondary"}]}]}
 
@@ -255,7 +260,7 @@ Known-good patterns -- mirror these exactly:
 STEP_USER_TEMPLATE = """\
 {design_context}{screen}{plan_outline}{repair}Current step: {step}
 
-{root_frame}{tokens}{fonts}{exemplars}
+{root_frame}{tokens}{assets}{links}{fonts}{exemplars}
 Relevant docs:
 {docs}
 
@@ -348,6 +353,21 @@ Build ONLY into the frame id below. The other screens ({others}) are separate \
 frames and are being built by their own steps; nothing you do here may touch \
 them or sit on top of them."""
 
+# What the REST of the design already looks like. Without it every screen is
+# designed from scratch and a file of five screens reads as five designs: five
+# different headers, five footers, five ideas about spacing.
+SHARED_DESIGN_NOTE = """\
+ALREADY BUILT ON THE OTHER SCREENS:
+{sections}
+
+This is one design, not several. If this screen needs any of those -- a header, \
+a nav, a footer -- build it to MATCH the one that already exists: same items in \
+the same order, same proportions, same type sizes. Copy the pattern; do not \
+invent a second version of it. Anything not listed there is new, and this \
+screen's own content is still its own.
+
+"""
+
 ROOT_FRAME_NOTE = """\
 This screen's frame ALREADY EXISTS -- do not create another one. Its id is \
 "{root_frame_id}" and it is a VERTICAL auto-layout frame. Get it with:
@@ -386,6 +406,44 @@ ROOT_FRAME_REPAIR_NOTE = """\
 This screen's frame is "{root_frame_id}". The nodes you are fixing are \
 ALREADY inside it -- do not append anything to it in this script, or the page \
 gets a second copy of the section.
+"""
+
+ASSETS_NOTE = """\
+THE USER ATTACHED THESE PICTURES, and they are already loaded into this Figma
+file. Place the real image wherever the design shows one -- a hero, a product
+shot, a logo, an avatar. A grey placeholder box beside an attachment the user
+gave you is a wasted attachment:
+
+{assets}
+
+ONE EXCEPTION, and it matters: if a picture is a SCREENSHOT OF AN INTERFACE,
+never place it. Rebuild what it shows out of real nodes -- text, inputs,
+buttons -- which is what you are being asked for. A screenshot of a UI pasted
+inside a UI is a picture of a design, not a design. Place photographs, logos,
+illustrations and product shots.
+
+  {{"kind":"image","asset":"{first}","height":320,"radius":"lg"}}
+  {{"kind":"avatar","asset":"{first}","size":48}}          // cropped to a circle
+  {{"kind":"section","image":"{first}","children":[...]}}  // photo BEHIND a section
+
+Use `"fit":"contain"` for a logo, so it is not cropped. Name the file exactly \
+as it appears above.
+
+"""
+
+LINK_TARGETS_NOTE = """\
+MAKE IT CLICKABLE. This is a prototype, not a picture of one -- the primary
+action of a section should really navigate. Add `on_click` to the node that
+does it, naming one of the OTHER screens:
+
+  {{"kind":"button","label":"Sign in","variant":"primary","on_click":"{first}"}}
+  {{"kind":"text","value":"Create account","color":"accent","on_click":"{first}"}}
+
+Screens you may link to: {screens}
+`"on_click":"back"` returns to the previous screen. Wire the ONE thing that \
+obviously navigates -- a submit button, a nav item, a card that opens a \
+detail screen -- not every node on the page.
+
 """
 
 CONTRAST_NOTE = """
@@ -676,7 +734,10 @@ def step_user_message(
     pairings: list[str] | None = None,
     screen_name: str = "",
     other_screens: list[str] | None = None,
+    shared_sections: list[str] | None = None,
     render_only: bool = False,
+    assets: list | None = None,
+    link_targets: list[str] | None = None,
 ) -> str:
     repair = repair_note(prior_node_ids, prior_defects, prior_error)
     screen_note = ""
@@ -689,6 +750,10 @@ def step_user_message(
             else ""
         )
         screen_note = SCREEN_NOTE.format(screen=screen_name, siblings=siblings)
+    if shared_sections:
+        screen_note += SHARED_DESIGN_NOTE.format(
+            sections="\n".join(f"  - {name}" for name in shared_sections[:12])
+        )
 
     root_note = ""
     if root_frame_id and repair:
@@ -723,6 +788,24 @@ def step_user_message(
             ) if pairings else "",
         )
 
+    # The user's own pictures, already in the file. Named exactly, because the
+    # renderer matches on the name and an invented one is refused.
+    assets_note = ""
+    if assets:
+        assets_note = ASSETS_NOTE.format(
+            assets="\n".join(f"  - {a.describe()}" for a in assets),
+            first=assets[0].name,
+        )
+
+    # The other screens, so the primary action of this section can really
+    # navigate. Only when there IS somewhere to go.
+    links_note = ""
+    if link_targets:
+        links_note = LINK_TARGETS_NOTE.format(
+            first=link_targets[0],
+            screens=", ".join(f'"{name}"' for name in link_targets),
+        )
+
     fonts_note = ""
     if font_styles:
         fonts_note = (
@@ -737,6 +820,8 @@ def step_user_message(
         state_summary=state_summary,
         root_frame=root_note,
         tokens=tokens_note,
+        assets=assets_note,
+        links=links_note,
         fonts=fonts_note,
         exemplars=(
             RENDER_EXEMPLARS if render_only
@@ -849,6 +934,8 @@ The ops, and what each needs:
     {"op":"set_radius",     "target":"1:3",  "radius":"lg"}
     {"op":"set_visible",    "target":"1:9",  "visible":false}
     {"op":"set_name",       "target":"1:9",  "name":"Primary Button"}
+    {"op":"set_image",      "target":"1:9",  "asset":"hero.png"}
+    {"op":"set_interaction","target":"1:9",  "to":"Dashboard"}
     {"op":"reorder",        "target":"1:9",  "index":0}
     {"op":"delete",         "target":"1:9"}
     {"op":"insert",         "parent":"1:3",  "index":2, "spec":{...}}
@@ -869,7 +956,13 @@ see rule 5.
     {"kind":"text","style":"Body","color":"text-muted","value":"..."},
     {"kind":"button","label":"Got it","variant":"primary"}]}
   kinds: section, card, row, col (containers, take `children`) | text | button |
-  badge | input | checkbox | avatar | divider | box.
+  badge | input | checkbox | avatar | divider | box | image.
+
+`set_image` only works with a picture the user attached to THIS run; the ones
+available are listed below when there are any. `set_interaction` makes clicking
+a node navigate to another screen in the prototype (`"action":"back"` goes
+back) -- use it when the user asks for something to be clickable or to link
+somewhere.
 
 When the change is done, reply with one short sentence and NO tool call.
 """
@@ -949,6 +1042,8 @@ def edit_step_user_message(
     pairings: list[str] | None = None,
     applied: list[str] | None = None,
     problems: list[str] | None = None,
+    assets: list | None = None,
+    screens: list[str] | None = None,
 ) -> str:
     """Everything the editing agent needs to make one change correctly.
 
@@ -992,6 +1087,21 @@ def edit_step_user_message(
         )
     if text_style_names:
         parts.append(f"Text styles: {', '.join(text_style_names)}\n")
+    if assets:
+        parts.append(
+            "Pictures the user attached to this run, usable with "
+            '`{"op":"set_image","target":"<id>","asset":"<name>"}` or inside an '
+            "`insert` spec:\n"
+            + "\n".join(f"  - {a.describe()}" for a in assets)
+            + "\n"
+        )
+    if screens and len(screens) > 1:
+        parts.append(
+            "Screens in this file, for "
+            '`{"op":"set_interaction","target":"<id>","to":"<screen>"}`: '
+            + ", ".join(f'"{name}"' for name in screens)
+            + "\n"
+        )
 
     parts.append(f"THE CANVAS RIGHT NOW (copy ids from here exactly):\n{listing}\n")
     parts.append("Make this change with one `edit_ui` call.")
@@ -1054,3 +1164,60 @@ The interactive parts you can see: inputs, buttons, checkboxes, toggles, tabs,
 avatars, icons, charts. Note the shape of each (corner radius, height, whether
 it is outlined or filled).
 """
+
+
+# The one model call the prototype pass makes, and only when name-matching
+# left a screen unreachable. Everything a string comparison CAN decide has
+# already been decided (agent/interactions.py) -- this is asked exactly the
+# question that needs judgement: which of these buttons opens that screen?
+PROTOTYPE_SYSTEM_PROMPT = """\
+You are wiring a finished Figma design into a clickable prototype.
+
+You are given a list of elements that are not linked to anything yet, the
+screens in the design, and the screens that nothing currently opens. Say which
+element opens which screen.
+
+Reply with ONLY a JSON array, no prose:
+
+  [{"id": "12:34", "to": "Dashboard"},
+   {"id": "12:40", "to": "Sign Up"},
+   {"id": "12:55", "action": "back"}]
+
+Rules:
+- `id` must be copied EXACTLY from the list. An id that is not on the list is
+  discarded, and so is a screen name that is not in the design.
+- Link the element a person would actually click to get there: the primary
+  button, the nav item, the card that opens a detail view. Not a heading, not
+  a label, not decoration.
+- Prefer to give every unreachable screen a way in. One good link each is
+  worth more than ten speculative ones.
+- Use {"action": "back"} for anything that means going back or cancelling.
+- If nothing on the list plausibly opens a screen, leave that screen out. An
+  invented link is worse than a missing one.
+"""
+
+PROTOTYPE_USER_TEMPLATE = """\
+The design was built from: {instruction}
+
+Screens in this design: {screens}
+Nothing currently opens: {stranded}
+
+Elements that are not linked yet -- id, label, and the screen it sits on:
+{candidates}
+
+Which of these open the screens nobody can reach? JSON array only.
+"""
+
+
+def prototype_user_message(
+    instruction: str,
+    candidates: list[str],
+    screens: list[str],
+    stranded: list[str],
+) -> str:
+    return PROTOTYPE_USER_TEMPLATE.format(
+        instruction=instruction.strip()[:400],
+        screens=", ".join(f'"{name}"' for name in screens),
+        stranded=", ".join(f'"{name}"' for name in stranded),
+        candidates="\n".join(f"  {line}" for line in candidates) or "  (none)",
+    )

@@ -340,3 +340,95 @@ def test_every_destructive_op_is_covered_by_the_guard():
     for op in editor.DESTRUCTIVE_OPS:
         body = source.split(f"def {op}(self")[1].split("\n    def ")[0]
         assert "guard_removal" in body, f"{op} removes nodes but is not guarded"
+
+
+# ---- pictures and prototype links ------------------------------------------
+#
+# The two things a real Figma design has that a static mockup does not. Both
+# were added to edit mode for the same reason as everything else here: the user
+# can ask for them, and rebuilding a screen to change one is not an edit.
+
+from agent.assets import ImageAsset  # noqa: E402
+
+HERO = ImageAsset(name="hero.png", key="hero", image_hash="hash-1", width=1600, height=900)
+SCREEN_FRAMES = {"Login": "1:2", "Dashboard": "8:1"}
+
+
+def compile_rich(resolve, *edits, assets=(HERO,), screens=None):
+    return editor.compile_edits(
+        list(edits), resolve, ROLES, TOKENS, {"1:2"},
+        assets=list(assets), screens=dict(screens if screens is not None else SCREEN_FRAMES),
+    )
+
+
+def test_an_attached_picture_can_be_dropped_onto_an_existing_node(resolve):
+    js, touched = compile_rich(resolve, {"op": "set_image", "target": "1:9", "asset": "hero.png"})
+
+    assert "hash-1" in js and "'IMAGE'" in js
+    assert touched == ["1:9"]
+    assert compiles_as_async_body(js)
+
+
+def test_set_image_with_no_attachment_says_what_to_do(resolve):
+    with pytest.raises(SpecError, match="Attach an image"):
+        compile_rich(resolve, {"op": "set_image", "target": "1:9"}, assets=())
+
+
+def test_set_image_with_an_unknown_name_lists_the_real_ones(resolve):
+    with pytest.raises(SpecError, match="hero.png"):
+        compile_rich(resolve, {"op": "set_image", "target": "1:9", "asset": "banner.jpg"})
+
+
+def test_a_button_can_be_made_to_navigate(resolve):
+    js, _ = compile_rich(resolve, {"op": "set_interaction", "target": "1:9", "to": "Dashboard"})
+
+    assert "setReactionsAsync(" in js
+    assert '"destinationId": "8:1"' in js
+    assert compiles_as_async_body(js)
+
+
+def test_an_interaction_to_a_screen_that_does_not_exist_is_refused(resolve):
+    """A dead prototype link looks wired and does nothing, which is worse than
+    not wiring it: the user finds out by clicking."""
+    with pytest.raises(SpecError, match="no screen"):
+        compile_rich(resolve, {"op": "set_interaction", "target": "1:9", "to": "Checkout"})
+
+
+def test_back_needs_no_screen_at_all(resolve):
+    js, _ = compile_rich(
+        resolve, {"op": "set_interaction", "target": "1:9", "action": "back"}, screens={}
+    )
+
+    assert '"BACK"' in js
+
+
+def test_neither_new_op_can_remove_anything(resolve):
+    """`DESTRUCTIVE_OPS` is the list the removal guard hangs off. Adding an op
+    that removes something without adding it there is the hole that emptied a
+    real user's file."""
+    assert "set_image" not in editor.DESTRUCTIVE_OPS
+    assert "set_interaction" not in editor.DESTRUCTIVE_OPS
+
+    js, _ = compile_rich(
+        resolve,
+        {"op": "set_image", "target": "1:9", "asset": "hero.png"},
+        {"op": "set_interaction", "target": "1:9", "to": "Dashboard"},
+    )
+    assert ".remove()" not in js
+
+
+def test_an_inserted_section_does_not_end_the_batch_early(resolve):
+    """The renderer's own `return` is rewritten when its body is inlined. That
+    rewrite matched a fixed string and the return line has since grown a field
+    -- so a missed match would silently discard every edit after an insert."""
+    js, _ = compile_rich(
+        resolve,
+        {"op": "insert", "parent": "1:3", "spec": {"kind": "text", "value": "Hi"}},
+        {"op": "set_name", "target": "1:9", "name": "Primary"},
+    )
+
+    assert "createdNodeIds: created" not in js  # the inlined return is gone
+    assert js.rstrip().endswith(
+        "return { createdNodeIds: madeIds, appliedEdits: applied, failedEdits: failed };"
+    )
+    assert compiles_as_async_body(js)

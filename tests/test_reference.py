@@ -79,16 +79,33 @@ def test_the_total_size_is_capped_even_when_each_file_is_legal():
 # ---- refusing what cannot be read -----------------------------------------
 
 
-def test_an_image_with_no_vision_model_is_refused_not_ignored():
-    """Building something generic while the user watches, having attached a
-    screenshot, is the worst possible outcome."""
+def test_a_placeable_image_with_no_vision_model_warns_rather_than_refusing():
+    """This line moved when images started being PLACED as well as read.
+
+    A PNG with no vision model used to be a dead end. It is now a picture the
+    design can genuinely show -- it just cannot be built to RESEMBLE it -- and
+    refusing to start over that is refusing work the agent can really do. The
+    warning is loud and names the setting that fixes it.
+    """
     items = reference.from_payload([payload("shot.png", b"data")])
+
+    warnings = reference.check_readable(items, has_vision=False)
+
+    assert len(warnings) == 1
+    assert "PLACED" in warnings[0] and "not read" in warnings[0]
+    assert "Settings -> Vision model" in warnings[0]   # ...and how to fix it
+
+
+def test_an_unplaceable_image_with_no_vision_model_is_still_refused():
+    """A WEBP can neither be read nor put on the canvas, so accepting it would
+    mean building something generic while the user watches."""
+    items = reference.from_payload([payload("shot.webp", b"data")])
 
     with pytest.raises(reference.ReferenceError) as caught:
         reference.check_readable(items, has_vision=False)
 
     assert "no vision model" in str(caught.value)
-    assert "Settings -> Vision model" in str(caught.value)   # ...and how to fix it
+    assert "Settings -> Vision model" in str(caught.value)
 
 
 def test_an_image_with_a_vision_model_is_accepted():

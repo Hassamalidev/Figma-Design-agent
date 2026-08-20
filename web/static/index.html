@@ -1245,6 +1245,8 @@ details.drawer > summary:hover { color: var(--text-1); }
       "Preselect whichever file is currently open with the plugin running."],
     final_repair: ["Fix issues at the end",
       "After the design is built, go back over every screen and rebuild the sections that are still broken, unfinished or duplicated. Costs a few extra model calls."],
+    prototype: ["Clickable prototype",
+      "Wire the finished design up so it actually works: buttons navigate between screens, “Back” goes back, long pages scroll. Press ▶ in Figma to try it."],
     max_retries: ["Retries per step",
       "Attempts before a step falls back to a labelled placeholder."],
     max_steps: ["Max steps",
@@ -1496,6 +1498,10 @@ details.drawer > summary:hover { color: var(--text-1); }
     // tall page, and it is the first thing to check is what you asked for.
     var screens = r.screens || [];
     if (screens.length > 1) sub.push(screens.length + " screens");
+    // A design you can click through is a different deliverable from a
+    // picture of one, so it is said up front rather than buried in a drawer.
+    var links = r.interactions || [];
+    if (links.length) sub.push(links.length + " interaction" + (links.length === 1 ? "" : "s"));
     if (met.length || missing.length) sub.push(met.length + "/" + (met.length + missing.length) + " requirements met");
     sub.push(r.created_node_count + " nodes");
     if (m.elapsed_seconds) sub.push(fmtDuration(m.elapsed_seconds));
@@ -1525,6 +1531,7 @@ details.drawer > summary:hover { color: var(--text-1); }
         stat(m.model.p95_seconds + "s", "model p95") + "</div>";
     }
 
+    h += drawer("Prototype links", links);
     h += drawer("Layout issues", r.layout_defects);
     h += drawer("Design system notes", r.design_notes);
     h += drawer("Warnings", r.warnings);

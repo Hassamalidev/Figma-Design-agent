@@ -114,6 +114,8 @@ PREF_SPECS: dict[str, BoolPref | IntPref] = {
     "auto_select": BoolPref(default=True),
     # after the design is built, go back and fix what the review found
     "final_repair": BoolPref(default=True),
+    # wire the finished design up as a clickable prototype
+    "prototype": BoolPref(default=True),
 }
 PREFS = tuple(PREF_SPECS)
 INT_PREFS = tuple(k for k, s in PREF_SPECS.items() if isinstance(s, IntPref))

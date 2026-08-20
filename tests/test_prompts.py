@@ -129,3 +129,53 @@ def test_repair_after_a_thrown_script_explains_what_survived():
     assert "1:1" in note
     assert "lineHeight" in note
     assert "continue from them rather than rebuilding" in note
+
+
+# ---- the two things only THIS run knows ------------------------------------
+#
+# An attachment the builder is never told about is an attachment that never
+# gets placed, and a screen it is never told about is a button that never
+# navigates. Both are plumbing, and plumbing is what this file guards.
+
+from agent.assets import ImageAsset  # noqa: E402
+
+HERO = ImageAsset(name="hero.png", key="hero", image_hash="h1", width=1600, height=900)
+
+
+def test_the_step_prompt_names_the_pictures_that_were_attached():
+    prompt = step_user_message(
+        "Add the hero.", docs="", state_summary="(none)", assets=[HERO], render_only=True
+    )
+    assert "hero.png" in prompt
+    assert "1600x900" in prompt
+    assert '"kind":"image"' in prompt
+
+
+def test_a_run_with_no_attachment_says_nothing_about_pictures():
+    prompt = step_user_message("Add the hero.", docs="", state_summary="(none)")
+    assert "ATTACHED" not in prompt
+
+
+def test_the_step_prompt_says_a_ui_screenshot_must_be_rebuilt_not_pasted():
+    """The one way this feature makes output worse: a screenshot of a design
+    placed inside the design."""
+    prompt = step_user_message(
+        "Add the hero.", docs="", state_summary="(none)", assets=[HERO]
+    )
+    assert "SCREENSHOT OF AN INTERFACE" in prompt
+
+
+def test_the_step_prompt_lists_the_screens_a_button_may_open():
+    prompt = step_user_message(
+        "Add the sign-in card.", docs="", state_summary="(none)",
+        link_targets=["Dashboard", "Sign Up"],
+    )
+    assert "on_click" in prompt
+    assert '"Dashboard"' in prompt and '"Sign Up"' in prompt
+
+
+def test_a_single_screen_run_is_never_told_to_wire_anything():
+    """There is nowhere to navigate to, and offering the option would only
+    produce links to screens that do not exist."""
+    prompt = step_user_message("Add the card.", docs="", state_summary="(none)")
+    assert "MAKE IT CLICKABLE" not in prompt

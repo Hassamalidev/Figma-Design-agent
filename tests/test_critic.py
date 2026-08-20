@@ -646,3 +646,40 @@ def test_an_empty_frame_the_colour_of_its_background_IS_still_a_blank_region():
                  "fill": {"r": 1, "g": 1, "b": 1}, "children": []}]}
 
     assert any(d.kind == "empty-frame" for d in critic.find_layout_defects(tree))
+
+
+def test_a_frame_showing_a_picture_is_not_an_empty_frame():
+    """The harness marking its own output as a defect, again: an image fill has
+    no single RGB, so `fill` is None -- but a childless frame showing the
+    user's photograph is exactly what `kind: "image"` builds (section 22)."""
+    tree = {
+        "id": "1:2", "name": "Hero", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 600, "visible": True, "layoutMode": "VERTICAL",
+        "fill": (1.0, 1.0, 1.0),
+        "children": [
+            {"id": "1:3", "name": "hero.jpg", "type": "FRAME", "x": 0, "y": 0,
+             "width": 1200, "height": 400, "visible": True, "layoutMode": "VERTICAL",
+             "fill": None, "hasPaint": True, "children": []}
+        ],
+    }
+
+    kinds = [d.kind for d in critic.find_layout_defects(tree)]
+
+    assert "empty-frame" not in kinds
+
+
+def test_a_frame_with_nothing_painted_in_it_is_still_reported():
+    tree = {
+        "id": "1:2", "name": "Hero", "type": "FRAME", "x": 0, "y": 0,
+        "width": 1440, "height": 600, "visible": True, "layoutMode": "VERTICAL",
+        "fill": (1.0, 1.0, 1.0),
+        "children": [
+            {"id": "1:3", "name": "Gap", "type": "FRAME", "x": 0, "y": 0,
+             "width": 1200, "height": 400, "visible": True, "layoutMode": "VERTICAL",
+             "fill": None, "hasPaint": False, "children": []}
+        ],
+    }
+
+    kinds = [d.kind for d in critic.find_layout_defects(tree)]
+
+    assert "empty-frame" in kinds

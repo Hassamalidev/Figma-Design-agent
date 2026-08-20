@@ -8,7 +8,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from agent import critic, metrics, planner, renderer, requirements, scaffold
+from agent import assets as assets_module
+from agent import critic, interactions, metrics, planner, renderer, requirements, scaffold
+from agent import prompts, vision_probe
 from agent.llm import ModelClient
 from agent.metrics import RunMetrics
 from agent.prompts import step_user_message, system_prompt
@@ -44,15 +46,29 @@ const summary = page.children.slice(0, 50).map(function (n) {
 return { createdNodeIds: [], pageName: page.name, topLevelNodes: summary };
 """
 
-# Never guess a font style string: a live run died on "Inter SemiBold" because
-# the real style is "Semi Bold" with a space. Discover them at runtime.
+# Never guess a font string: a live run died on "Inter SemiBold" because the
+# real style is "Semi Bold" with a space. Discover them at runtime -- and the
+# same rule applies to the FAMILY. A design that asks for Playfair Display
+# names a family this file may or may not have, so the wanted families are
+# offered to Figma and only what comes back is ever used.
 FONT_SCRIPT = """\
+const wanted = __WANTED__;
 const fonts = await figma.listAvailableFontsAsync();
-const styles = [];
+const families = {};
 for (const f of fonts) {
-  if (f.fontName.family === 'Inter') { styles.push(f.fontName.style); }
+  const family = f.fontName.family;
+  const key = family.toLowerCase();
+  if (key !== 'inter' && wanted.indexOf(key) === -1) { continue; }
+  if (!families[family]) { families[family] = []; }
+  if (families[family].indexOf(f.fontName.style) === -1) {
+    families[family].push(f.fontName.style);
+  }
 }
-return { createdNodeIds: [], interStyles: styles };
+return {
+  createdNodeIds: [],
+  interStyles: families['Inter'] || [],
+  families: families
+};
 """
 
 # Gap left between an existing design and a newly created one, so a second run
@@ -89,6 +105,8 @@ def run(
     final_repair: bool = True,
     should_stop=None,
     references: str = "",
+    attachments: list | None = None,
+    prototype: bool = True,
 ) -> RunResult:
     """Build the design, measuring what it cost.
 
@@ -105,7 +123,7 @@ def run(
     with metrics.recording(run_metrics) as measured:
         result = _run(
             instruction, bridge, llm, max_retries, max_steps, visual_gate, critic_llm,
-            final_repair, should_stop, references,
+            final_repair, should_stop, references, attachments, prototype,
         )
     result.metrics = measured.snapshot()
     logger.info("Run cost: %s", measured.summary())
@@ -123,18 +141,20 @@ def _run(
     final_repair: bool = True,
     should_stop=None,
     references: str = "",
+    attachments: list | None = None,
+    prototype: bool = True,
 ) -> RunResult:
     state = RunState(instruction=instruction)
     state.references = references
+    state.attachments = list(attachments or [])
+    state.prototype_enabled = prototype
     state.should_stop = should_stop
     state.visual_gate_enabled = visual_gate
     # A separate vision model, if one is configured. The generator needs
     # reliable tool calling; the critic needs eyes. Rarely the same model.
     state.critic_llm = critic_llm
     if critic_llm is None:
-        # Never send images to a model not known to accept them: a text-only
-        # endpoint 400s, which costs a round trip per step to rediscover.
-        state.model_sees_images = False
+        _enable_self_review(state, llm)
 
     try:
         return _build(state, bridge, llm, max_retries, max_steps, final_repair)
@@ -195,6 +215,7 @@ def _build(
 
     create_screens(state, bridge)     # deterministic: every section needs this parent
     bootstrap_tokens(state, bridge)   # deterministic: the model never has to write these
+    upload_assets(state, bridge)      # the user's own pictures, ready to be placed
 
     state.plan = plan_all_screens(state, llm, max_steps)  # components -> composition
 
@@ -207,7 +228,10 @@ def _build(
         run_step(step, state, bridge, llm, max_retries, index, total)
 
     logger.info("Final validation: screenshot + variable-binding audit...")
-    final_validation(state, bridge, llm if final_repair else None)  # 4. whole-screen screenshot
+    # The model is handed over for both end-of-run jobs; each is gated by its
+    # own preference inside, so "no repair pass" never silently means "no
+    # prototype" as well.
+    final_validation(state, bridge, llm, final_repair)  # 4. whole-screen screenshot
     logger.info("Done. Success=%s, created %d node(s).", not state.failed_steps, len(state.created_node_ids))
     return state.result()
 
@@ -225,6 +249,7 @@ def _stop_gracefully(state: RunState, bridge: Bridge) -> RunResult:
     logger.info("Stopped by request after %d node(s).", len(state.created_node_ids))
     state.warnings.insert(0, "You stopped this run, so the design is unfinished.")
     try:
+        fit_screens_to_viewport(state, bridge)
         capture_screens(state, bridge)
         final_layout_review(state, bridge)
     except Exception as exc:
@@ -232,6 +257,41 @@ def _stop_gracefully(state: RunState, bridge: Bridge) -> RunResult:
         # "you stopped it" with a crash.
         logger.info("Could not finish tidying up after the stop: %s", exc)
     return state.result()
+
+
+def _enable_self_review(state: RunState, llm: ModelClient) -> None:
+    """Let the builder be its own critic, when it can actually see.
+
+    Two models is the right split when they are genuinely different animals --
+    the generator needs reliable tool calling, the critic needs eyes. But it
+    left the single most valuable check in this project switched off by
+    default: `CRITIC_MODEL_NAME` is blank in most setups, and a blank critic
+    hard-disabled screenshot review, so nothing ever looked at the design.
+    Multimodal models that also call tools are now ordinary, and one model that
+    builds a section and then looks at a picture of it needs no configuration
+    at all.
+
+    PROBED, not assumed (CLAUDE.md section 8e). A model name says nothing about
+    whether it can see, and the dangerous case is not the endpoint that refuses
+    the image -- it is the one that ACCEPTS it and answers from the text alone,
+    where critique still comes back and every defect in it is invented. The
+    probe sends a solid blue square and checks the model says "blue".
+
+    Costs one small call per run, once, and only when no critic is configured.
+    """
+    if not state.visual_gate_enabled:
+        state.model_sees_images = False
+        return
+    result = vision_probe.probe_vision(llm)
+    if result.ok:
+        state.critic_llm = llm
+        state.model_sees_images = True
+        logger.info("No critic configured -- the builder will review its own work (%s)", result.detail)
+        return
+    # Never send images to a model not known to accept them: a text-only
+    # endpoint 400s, which would cost a round trip per step to rediscover.
+    state.model_sees_images = False
+    logger.info("Screenshot review is off: %s", result.detail)
 
 
 def inspect_file(state: RunState, bridge: Bridge) -> None:
@@ -249,14 +309,40 @@ def inspect_file(state: RunState, bridge: Bridge) -> None:
 
 
 def discover_fonts(state: RunState, bridge: Bridge) -> None:
-    """Read the real Inter style strings so no script has to guess them."""
-    result = execute_figma_js(bridge, FONT_SCRIPT)
+    """Read the real font strings, so no script has to guess a family or a weight.
+
+    The instruction's font names are guesses until Figma confirms them: a brief
+    can ask for anything, and a text style set to a family the file does not
+    have throws the moment anything uses it. So the candidates go out and only
+    what comes back is used -- the same rule this project already applies to
+    style strings.
+    """
+    candidates = scaffold.candidate_fonts(state.design_source())
+    result = execute_figma_js(
+        bridge,
+        FONT_SCRIPT.replace(
+            "__WANTED__", json.dumps([name.lower() for name in candidates])
+        ),
+    )
     if not result["ok"]:
         return
-    styles = (result.get("result") or {}).get("interStyles") or []
+    payload = result.get("result") or {}
+    styles = payload.get("interStyles") or []
     state.font_styles = [s for s in styles if isinstance(s, str)][:20]
     if state.font_styles:
         logger.info("Inter styles available: %s", ", ".join(state.font_styles))
+
+    families = payload.get("families") or {}
+    state.display_family = scaffold.pick_display_family(candidates, families)
+    state.text_fonts = scaffold.ramp_fonts(state.display_family, families)
+    if state.display_family:
+        logger.info(
+            "Brand font: %s (headings) with Inter for UI text.", state.display_family
+        )
+    elif candidates:
+        # Named, wanted, and not in this file. Worth saying: the design will be
+        # built in Inter and the user is the only one who can fix that.
+        logger.info("None of %s is available in this file; using Inter.", ", ".join(candidates[:3]))
 
 
 SCREEN_Y = 200  # every screen sits on the same baseline, so they read as a row
@@ -297,6 +383,9 @@ def create_screens(state: RunState, bridge: Bridge) -> None:
             screen.width = width
         if height:
             screen.height = height
+            # ...and it stays the screenful this design is measured in, all
+            # the way to the end. See Screen.viewport_height.
+            screen.viewport_height = height
         existing = _match_existing_screen(state.existing_nodes, screen.name)
         # With a single screen, fall back to the old "continue whatever design
         # is here" behaviour -- a lone frame from an earlier run rarely happens
@@ -407,7 +496,7 @@ def _row_y(state: RunState) -> int:
 
 
 def plan_all_screens(state: RunState, llm: ModelClient, max_steps: int) -> list[PlanStep]:
-    """One plan per screen, concatenated, each step tagged with its screen.
+    """One plan per screen, INTERLEAVED, each step tagged with its screen.
 
     The step budget is SHARED OUT rather than applied to one combined plan:
     truncating a single list to `max_steps` cut whole screens off the end, so
@@ -421,7 +510,7 @@ def plan_all_screens(state: RunState, llm: ModelClient, max_steps: int) -> list[
         MAX_STEPS_PER_SCREEN, max(MIN_STEPS_PER_SCREEN, max_steps // len(buildable))
     )
     multi = len(buildable) > 1
-    steps: list[PlanStep] = []
+    by_screen: list[list[PlanStep]] = []
     for index in buildable:
         screen = state.screens[index]
         others = [s.name for j, s in enumerate(state.screens) if j != index]
@@ -438,11 +527,41 @@ def plan_all_screens(state: RunState, llm: ModelClient, max_steps: int) -> list[
         # the bottom of a screen -- a landing page shipped without its footer
         # and every step it did run passed, so nothing could notice.
         described = planner.fit_steps(described, per_screen)
-        steps.extend(PlanStep(description=text, screen_index=index) for text in described)
+        by_screen.append(
+            [PlanStep(description=text, screen_index=index) for text in described]
+        )
 
+    steps = _interleave_screens(by_screen)
     if len(steps) > max_steps:
         logger.info("Plan trimmed from %d to the %d-step cap.", len(steps), max_steps)
     return steps[:max_steps]
+
+
+def _interleave_screens(by_screen: list[list[PlanStep]]) -> list[PlanStep]:
+    """Round-robin the screens: every screen's first step, then every second.
+
+    The plan used to be screen-major -- all of Home, then all of Shop, then all
+    of Category. A run that does not reach the end therefore does not lose a
+    LITTLE of each screen, it loses whole screens: a real four-screen run
+    finished Home completely and left Shop, Category and Book Details as three
+    empty frames. Nothing about that is recoverable afterwards, and the user
+    cannot tell a design that ran out of time from one that was built wrong.
+
+    Interleaving turns a cliff into a slope. The same budget spent in this
+    order gives every screen its most important section first, so a run cut
+    short is a design that is thin everywhere rather than absent in three
+    quarters of the file. Within a screen the order is untouched: step order is
+    visual order (`planner.order_steps`), and a header still lands before the
+    footer beneath it.
+    """
+    if len(by_screen) < 2:
+        return [step for steps in by_screen for step in steps]
+    ordered: list[PlanStep] = []
+    for position in range(max((len(steps) for steps in by_screen), default=0)):
+        for steps in by_screen:
+            if position < len(steps):
+                ordered.append(steps[position])
+    return ordered
 
 
 def _screen_label(state: RunState, step: PlanStep) -> str:
@@ -482,13 +601,60 @@ def bootstrap_tokens(state: RunState, bridge: Bridge) -> None:
 
     describe_usable_palette(state, palette)
 
-    text = execute_figma_js(bridge, scaffold.build_text_style_script())
+    text = execute_figma_js(bridge, scaffold.build_text_style_script(state.text_fonts))
     if text["ok"]:
-        state.text_style_names = (text.get("result") or {}).get("textStyleNames") or []
+        payload = text.get("result") or {}
+        state.text_style_names = payload.get("textStyleNames") or []
         logger.info("Text styles ready (%d): %s", len(state.text_style_names), ", ".join(state.text_style_names))
+        fell_back = payload.get("fellBack") or []
+        if fell_back:
+            # The family loaded a moment ago and would not load now: say so
+            # rather than shipping Inter and calling it the brand font.
+            state.display_family = ""
+            state.text_fonts = scaffold.ramp_fonts("", {})
+            state.warnings.append(
+                "These text styles fell back to Inter: " + ", ".join(str(f) for f in fell_back)
+            )
     else:
         state.warnings.append(f"Text styles could not be created: {text['error']}")
         logger.info("Text styles FAILED: %s", text["error"])
+
+
+def upload_assets(state: RunState, bridge: Bridge) -> None:
+    """Store the user's attached pictures in the Figma file, once.
+
+    An image in Figma is a handle, not a node: uploading it returns a hash that
+    any number of paints can reference. So this costs one round trip per
+    attachment for the whole run, however many nodes end up showing it.
+
+    Best-effort by construction. A picture that will not upload is a warning
+    naming the file and the reason -- never a failed run, because the reference
+    text from the same attachment is already in the brief and the design can be
+    built from that alone.
+    """
+    placeable, warnings = assets_module.placeable(state.attachments)
+    state.warnings.extend(warnings)
+    for note in warnings:
+        logger.info("%s", note)
+    if not placeable:
+        return
+    logger.info("Uploading %d image(s) into the Figma file...", len(placeable))
+    for item in placeable:
+        result = execute_figma_js(bridge, assets_module.build_upload_script(item.data))
+        if not result["ok"]:
+            message = str(result.get("error") or "")
+            state.warnings.append(
+                f"'{item.name}' could not be placed on the canvas -- {message}."
+                + assets_module.upload_hint(message)
+            )
+            logger.info("Could not upload '%s': %s", item.name, message)
+            continue
+        asset = assets_module.parse_upload(item.name, result.get("result"))
+        if asset is None:
+            state.warnings.append(f"'{item.name}' uploaded but Figma returned no image.")
+            continue
+        state.assets.append(asset)
+        logger.info("Ready to place: %s", asset.describe())
 
 
 def describe_usable_palette(state: RunState, palette: list[tuple[str, str]]) -> None:
@@ -1044,7 +1210,20 @@ def converse_step(
                 pairings=state.readable_pairings,
                 screen_name=screen.name if (screen and len(state.screens) > 1) else "",
                 other_screens=other_screens or None,
+                # What the rest of the design already looks like, so a second
+                # screen's header matches the first one's instead of being
+                # designed again from nothing.
+                shared_sections=state.sections_elsewhere(step.screen_index),
                 render_only=render_only,
+                # The pictures the user attached, and the screens a button may
+                # be wired to. Both are facts about THIS run that the model
+                # cannot see any other way.
+                assets=state.assets,
+                link_targets=(
+                    [s.name for s in state.screens if s.name != (screen.name if screen else "")]
+                    if state.prototype_enabled and len(state.screens) > 1
+                    else None
+                ),
             ),
         },
     ]
@@ -1185,6 +1364,15 @@ def converse_step(
                         # replaced by the corrected one -- and so is anything
                         # rendered earlier in THIS attempt.
                         "replace_ids": list(prior_node_ids or []) + list(render_ids),
+                        # The user's own pictures, and every screen frame by
+                        # name -- so a spec can place a real photo and wire a
+                        # button to a screen that has not been built yet.
+                        "assets": list(state.assets),
+                        "screens": state.screen_map() if state.prototype_enabled else {},
+                        # The real (family, style) behind each ramp name, so a
+                        # heading is set in the brand font and every font the
+                        # script uses is one Figma confirmed it has.
+                        "text_fonts": dict(state.text_fonts),
                     },
                 )
             except Exception as exc:
@@ -1221,6 +1409,14 @@ def converse_step(
             new_ids = _normalize_node_ids((result.get("result") or {}).get("createdNodeIds"))
             if new_ids:
                 logger.info("%s: created %s", label, ", ".join(new_ids))
+            # Interactions the model wired into the section it just built. The
+            # end-of-run pass will SKIP these (a node that already has a
+            # reaction is never overwritten), so without this they would work
+            # in Figma and be missing from every report of the run.
+            for line in (result.get("result") or {}).get("wired") or []:
+                if str(line) not in state.interactions:
+                    state.interactions.append(str(line))
+                    logger.info("%s: wired %s", label, line)
             if is_render:
                 # The nodes it replaced are gone from the canvas, so they must
                 # go from the step's own bookkeeping too -- otherwise the run
@@ -1465,15 +1661,411 @@ def augment_with_error(docs: str, error: str) -> str:
 
 
 def final_validation(
-    state: RunState, bridge: Bridge, llm: ModelClient | None = None
+    state: RunState,
+    bridge: Bridge,
+    llm: ModelClient | None = None,
+    final_repair: bool = True,
 ) -> None:
     """Whole-design review. Fix everything fixable, then report what is left."""
     enforce_root_hug(state, bridge)          # fix clipping BEFORE judging the layout
     audit_variable_bindings(state, bridge)   # rebind hardcoded colours to tokens
-    repair_remaining_defects(state, bridge, llm)  # then have another go at what is wrong
+    # BEFORE the repair pass, so an empty screen becomes one of its targets and
+    # gets a real attempt rather than shipping blank.
+    mark_unbuilt_screens(state, bridge)
+    # A screen with content but not ENOUGH of it -- artwork and no form. Before
+    # the repair pass, so whatever it builds is reviewed like everything else.
+    finish_thin_screens(state, bridge, llm if final_repair else None)
+    # then have another go at what is wrong
+    repair_remaining_defects(state, bridge, llm if final_repair else None)
 
+    # Last, because a repair changes how tall a screen is.
+    fit_screens_to_viewport(state, bridge)
+    # After the heights are final: whether a screen SCROLLS in the prototype
+    # depends on how tall it ended up.
+    wire_prototype(state, bridge, llm)
     capture_screens(state, bridge)
     final_layout_review(state, bridge)
+
+
+def mark_unbuilt_screens(state: RunState, bridge: Bridge) -> None:
+    """A screen nothing was ever built into is a FAILURE, not a blank page.
+
+    A real run finished with a fully built Home beside a completely empty
+    Shop, reported success, and the only visible symptom was that the two
+    frames were wildly different heights -- which reads as a sizing bug and is
+    not one. No height rule can fix this: a frame is sized to its content, and
+    sizing an empty frame to match a full one is exactly the blank canvas that
+    levelling-to-the-tallest was removed for.
+
+    Every OTHER way of failing already leaves a mark. A step that exhausts its
+    retries drops a labelled `TODO` band (`fallback_for_step`); a section that
+    fails its gates is recorded. A screen whose steps never ran at all -- the
+    run ended early, or the step budget went entirely on another screen -- left
+    nothing behind, so nothing downstream could tell it apart from a screen
+    somebody wanted blank.
+
+    Marked here, one step BEFORE the repair pass, because a `TODO` placeholder
+    is one of that pass's targets (section 18a2): the screen gets a genuine
+    attempt at being built instead of only being complained about.
+    """
+    screens = [s for s in state.screens if s.frame_id]
+    if not screens:
+        return
+    empty = _empty_screen_ids(state, bridge, screens)
+    for index, screen in enumerate(state.screens):
+        if screen.frame_id not in empty:
+            continue
+        logger.info("Nothing was ever built into the '%s' screen.", screen.name)
+        surface, ink = _placeholder_styles(state)
+        result = execute_figma_js(
+            bridge,
+            scaffold.build_placeholder_section_script(
+                screen.frame_id,
+                screen.name,
+                surface_style=surface,
+                text_style=ink,
+            ),
+        )
+        if result["ok"]:
+            state.add_node_ids((result.get("result") or {}).get("createdNodeIds") or [])
+            state.record_section(f"TODO — {screen.name}", index)
+        else:
+            logger.info("Could not mark '%s' as unbuilt: %s", screen.name, result["error"])
+        state.warnings.append(
+            f"The '{screen.name}' screen is empty -- no step ever built anything into it."
+        )
+        # Not a success. A design with a blank page in it is not finished, and
+        # a green tick beside one destroys trust in every other number reported.
+        state.mark_failed(f"Build the '{screen.name}' screen")
+
+
+def finish_thin_screens(state: RunState, bridge: Bridge, llm: ModelClient | None) -> None:
+    """A screen that got its artwork and none of its content is not finished.
+
+    `mark_unbuilt_screens` only catches a screen with NO children, and a real
+    run slipped straight past it: the Sign Up screen was built as a full-width
+    editorial panel -- one image, one quote -- and the form itself never
+    arrived. From Python it had a child and looked built; on the canvas it was
+    a picture where a sign-up form should be, and the run reported success.
+
+    So the check is on what is really IN a screen, not whether anything is
+    (`scaffold.thin_screen_reason`), and the response is a real attempt to
+    build the missing content rather than a note about it. It runs BEFORE the
+    repair pass, so anything it builds is still reviewed and corrected.
+    """
+    screens = _built_screens(state)
+    if not screens:
+        return
+    rows = _screen_content_rows(bridge, screens)
+    if not rows:
+        return
+    richest = max((int(r.get("texts") or 0) for r in rows.values()), default=0)
+    for index, screen in enumerate(state.screens):
+        row = rows.get(str(screen.frame_id))
+        if row is None:
+            continue
+        reason = scaffold.thin_screen_reason(row, richest)
+        if not reason:
+            continue
+        logger.info("The '%s' screen is only part-built: %s.", screen.name, reason)
+        if llm is not None and _build_missing_content(state, bridge, llm, index, screen, reason):
+            continue
+        state.warnings.append(
+            f"The '{screen.name}' screen was only part-built -- {reason}."
+        )
+        # Not a success: a design with a half-finished screen in it is not
+        # finished, and a green tick beside one destroys trust in the rest.
+        state.mark_failed(f"Finish the '{screen.name}' screen")
+
+
+def _screen_content_rows(bridge: Bridge, screens: list) -> dict[str, dict]:
+    """What is really inside each screen frame, by frame id. One round trip."""
+    result = execute_figma_js(
+        bridge, scaffold.build_screen_content_script([s.frame_id for s in screens])
+    )
+    if not result["ok"]:
+        logger.info("Could not check what the screens contain: %s", result["error"])
+        return {}
+    return {
+        str(row.get("id")): row
+        for row in (result.get("result") or {}).get("screens") or []
+        if row.get("id")
+    }
+
+
+def _build_missing_content(
+    state: RunState, bridge: Bridge, llm: ModelClient, index: int, screen, reason: str
+) -> bool:
+    """One real attempt at the content this screen never got.
+
+    An APPEND, not a repair: what is there is fine as far as it goes, and
+    replacing it would throw away the one part of the screen that did get
+    built. So no `prior_node_ids` -- this is a normal build step aimed at the
+    gap.
+    """
+    label = f"Finishing '{screen.name}'"
+    step = PlanStep(
+        description=(
+            f"Build the main content of the '{screen.name}' screen -- it currently has "
+            f"{reason}. Add the complete section the design calls for, beside or below "
+            f"what is already there."
+        ),
+        screen_index=index,
+        render_only=True,   # declared, so it never depends on the wording
+    )
+    logger.info("%s: building the content it is missing...", label)
+    outcome = converse_step(
+        step, docs="", state=state, bridge=bridge, llm=llm, label=label, index=0,
+        seen_calls=set(), frame_id=state.frame_for(index),
+    )
+    if outcome.ok and outcome.created_node_ids:
+        state.add_node_ids(outcome.created_node_ids)
+        state.record_section(outcome.section_name or f"{screen.name} content", index)
+        logger.info("%s: added the missing content.", label)
+        return True
+    logger.info("%s: could not build it -- %s", label, outcome.summary)
+    discard_nodes(outcome.created_node_ids, state, bridge, label)
+    return False
+
+
+def _empty_screen_ids(state: RunState, bridge: Bridge, screens: list) -> set[str]:
+    """Which screen frames really have nothing in them, read from the canvas.
+
+    One round trip for the whole page. Returns an empty set if the read fails:
+    a check that cannot see the canvas must not start declaring finished
+    screens blank and failing the run over it.
+    """
+    result = execute_figma_js(
+        bridge, scaffold.build_screen_content_script([s.frame_id for s in screens])
+    )
+    if not result["ok"]:
+        logger.info("Could not check which screens are empty: %s", result["error"])
+        return set()
+    rows = (result.get("result") or {}).get("screens") or []
+    return {
+        str(row.get("id"))
+        for row in rows
+        if isinstance(row, dict) and not int(row.get("children") or 0)
+    }
+
+
+def fit_screens_to_viewport(state: RunState, bridge: Bridge) -> None:
+    """Round every screen frame up to a whole number of its own viewports.
+
+    Screen frames HUG their content while they are built, which is what stops a
+    long page clipping -- and leaves the finished page a row of frames ending
+    at assorted heights. Levelling them all to the tallest fixed the raggedness
+    and bought something worse: a short page sitting in a frame sized for the
+    longest one, more than half of it blank canvas.
+
+    A viewport multiple gives both. A page that fits is exactly 1440x1024, a
+    real laptop screen; pages that fit are therefore all identical; and a long
+    page is a clean 2048 or 3072 with at most one screenful of slack.
+
+    Best-effort: this is the last cosmetic step of a run, and losing a finished
+    design over it would be absurd.
+    """
+    screens = [s for s in state.screens if s.frame_id]
+    if not screens:
+        return
+    specs = [
+        {"id": screen.frame_id, "viewport": _viewport_height(screen)} for screen in screens
+    ]
+    result = execute_figma_js(bridge, scaffold.build_fit_screens_script(specs))
+    if not result["ok"]:
+        logger.info("Could not size the screens: %s", result["error"])
+        return
+    payload = result.get("result") or {}
+    by_id = {str(row.get("id")): row for row in payload.get("screens") or []}
+    for screen in screens:
+        row = by_id.get(str(screen.frame_id))
+        if not row:
+            continue
+        screen.height = int(row.get("height") or screen.height)
+        if row.get("snapped", True):
+            count = row.get("screens")
+            logger.info(
+                "Screen '%s' fitted to %d x %d (%s screenful%s).",
+                screen.name, screen.width, screen.height, count,
+                "" if count == 1 else "s",
+            )
+        else:
+            # Snapping would have added most of a blank screenful, so the frame
+            # keeps its content height instead (scaffold.MAX_SNAP_SLACK).
+            logger.info(
+                "Screen '%s' kept at %d x %d -- its content does not fit a whole "
+                "number of %dpx screens.",
+                screen.name, screen.width, screen.height, _viewport_height(screen),
+            )
+    for failure in payload.get("failed") or []:
+        logger.info("Screen could not be sized -- %s", failure)
+
+
+def wire_prototype(state: RunState, bridge: Bridge, llm: ModelClient | None = None) -> None:
+    """Make the finished design clickable: links, entry points, scrolling.
+
+    Everything the model wired while building is already on the canvas. This
+    pass reads what was ACTUALLY built and closes the gaps -- which is the only
+    honest way to do it, because a step's spec is what was asked for and the
+    canvas is what happened.
+
+    Ordered cheapest-first on purpose:
+
+    1. Read every clickable thing on every screen. One round trip.
+    2. Match labels to screen names in Python -- "Sign up" goes to the Sign Up
+       screen, "Back" goes back. No model, no tokens, no guessing.
+    3. Only if screens are still unreachable, ask the model once about the
+       buttons nothing matched. One call per run, and skipped entirely when
+       step 2 already connected everything.
+    4. Give every screen a way to be reached, and let long pages scroll.
+    """
+    if not state.prototype_enabled:
+        return
+    screens = _built_screens(state)
+    if not screens:
+        return
+    result = execute_figma_js(
+        bridge,
+        interactions.build_candidates_script(
+            [{"id": s.frame_id, "name": s.name} for s in screens]
+        ),
+    )
+    if not result["ok"]:
+        logger.info("Could not read the canvas for prototype links: %s", result["error"])
+        return
+    candidates = interactions.parse_candidates(result.get("result"))
+    links = interactions.auto_link(candidates, screens)
+    if llm is not None and len(screens) > 1:
+        links += _ask_for_links(state, candidates, links, screens, llm)
+    apply_links(state, bridge, links)
+    set_prototype_flows(state, bridge, links)
+
+
+def _ask_for_links(
+    state: RunState,
+    candidates: list,
+    links: list,
+    screens: list,
+    llm: ModelClient,
+) -> list:
+    """One model call, and only when name-matching left a screen unreachable.
+
+    A screen nothing navigates to is a real hole in a prototype, and it is the
+    one case where matching cannot help: "Explore the collection" points at the
+    Shop screen for reasons no string comparison can see.
+    """
+    stranded = interactions.unreachable(screens, links)
+    spare = interactions.unlinked(candidates, links)
+    if not stranded or not spare:
+        return []
+    logger.info(
+        "Asking which buttons open %s...", ", ".join(f"'{s.name}'" for s in stranded[:4])
+    )
+    try:
+        reply = llm.complete(
+            [
+                {"role": "system", "content": prompts.PROTOTYPE_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": prompts.prototype_user_message(
+                        state.instruction,
+                        [
+                            f"{c.id}  {c.text or c.name}  (on '{_screen_named(screens, c.screen_id)}')"
+                            for c in spare[:60]
+                        ],
+                        [s.name for s in screens],
+                        [s.name for s in stranded],
+                    ),
+                },
+            ],
+            tools=None,
+        )
+    except Exception as exc:
+        # A prototype link is worth far less than the design it decorates.
+        logger.info("Could not plan the remaining links: %s", exc)
+        return []
+    plan = interactions.parse_link_plan(getattr(reply, "content", "") or "", candidates, screens)
+    for reason in plan.rejected[:4]:
+        logger.info("Ignored a proposed link -- %s.", reason)
+    # Never overwrite something the deterministic pass already wired.
+    taken = {link.source_id for link in links}
+    return [link for link in plan.links if link.source_id not in taken]
+
+
+def _screen_named(screens: list, frame_id: str) -> str:
+    return next((s.name for s in screens if str(s.frame_id) == str(frame_id)), "")
+
+
+def apply_links(state: RunState, bridge: Bridge, links: list) -> None:
+    """Write the interactions to the canvas and record what really took."""
+    if not links:
+        return
+    result = execute_figma_js(bridge, interactions.build_apply_script(links))
+    if not result["ok"]:
+        logger.info("Could not wire the prototype: %s", result["error"])
+        return
+    payload = result.get("result") or {}
+    applied = [str(line) for line in payload.get("applied") or []]
+    state.interactions.extend(applied)
+    for line in applied:
+        logger.info("Wired %s", line)
+    for failure in (payload.get("failed") or [])[:4]:
+        logger.info("Could not wire %s", failure)
+
+
+def set_prototype_flows(state: RunState, bridge: Bridge, links: list) -> None:
+    """Entry points and scrolling -- the two things a flow needs to be playable.
+
+    A screen nothing links to is not broken, but it cannot be REACHED in
+    Presentation view unless it is its own starting point. So the first screen
+    always starts a flow, and so does anything stranded: the alternative is a
+    finished screen the user can only find by scrolling the canvas.
+    """
+    screens = _built_screens(state)
+    if not screens:
+        return
+    stranded = {str(s.frame_id) for s in interactions.unreachable(screens, links)}
+    specs = [
+        {
+            "id": screen.frame_id,
+            "name": screen.name,
+            "start": index == 0 or str(screen.frame_id) in stranded,
+            # Taller than one screenful of its own device: it should scroll in
+            # the prototype rather than being cut off at the fold.
+            "scrolls": screen.height > _viewport_height(screen) + 1,
+        }
+        for index, screen in enumerate(screens)
+    ]
+    result = execute_figma_js(bridge, interactions.build_flow_script(specs))
+    if not result["ok"]:
+        logger.info("Could not set the prototype flows: %s", result["error"])
+        return
+    payload = result.get("result") or {}
+    for name in payload.get("flows") or []:
+        logger.info("Prototype starts at '%s'.", name)
+    for name in payload.get("scrolled") or []:
+        logger.info("'%s' scrolls vertically in the prototype.", name)
+    # Reported alongside the links rather than as a warning or a design note.
+    # It is not a fault -- it is what the prototype IS, and `design_notes` is
+    # rewritten wholesale by the design-system review a moment later anyway.
+    for screen in screens:
+        if str(screen.frame_id) in stranded and len(screens) > 1:
+            state.interactions.append(
+                f"'{screen.name}' starts its own flow -- nothing else links to it"
+            )
+
+
+def _viewport_height(screen) -> int:
+    """One screenful for this screen: what the user asked for, else its device.
+
+    The instruction wins. "Frame size for both: 1440 x 900px" is a decision,
+    and rounding that design up to a multiple of the DESKTOP viewport (1024)
+    is how a screen the user sized themselves came back 2048px tall.
+    """
+    requested = getattr(screen, "viewport_height", None)
+    if requested and 200 <= int(requested) <= 4000:
+        return int(requested)
+    return scaffold.device_size(getattr(screen, "device", "desktop"))[1]
 
 
 def capture_screens(state: RunState, bridge: Bridge) -> None:

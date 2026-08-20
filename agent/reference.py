@@ -114,25 +114,44 @@ def from_payload(items: list[dict]) -> list[Attachment]:
     return attachments
 
 
-def check_readable(attachments: list[Attachment], has_vision: bool) -> None:
-    """Refuse now, clearly, rather than ignoring the attachment mid-run."""
+def check_readable(attachments: list[Attachment], has_vision: bool) -> list[str]:
+    """Refuse now, clearly, rather than ignoring the attachment mid-run.
+
+    Returns warnings for attachments that are usable but not fully usable. The
+    line between the two moved when images started being PLACED as well as read
+    (agent/assets.py): a PNG with no vision model configured used to be a dead
+    end, and is now a picture the design can genuinely show -- it just cannot be
+    built to resemble it. Refusing to start over that would be refusing work we
+    can actually do, so it is a loud warning naming the setting that fixes it.
+    """
+    warnings: list[str] = []
     for item in attachments:
         if item.is_text:
             continue
         if item.is_image:
-            if not has_vision:
-                raise ReferenceError(
-                    f"'{item.name}' is an image, and no vision model is configured to read "
-                    "it. Name one in Settings -> Vision model (or set VISION_MODEL_NAME in "
-                    ".env), or describe the design in words instead."
+            if has_vision:
+                continue
+            from agent.assets import PLACEABLE_TYPES
+
+            if item.extension in PLACEABLE_TYPES:
+                warnings.append(
+                    f"'{item.name}' will be PLACED in the design but not read: no vision "
+                    "model is configured, so the design cannot be built to resemble it. "
+                    "Name one in Settings -> Vision model (or set VISION_MODEL_NAME in .env)."
                 )
-            continue
+                continue
+            raise ReferenceError(
+                f"'{item.name}' is an image, and no vision model is configured to read "
+                "it. Name one in Settings -> Vision model (or set VISION_MODEL_NAME in "
+                ".env), or describe the design in words instead."
+            )
         raise ReferenceError(
             f"'{item.name}' is a .{item.extension or '?'} file, which cannot be read. "
             f"Attach an image ({', '.join(sorted(IMAGE_TYPES))}) or a text file "
             f"({', '.join(sorted(list(TEXT_TYPES)[:6]))}, ...). For a PDF, export the "
             "page as PNG."
         )
+    return warnings
 
 
 def describe(

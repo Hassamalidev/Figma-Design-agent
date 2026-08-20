@@ -159,7 +159,7 @@ def test_the_script_returns_every_node_it_created():
     assert len(created) == 3  # section + 2 texts
     for var in created:
         assert f"created.push({var}.id)" in js
-    assert "return { createdNodeIds: created };" in js
+    assert "return { createdNodeIds: created, wired: wired, wireFailed: wireFailed };" in js
 
 
 def test_a_primary_button_puts_readable_text_on_the_accent():
@@ -338,3 +338,248 @@ def test_a_label_before_a_DIFFERENT_input_is_kept():
     code, _ = renderer.compile_spec(spec, "1:2", {})
 
     assert '"Account details"' in code and '"Email"' in code
+
+
+# ---- blank space to the right of everything -------------------------------
+#
+# A real design came back with a book grid occupying a third of a 1440px page
+# and the rest empty canvas. The cause was ORDER, not layout:
+#
+#     n4.appendChild(n5);
+#     setFill(n5);                  <- width = FILL
+#     n5.resize(n5.width, 180);     <- resize() resets BOTH axes to FIXED
+#
+# so the fill was destroyed two lines after it was applied, freezing the node
+# at whatever width it had while the frame was still empty. Every fill was also
+# applied BEFORE the frame had any children, so there was nothing to resolve a
+# width against in the first place.
+
+
+def body_of(js: str) -> str:
+    """Just the generated nodes -- the preamble defines `setFill` itself, and
+    matching that definition is not the same as matching a call to it."""
+    return js.split("const created = [];", 1)[1]
+
+
+def test_every_fill_is_applied_after_every_resize():
+    """The invariant that was broken. `resize()` resets sizing modes, so a
+    fill emitted before one is silently thrown away."""
+    js = body_of(node_js({"kind": "row", "name": "Grid", "children": [
+        {"kind": "card", "children": [
+            {"kind": "box", "name": "Cover", "height": 180},
+            {"kind": "text", "value": "Title"},
+        ]} for _ in range(3)]}))
+
+    assert "setFill(" in js and ".resize(" in js
+    assert js.index("setFill(") > js.rindex(".resize("), (
+        "a FILL is emitted before a resize, which silently undoes it"
+    )
+
+
+def test_a_filling_node_is_never_left_fixed_by_its_own_resize():
+    """A box sets its own height, and that resize used to pin its width too."""
+    js = body_of(node_js({"kind": "row", "children": [
+        {"kind": "box", "name": "Cover", "height": 180}]}))
+
+    fills_after_last_resize = js[js.rindex(".resize("):].count("setFill(")
+
+    assert fills_after_last_resize >= 2, "the row and the box must both be filled afterwards"
+
+
+def test_fills_run_outermost_first():
+    """A child can only fill a parent that already has a resolved width."""
+    js = body_of(node_js({"kind": "section", "name": "Outer", "children": [
+        {"kind": "row", "name": "Middle", "children": [
+            {"kind": "card", "name": "Inner", "children": [{"kind": "text", "value": "x"}]}]}]}))
+
+    names = [line.strip()[len("setFill("):-2]
+             for line in js.splitlines() if line.strip().startswith("setFill(")]
+
+    assert names == sorted(names, key=lambda n: int(n[1:])), "fills are not outermost-first"
+
+
+def test_a_full_width_row_spreads_its_children():
+    """A header is a row of things that each hug -- a logo, nav links, icons.
+    The row fills the page, the children do not, and the default MIN packs all
+    of them against the left with the rest of the 1440px blank."""
+    js = node_js({"kind": "row", "name": "Header", "children": [
+        {"kind": "text", "value": "Lefhaz Books"},
+        {"kind": "text", "value": "Home Shop About"},
+        {"kind": "avatar"},
+    ]})
+
+    assert "SPACE_BETWEEN" in js
+
+
+def test_a_hugging_row_is_not_spread():
+    """Inside a button there is no free space to distribute, and spreading a
+    row that hugs would push its own label away from its icon."""
+    js = node_js({"kind": "row", "fill": False, "children": [
+        {"kind": "avatar"}, {"kind": "text", "value": "Sign in"}]})
+
+    assert "SPACE_BETWEEN" not in js
+
+
+def test_an_explicit_justify_wins():
+    js = node_js({"kind": "row", "justify": "CENTER", "children": [
+        {"kind": "text", "value": "a"}, {"kind": "text", "value": "b"}]})
+
+    assert "CENTER" in js and "SPACE_BETWEEN" not in js
+
+
+def test_a_column_is_never_spread():
+    js = node_js({"kind": "col", "children": [
+        {"kind": "text", "value": "a"}, {"kind": "text", "value": "b"}]})
+
+    assert "SPACE_BETWEEN" not in js
+
+
+# ---- the user's attached pictures ------------------------------------------
+
+HERO = renderer.assets_module.ImageAsset(
+    name="hero.png", key="hero", image_hash="hash-1", width=1600, height=900
+)
+LOGO = renderer.assets_module.ImageAsset(
+    name="logo.png", key="logo", image_hash="hash-2", width=200, height=200
+)
+
+
+def compile_with_assets(spec, assets=(HERO,), screens=None, parent="1:2"):
+    return renderer.compile_spec(spec, parent, ROLES, assets=list(assets), screens=screens)
+
+
+def test_an_image_kind_paints_the_real_picture():
+    js, _ = compile_with_assets({"kind": "image", "asset": "hero.png", "height": 320})
+
+    assert "applyImage(" in js
+    assert '"hash-1"' in js
+    assert "'IMAGE'" in js or '"IMAGE"' in js
+    assert "320" in js
+
+
+def test_an_image_with_no_attachment_is_the_placeholder_box_it_always_was():
+    """The word means "a picture goes here" either way. Failing a section over
+    a missing attachment would be a regression, not a feature."""
+    js, created = renderer.compile_spec({"kind": "image", "height": 200}, "1:2", ROLES)
+
+    # The helper is always in the preamble; what must be absent is a CALL.
+    assert not re.search(r"^  applyImage\(", js, re.MULTILINE)
+    assert created  # it still built something
+
+
+def test_an_asset_name_that_matches_nothing_is_a_readable_error():
+    """Silently drawing a grey box means the user watches their attachment be
+    ignored. The message names the files that DO exist so the model can fix it."""
+    with pytest.raises(renderer.SpecError) as caught:
+        compile_with_assets({"kind": "image", "asset": "banner.jpg"})
+
+    assert "hero.png" in str(caught.value)
+
+
+def test_a_frame_can_carry_a_photo_behind_its_content():
+    js, _ = compile_with_assets(
+        {"kind": "section", "image": "hero.png", "children": [
+            {"kind": "text", "value": "Overlaid"}]}
+    )
+
+    assert "applyImage(" in js
+
+
+def test_an_avatar_can_be_a_real_photograph():
+    js, _ = compile_with_assets({"kind": "avatar", "asset": "hero.png", "size": 48})
+
+    assert "createEllipse()" in js and "applyImage(" in js
+
+
+def test_a_logo_can_be_shown_whole_rather_than_cropped():
+    js, _ = compile_with_assets(
+        {"kind": "image", "asset": "logo.png", "fit": "contain"}, assets=(HERO, LOGO)
+    )
+
+    assert '"FIT"' in js
+
+
+def test_an_image_height_follows_its_aspect_ratio_when_a_width_is_given():
+    js, _ = compile_with_assets({"kind": "image", "asset": "hero.png", "width": 800})
+
+    assert ", 450)" in js  # 800 / (1600/900)
+
+
+# ---- clicking actually does something --------------------------------------
+
+SCREENS = {"Login": "1:2", "Dashboard": "9:9"}
+
+
+def test_a_button_can_navigate_to_another_screen():
+    js, _ = renderer.compile_spec(
+        {"kind": "button", "label": "Sign in", "on_click": "Dashboard"},
+        "1:2", ROLES, screens=SCREENS,
+    )
+
+    assert "setReactionsAsync(" in js
+    assert '"destinationId": "9:9"' in js
+    assert '"ON_CLICK"' in js
+
+
+def test_a_link_to_an_unknown_screen_is_skipped_rather_than_fatal():
+    """A missing interaction is worth far less than the section it would take
+    down -- and the end-of-run pass reads the real canvas and tries again."""
+    js, created = renderer.compile_spec(
+        {"kind": "button", "label": "Sign in", "on_click": "Checkout"},
+        "1:2", ROLES, screens=SCREENS,
+    )
+
+    assert "setReactionsAsync(" not in js
+    assert created
+
+
+def test_a_screen_never_links_to_itself():
+    js, _ = renderer.compile_spec(
+        {"kind": "button", "label": "Reload", "on_click": "Login"},
+        "1:2", ROLES, screens=SCREENS,
+    )
+
+    assert "setReactionsAsync(" not in js
+
+
+def test_back_needs_no_destination_at_all():
+    js, _ = renderer.compile_spec(
+        {"kind": "text", "value": "Back", "on_click": "back"}, "1:2", ROLES, screens={},
+    )
+
+    assert '"BACK"' in js
+
+
+def test_a_wired_section_still_compiles_as_javascript():
+    from tests.test_scaffold import compiles_as_async_body
+
+    js, _ = renderer.compile_spec(
+        {"kind": "section", "name": "Hero", "image": "hero.png", "children": [
+            {"kind": "text", "value": "Welcome"},
+            {"kind": "button", "label": "Sign in", "on_click": "Dashboard"},
+            {"kind": "text", "value": "Back", "on_click": "back"}]},
+        "1:2", ROLES, assets=[HERO], screens=SCREENS,
+    )
+
+    assert compiles_as_async_body(js)
+
+
+def test_interactions_are_applied_after_the_whole_tree_exists():
+    """Same reason as the sizing pass: a node has to be finished before
+    anything is hung off it, and one ordering rule is easier to keep than two."""
+    js, _ = renderer.compile_spec(
+        {"kind": "section", "children": [
+            {"kind": "button", "label": "Go", "on_click": "Dashboard"},
+            {"kind": "text", "value": "After"}]},
+        "1:2", ROLES, screens=SCREENS,
+    )
+
+    assert js.index("createText()") < js.index("setReactionsAsync(")
+
+
+def test_one_bad_reaction_cannot_take_down_the_section():
+    js, _ = renderer.compile_spec(
+        {"kind": "divider", "on_click": "Dashboard"}, "1:2", ROLES, screens=SCREENS,
+    )
+
+    assert "catch (e) { wireFailed.push(" in js

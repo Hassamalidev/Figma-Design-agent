@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 30.0
 
+# Biggest single WebSocket message, in either direction. Screenshots of a tall
+# page and attached images are both megabytes; the library's 1MB default closes
+# the socket on one.
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
 
 class BridgeError(RuntimeError):
     """Raised when a request can't be delivered or answered (no plugin, timeout, disconnect)."""
@@ -81,8 +86,14 @@ class Bridge:
         # ui.html reconnects, and the cycle repeats. This link is loopback-only
         # and every request already has its own timeout, so we don't need pings
         # to detect a dead peer.
+        # The 1MB default is far too small for what actually crosses this
+        # link: a full-page PNG comes back base64-encoded, and an attached
+        # photo goes out the same way inside the script that uploads it. Over
+        # the limit the library closes the connection rather than erroring, so
+        # it surfaces as "Figma disconnected" mid-run.
         self._server = await websockets.serve(
-            self._handler, self._host, self._port, ping_interval=None
+            self._handler, self._host, self._port, ping_interval=None,
+            max_size=MAX_MESSAGE_BYTES,
         )
         ready.set()
 

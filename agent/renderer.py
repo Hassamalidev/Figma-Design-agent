@@ -28,8 +28,12 @@ generated JavaScript has no control flow to get wrong.
 from __future__ import annotations
 
 import json
+import logging
 
-from agent import scaffold
+from agent import assets as assets_module
+from agent import interactions, scaffold
+
+logger = logging.getLogger(__name__)
 
 # The 8px scale. The model picks a NAME, never a number, so off-scale spacing
 # is not expressible rather than merely discouraged.
@@ -66,7 +70,7 @@ ALIASES = {
     "textfield": "input", "textbox": "input", "field": "input",
     "ellipse": "avatar", "circle": "avatar", "dot": "avatar",
     "icon": "avatar", "logo": "avatar",
-    "image": "box", "img": "box", "illustration": "box", "graphic": "box",
+    "illustration": "box", "graphic": "box",
     "rectangle": "box", "rect": "box", "shape": "box", "spacer": "box",
     "gradient": "box", "chart": "box", "placeholder": "box",
     "line": "divider", "rule": "divider", "separator": "divider",
@@ -74,7 +78,20 @@ ALIASES = {
     "tag": "badge", "chip": "badge", "pill": "badge",
 }
 
+# Kinds that mean "the picture the user attached". Handled before ALIASES,
+# because with no attachment they fall back to a `box` placeholder and with one
+# they are the real thing -- the same word meaning both is the point.
+IMAGE_KINDS = {"image", "img", "photo", "picture", "screenshot", "cover", "thumbnail"}
+
+# Where a node says what clicking it does. Several spellings, because a refused
+# synonym costs a whole turn and teaches the model nothing.
+NAV_KEYS = ("on_click", "navigate", "goto", "go_to", "link_to", "onClick", "href")
+
 MAX_NODES = 400  # a runaway spec must not lock up Figma
+
+# An image with no stated height. Tall enough to read as a picture rather than
+# a band, short enough not to push the rest of a section below the fold.
+DEFAULT_IMAGE_HEIGHT = 240
 
 # Below this ratio an aliased role is indistinguishable from what it sits on,
 # so the alias is dropped rather than painting a divider white on white.
@@ -91,19 +108,81 @@ def _js(value) -> str:
 
 
 class _Compiler:
-    def __init__(self, parent_id: str, color_roles: dict[str, str], token_names=()):
+    def __init__(
+        self,
+        parent_id: str,
+        color_roles: dict[str, str],
+        token_names=(),
+        assets=(),
+        screens: dict[str, str] | None = None,
+        text_fonts: dict | None = None,
+    ):
         self.parent_id = parent_id
         # role -> real paint style name, e.g. {"text": "color/dark-gray"}
         self.roles = color_roles
+        # The images the user attached, already uploaded to this Figma file
+        # (agent/assets.py). Empty on a run with no attachments, which is what
+        # makes `kind: "image"` fall back to a placeholder box.
+        self.assets = list(assets or [])
+        # screen name -> frame id, so `"on_click": "Dashboard"` can become a
+        # real prototype link while the section is being built.
+        self.screens = dict(screens or {})
+        # Ramp style name -> the (family, style) it really uses. Defaults to
+        # the Inter table, so nothing changes for a design that named no font.
+        self.text_fonts = dict(text_fonts or {})
+        # (var, description, reaction) for every interaction this spec wires.
+        self.reactions: list[tuple[str, str, dict]] = []
         # Every token that really exists, keyed loosely so "color/deep-navy",
         # "deep-navy" and "Deep Navy" all resolve to the same paint style.
         self.tokens = {_token_key(n): n for n in (token_names or ())}
         # Row frames with an explicit height: their children stretch to it.
         self.fixed_rows: set[str] = set()
+        # Nodes that must FILL their parent, applied in ONE pass at the very
+        # end (see `sizing_pass`). Collected in creation order, which is
+        # outermost first -- a child can only fill a parent that already has a
+        # resolved width.
+        self.fills: list[str] = []
+        self.vfills: list[str] = []
         self.lines: list[str] = []
         self.fonts: set[tuple[str, str]] = set()
         self.created: list[str] = []
         self.count = 0
+
+    def sizing_pass(self) -> list[str]:
+        """Every FILL, emitted once, after the whole subtree exists.
+
+        Width is the one property in this compiler that cannot be decided
+        locally: `resize()` resets sizing modes, and a frame's own resolved
+        width depends on children that do not exist yet when it is created. So
+        it is decided here, last, in outermost-first order -- a child can only
+        fill a parent that already has a width.
+        """
+        if not self.fills and not self.vfills:
+            return []
+        lines = [
+            "  // Width LAST. resize() resets sizing modes, and a frame has no",
+            "  // resolved width until its children exist, so every FILL is",
+            "  // applied here rather than while the tree was being built.",
+        ]
+        lines += [f"  setFill({var});" for var in self.fills]
+        lines += [f"  setFillV({var});" for var in self.vfills]
+        return lines
+
+    def wiring_pass(self) -> list[str]:
+        """Every prototype interaction, applied once the whole tree exists.
+
+        Each one is wrapped on its own: a node type that cannot hold a reaction
+        must cost one interaction, not the section it belongs to. `reactions`
+        is read-only under `documentAccess: "dynamic-page"`, so
+        `setReactionsAsync` is the only setter there is.
+        """
+        lines: list[str] = []
+        for var, description, payload in self.reactions:
+            lines.append("  try {")
+            lines.append(f"    await {var}.setReactionsAsync({_js([payload])});")
+            lines.append(f"    wired.push({_js(description)});")
+            lines.append("  } catch (e) { wireFailed.push(" + _js(description) + "); }")
+        return lines
 
     def var(self) -> str:
         self.count += 1
@@ -131,6 +210,52 @@ class _Compiler:
             return  # unknown role: leave the default fill rather than guessing
         self.lines.append(f"  await applyFill({var}, {_js(style)});")
 
+    def paint_image(self, var: str, node: dict) -> bool:
+        """Paint one of the user's attached images onto this node.
+
+        Returns False when there is nothing to paint, so the caller can fall
+        back to the placeholder it would have drawn anyway. An asset name that
+        matches NOTHING is an error rather than a silent grey box: the user
+        attached a picture and would otherwise never learn it went unused.
+        """
+        wanted = node.get("asset") or node.get("image") or node.get("src")
+        if not wanted and str(node.get("kind") or "").lower() not in IMAGE_KINDS:
+            return False
+        if not self.assets:
+            return False
+        asset = assets_module.find(self.assets, wanted if isinstance(wanted, str) else None)
+        if asset is None:
+            raise SpecError(
+                f"no attached image called {str(wanted)!r}. The images available are: "
+                f"{assets_module.names(self.assets)}"
+            )
+        mode = "FIT" if str(node.get("fit", "")).lower() in ("fit", "contain") else "FILL"
+        self.lines.append(
+            f"  applyImage({var}, {_js(asset.image_hash)}, {_js(mode)});"
+        )
+        return True
+
+    @staticmethod
+    def _default_justify(node: dict, layout: str) -> str | None:
+        """Spread a full-width row's children instead of packing them left.
+
+        A header is a row of things that each hug -- a logo, some nav links,
+        some icons. The row fills the page, the children do not, and the
+        default `MIN` packs all of them against the left with the rest of the
+        1440px blank. That is half of the empty space a real design showed.
+
+        Only for a row that actually FILLS: on a row that hugs its content
+        there is no free space, so this is a no-op, and on a grid whose cards
+        all fill there is none either. It changes exactly the case it is for.
+        """
+        if layout != "HORIZONTAL":
+            return None
+        if node.get("width") or not node.get("fill", True):
+            return None  # a hugging or fixed-width row has nothing to spread
+        if len(node.get("children") or []) < 2:
+            return None
+        return "SPACE_BETWEEN"
+
     def frame(self, node: dict, parent: str, default_dir: str = "col") -> str:
         var = self.var()
         direction = node.get("direction", default_dir)
@@ -156,7 +281,14 @@ class _Compiler:
         self.lines.append(f"  {var}.counterAxisSizingMode = 'AUTO';")
         if node.get("align"):
             self.lines.append(f"  {var}.counterAxisAlignItems = {_js(node['align'])};")
+        justify = node.get("justify") or self._default_justify(node, layout)
+        if justify:
+            self.lines.append(f"  {var}.primaryAxisAlignItems = {_js(justify)};")
         self.fill(var, node.get("background"))
+        # After the role fill, so a frame given both shows the picture. A
+        # section with a photo behind it is the commonest thing an attachment
+        # is for, and it must not be undone by the background token.
+        self.paint_image(var, node)
         self.lines.append(f"  {parent}.appendChild({var});")
         # SIZE FIRST, THEN SIZING MODES. `resize()` resets HUG/FILL back to
         # FIXED (knowledge/gotchas.md), so a FILL applied before a resize is
@@ -177,9 +309,22 @@ class _Compiler:
             )
             self.lines.append(f"  {var}.resize({var}.width, {int(node['height'])});")
         if not node.get("width") and node.get("fill", True):
-            # `setFill` re-checks at runtime that the parent really is
-            # auto-layout, so this can never throw.
-            self.lines.append(f"  setFill({var});")
+            # DEFERRED, not emitted here. This is the bug that left a book grid
+            # occupying a third of the page with the rest blank:
+            #
+            #   n4.appendChild(n5);
+            #   setFill(n5);                  <- width = FILL
+            #   n5.resize(n5.width, 180);     <- resets BOTH axes to FIXED
+            #
+            # `resize()` resets sizing modes (knowledge/gotchas.md), so a fill
+            # applied here is destroyed by the node's own height resize two
+            # lines later -- freezing it at whatever width it happened to have
+            # while the frame was still empty. Worse, every fill was applied
+            # BEFORE the frame had any children at all, so the width it
+            # resolved against was mid-build in every case.
+            #
+            # Deciding width last removes the ordering question entirely.
+            self.fills.append(var)
         # A column beside another column has to be as tall as the row holding
         # them, or a 55/45 split screen renders as two short bands with the
         # page showing through underneath. Automatic for a container inside a
@@ -192,7 +337,7 @@ class _Compiler:
             parent in self.fixed_rows and node.get("fill", True)
         )
         if stretches:
-            self.lines.append(f"  setFillV({var});")
+            self.vfills.append(var)
         if direction == "row" and node.get("height"):
             self.fixed_rows.add(var)
         self.created.append(var)
@@ -204,11 +349,16 @@ class _Compiler:
         if style_name not in TEXT_STYLES:
             style_name = DEFAULT_TEXT_STYLE
         weight, size = TEXT_STYLES[style_name]
-        self.fonts.add(("Inter", weight))
+        # The BRAND font for headings when the design asked for one and this
+        # file has it -- resolved by the harness, never guessed here.
+        family, weight = self.text_fonts.get(style_name, ("Inter", weight))
+        self.fonts.add((family, weight))
         value = str(node.get("value", ""))[:400]
 
         self.lines.append(f"  const {var} = figma.createText();")
-        self.lines.append(f"  {var}.fontName = {{ family: 'Inter', style: {_js(weight)} }};")
+        self.lines.append(
+            f"  {var}.fontName = {{ family: {_js(family)}, style: {_js(weight)} }};"
+        )
         self.lines.append(f"  {var}.characters = {_js(value)};")
         self.lines.append(f"  {var}.fontSize = {size};")
         # Hug by default. This is the fix for text that renders as a vertical
@@ -218,9 +368,11 @@ class _Compiler:
         self.fill(var, node.get("color", "text"))
         self.lines.append(f"  {parent}.appendChild({var});")
         if node.get("wrap"):
-            # Explicit wrapping: fill the parent's width, grow downwards.
-            self.lines.append(f"  setFill({var});")
+            # Explicit wrapping: fill the parent's width, grow downwards. The
+            # fill is deferred with all the others so a later resize anywhere
+            # in the subtree cannot undo it.
             self.lines.append(f"  {var}.textAutoResize = 'HEIGHT';")
+            self.fills.append(var)
         self.lines.append(f"  await applyTextStyle({var}, {_js(style_name)});")
         self.created.append(var)
         return var
@@ -286,7 +438,10 @@ class _Compiler:
         self.lines.append(f"  const {var} = figma.createEllipse();")
         self.lines.append(f"  {var}.name = {_js('Avatar')};")
         self.lines.append(f"  {var}.resize({size}, {size});")
-        self.fill(var, node.get("color", "accent"))
+        # A real profile picture or logo, cropped to the circle, when one was
+        # attached -- otherwise the flat accent disc.
+        if not self.paint_image(var, node):
+            self.fill(var, node.get("color", "accent"))
         self.lines.append(f"  {parent}.appendChild({var});")
         self.created.append(var)
         return var
@@ -315,6 +470,39 @@ class _Compiler:
         self.lines.append(f"  {var}.resize({var}.width, {height});")
         return var
 
+    def image(self, node: dict, parent: str) -> str:
+        """One of the user's attached pictures, at a real size on the canvas.
+
+        With no attachment this IS `box` -- the same grey placeholder the
+        renderer has always drawn for `kind: "image"`. The word means "a
+        picture goes here" either way; only one of them has a picture.
+        """
+        if not self.assets:
+            return self.box(node, parent)
+        frame = dict(node)
+        frame.setdefault("name", str(node.get("asset") or "Image"))
+        frame["radius"] = node.get("radius", "md")
+        # No background token: the image IS the fill, and a role underneath it
+        # would only show through if the picture failed to paint. Height is
+        # applied below instead, so it is stated exactly once.
+        frame.pop("background", None)
+        frame.pop("height", None)
+        var = self.frame(frame, parent)
+        self.lines.append(f"  {var}.primaryAxisSizingMode = 'FIXED';")
+        self.lines.append(f"  {var}.resize({var}.width, {self._image_height(node)});")
+        return var
+
+    def _image_height(self, node: dict) -> int:
+        """How tall the picture is. Width is decided last (`sizing_pass`), so an
+        explicit height is the only thing that can be honoured exactly; from a
+        stated width the image's own aspect ratio gives the rest."""
+        if node.get("height"):
+            return max(8, int(node["height"]))
+        asset = assets_module.find(self.assets, node.get("asset") or node.get("image"))
+        if node.get("width") and asset is not None:
+            return max(40, round(int(node["width"]) / asset.aspect))
+        return DEFAULT_IMAGE_HEIGHT
+
     def checkbox(self, node: dict, parent: str) -> str:
         """A 20px box beside its label. Every auth screen wants one ("Remember
         me", "I agree to the Terms"), and rejecting the kind cost a step three
@@ -340,9 +528,62 @@ class _Compiler:
     # -- dispatch ----------------------------------------------------------
 
     def node(self, spec: dict, parent: str) -> str:
+        """Build one node, then wire whatever clicking it should do."""
+        var = self._build(spec, parent)
+        self.wire(spec, var)
+        return var
+
+    def wire(self, spec: dict, var: str) -> None:
+        """Turn `"on_click": "Dashboard"` into a real prototype interaction.
+
+        The model is the only thing that knows the primary action of the
+        section it just designed, so it says so while building. Everything
+        mechanical about it -- which frame that name means, which transition,
+        what a bare "back" does -- is decided here (CLAUDE.md rule 7).
+        """
+        target = next(
+            (str(spec[key]) for key in NAV_KEYS if str(spec.get(key) or "").strip()), ""
+        ).strip()
+        if not target:
+            return
+        label = str(spec.get("label") or spec.get("value") or spec.get("name") or "")[:60]
+        trigger = interactions.normalize_trigger(spec.get("trigger"))
+        transition = interactions.normalize_transition(spec.get("transition"))
+        lowered = target.lower()
+        if lowered in ("back", "go back", "previous"):
+            link = interactions.Link(
+                source_id="", label=label, action="back", trigger=trigger
+            )
+        elif lowered.startswith("http://") or lowered.startswith("https://"):
+            link = interactions.Link(
+                source_id="", label=label, action="url", url=target, trigger=trigger
+            )
+        else:
+            destination = interactions.resolve_screen(target, self.screens)
+            if not destination or destination == self.parent_id:
+                # An unknown screen name, or a link from a screen to itself.
+                # Never fatal: a missing interaction is worth far less than the
+                # section it would take down, and the end-of-run wiring pass
+                # reads the real canvas and gets another go at it.
+                logger.info("Skipped an interaction to %r -- no such screen.", target)
+                return
+            link = interactions.Link(
+                source_id="",
+                label=label,
+                destination_id=destination,
+                destination_name=target,
+                trigger=trigger,
+                transition=transition,
+            )
+        self.reactions.append((var, link.describe(), interactions.reaction(link)))
+
+    def _build(self, spec: dict, parent: str) -> str:
         if not isinstance(spec, dict):
             raise SpecError(f"every node must be an object, got {type(spec).__name__}")
-        kind = ALIASES.get(str(spec.get("kind") or "").strip().lower(), spec.get("kind"))
+        raw_kind = str(spec.get("kind") or "").strip().lower()
+        if raw_kind in IMAGE_KINDS:
+            return self.image(spec, parent)
+        kind = ALIASES.get(raw_kind, spec.get("kind"))
         if kind in ("section", "col", "row", "card", "stack"):
             defaults = {"row": "row"}.get(kind, "col")
             node = dict(spec)
@@ -380,7 +621,7 @@ class _Compiler:
             return self.checkbox(spec, parent)
         raise SpecError(
             f"unknown kind {kind!r}. Valid kinds: section, col, row, card, text, "
-            "button, badge, input, checkbox, avatar, divider, box"
+            "button, badge, input, checkbox, avatar, divider, box, image"
         )
 
 
@@ -416,6 +657,13 @@ async function applyTextStyle(node, styleName) {{
   const style = _textByName[styleName];
   if (style) {{ await node.setTextStyleIdAsync(style.id); }}
 }}
+// One of the user's attached pictures. The image itself is already stored in
+// this file (agent/assets.py uploaded it once); a paint only references it by
+// hash, which is why the same photo costs nothing to reuse on five screens.
+function applyImage(node, hash, mode) {{
+  if (!('fills' in node)) {{ return; }}
+  node.fills = [{{ type: 'IMAGE', scaleMode: mode, imageHash: hash }}];
+}}
 // FILL is only legal inside an auto-layout parent, and only after appending.
 function setFill(node) {{
   const p = node.parent;
@@ -432,6 +680,8 @@ function setFillV(node) {{
 }}
 
 const created = [];
+const wired = [];
+const wireFailed = [];
 {{
 """
 
@@ -476,6 +726,9 @@ def compile_spec(
     color_roles: dict[str, str],
     replace_ids: list[str] | None = None,
     token_names: list[str] | None = None,
+    assets: list | None = None,
+    screens: dict[str, str] | None = None,
+    text_fonts: dict | None = None,
 ) -> tuple[str, list[str]]:
     """Turn one UI tree into an atomic Figma script. Returns (js, node_var_names).
 
@@ -487,15 +740,21 @@ def compile_spec(
     removed before the new section is built, which is what makes a correcting
     retry a REPLACEMENT rather than a second copy appended beside the first.
     Scripts are atomic, so a failed repair leaves the original section intact.
+
+    `assets` are the user's attached images, already uploaded to this file, and
+    `screens` maps a screen NAME to its frame id -- which is what lets a spec
+    say `"on_click": "Dashboard"` and get a working prototype link out of it.
     """
-    compiler = _Compiler(parent_id, color_roles, token_names or [])
+    compiler = _Compiler(
+        parent_id, color_roles, token_names or [], assets, screens, text_fonts
+    )
     compiler.node(spec, "root0")
 
     fonts = "\n".join(
         f"await figma.loadFontAsync({{ family: {_js(f)}, style: {_js(s)} }});"
         for f, s in sorted(compiler.fonts)
     )
-    body = "\n".join(compiler.lines)
+    body = "\n".join(compiler.lines + compiler.sizing_pass() + compiler.wiring_pass())
     pushes = "\n".join(f"  created.push({v}.id);" for v in compiler.created)
     return (
         PREAMBLE.format(
@@ -504,7 +763,7 @@ def compile_spec(
         + body
         + "\n"
         + pushes
-        + "\n}\nreturn { createdNodeIds: created };\n"
+        + "\n}\nreturn { createdNodeIds: created, wired: wired, wireFailed: wireFailed };\n"
     ), compiler.created
 
 

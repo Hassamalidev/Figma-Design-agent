@@ -35,11 +35,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": (
                             "One UI tree. Every node has a `kind`: "
                             "section/card/row/col (containers, take `children`), "
-                            "text, button, badge, input, avatar, divider, box. "
+                            "text, button, badge, input, avatar, divider, box, image. "
+                            "Any node may carry `on_click` (the name of another "
+                            "screen, or \"back\") to make it navigate in the "
+                            "prototype, and `image`/`asset` to show a picture the "
+                            "user attached. "
                             'Example: {"kind":"section","name":"Sign in","children":['
                             '{"kind":"text","style":"Heading","value":"Welcome back"},'
                             '{"kind":"input","label":"Email","placeholder":"you@co.com"},'
-                            '{"kind":"button","label":"Sign in","variant":"primary"}]}'
+                            '{"kind":"button","label":"Sign in","variant":"primary",'
+                            '"on_click":"Dashboard"}]}'
                         ),
                     }
                 },
@@ -71,6 +76,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "set_text_style {style}, set_size {width, height}, "
                             "set_spacing {gap, padding}, set_radius {radius}, "
                             "set_visible {visible}, set_name {name}, reorder {index}, "
+                            "set_image {asset: an attached picture's file name}, "
+                            "set_interaction {to: a screen name, or action: \"back\"}, "
                             "delete, insert {parent, spec, index}, replace {target, spec}. "
                             "`spec` is a render_ui UI tree. Example: "
                             '[{"op":"set_fill","target":"1:9","color":"accent"},'
@@ -297,6 +304,11 @@ def _render_ui(arguments: dict[str, Any], bridge: Bridge, context: dict[str, Any
             context.get("color_roles") or {},
             replace_ids=context.get("replace_ids"),
             token_names=context.get("token_names"),
+            # The user's attached pictures, and every screen by name -- so a
+            # spec can place a real photo and wire a button to another screen.
+            assets=context.get("assets"),
+            screens=context.get("screens"),
+            text_fonts=context.get("text_fonts"),
         )
     except renderer.SpecError as exc:
         return _bad_spec(f"Invalid UI spec: {exc}")
@@ -335,6 +347,8 @@ def _edit_ui(arguments: dict[str, Any], bridge: Bridge, context: dict[str, Any])
             context.get("color_roles") or {},
             token_names=context.get("token_names"),
             protected_ids=context.get("protected_ids"),
+            assets=context.get("assets"),
+            screens=context.get("screens"),
         )
     except renderer.SpecError as exc:
         return _bad_spec(f"Invalid edit: {exc}")

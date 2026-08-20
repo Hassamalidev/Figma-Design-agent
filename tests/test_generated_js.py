@@ -17,7 +17,7 @@ import functools
 
 import pytest
 
-from agent import critic, editor, inventory, renderer, scaffold
+from agent import assets, critic, editor, interactions, inventory, renderer, scaffold
 
 PAGE = {
     "roots": [{
@@ -58,6 +58,18 @@ def every_generated_script() -> dict[str, str]:
         "hug_fix": scaffold.build_hug_fix_script("1:2"),
         "bind": scaffold.build_bind_fills_script(["1:3"], [("accent", "#6C5CE7")]),
         "clear_page": scaffold.build_clear_page_script(),
+        "screen_content": scaffold.build_screen_content_script(["1:2", "1:3"]),
+        "fit_screens": scaffold.build_fit_screens_script(
+            [{"id": "1:2", "viewport": 1024}, {"id": "1:3", "viewport": 1024}]
+        ),
+        "asset_upload": assets.build_upload_script(b"\x89PNG\r\n\x1a\n"),
+        "prototype_read": interactions.build_candidates_script([{"id": "1:2", "name": "Login"}]),
+        "prototype_apply": interactions.build_apply_script(
+            [interactions.Link(source_id="1:9", label="Sign in", destination_id="1:20")]
+        ),
+        "prototype_flows": interactions.build_flow_script(
+            [{"id": "1:2", "name": "Login", "start": True, "scrolls": True}]
+        ),
     }
 
 

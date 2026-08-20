@@ -34,8 +34,10 @@ Three safety properties, all deliberate:
 from __future__ import annotations
 
 import json
+import re
 
-from agent import renderer
+from agent import assets as assets_module
+from agent import interactions, renderer
 from agent.renderer import RADIUS, SPACING, TEXT_STYLES, SpecError
 
 # Ops that change something. Kept small on purpose: a vocabulary the model
@@ -49,6 +51,10 @@ OPS = (
     "set_radius",
     "set_visible",
     "set_name",
+    # An attached picture, and a prototype link. Both are things a design has
+    # that a static mockup does not, so editing has to be able to change them.
+    "set_image",
+    "set_interaction",
     "reorder",
     "delete",
     "insert",
@@ -77,9 +83,19 @@ def _js(value) -> str:
 
 
 class _EditCompiler:
-    def __init__(self, roles: dict[str, str], tokens, protected: set[str]):
+    def __init__(
+        self,
+        roles: dict[str, str],
+        tokens,
+        protected: set[str],
+        assets=(),
+        screens: dict[str, str] | None = None,
+    ):
         self.roles = roles
         self.tokens = {renderer._token_key(t): t for t in (tokens or ())}
+        # The user's attached pictures, and the screens a link may point at.
+        self.assets = list(assets or [])
+        self.screens = dict(screens or {})
         # Screen frames. Deleting one throws a whole screen away over a
         # phrase like "remove the old login" -- far too much damage for a
         # single mis-parsed word.
@@ -156,11 +172,14 @@ class _EditCompiler:
             raise SpecError(
                 f"unknown text style {name!r}. Available: {', '.join(TEXT_STYLES)}"
             )
-        self.fonts.add(("Inter", TEXT_STYLES[name][0]))
         var = self.begin(node_id, "set_text_style")
         self.lines.append(f"  if ({var}.type !== 'TEXT') {{ throw new Error('not a text node'); }}")
         self.lines.append(f"  const ts = _textByName[{_js(name)}];")
         self.lines.append("  if (!ts) { throw new Error('no text style ' + " + _js(name) + "); }")
+        # Load the font the STYLE uses, not the one the ramp normally uses:
+        # applying a text style whose font is not loaded throws, and in a file
+        # whose heading style is Playfair Display, Inter is the wrong guess.
+        self.lines.append("  if (ts.fontName) { await figma.loadFontAsync(ts.fontName); }")
         self.lines.append(f"  await {var}.setTextStyleIdAsync(ts.id);")
         self.end(node_id, "set_text_style")
 
@@ -226,6 +245,86 @@ class _EditCompiler:
         var = self.begin(node_id, "set_name")
         self.lines.append(f"  {var}.name = {_js(name[:100])};")
         self.end(node_id, "set_name")
+
+    def set_image(self, node_id: str, edit: dict) -> None:
+        """Show one of the user's attached pictures on a node that already exists.
+
+        The mirror of the renderer's `image`: the file is uploaded once per run
+        and every paint that shows it is just a reference to the same hash.
+        """
+        wanted = edit.get("asset") or edit.get("image") or edit.get("value")
+        if not self.assets:
+            raise SpecError(
+                "set_image needs a picture, and none were attached to this run. "
+                "Attach an image and run it again."
+            )
+        asset = assets_module.find(self.assets, wanted if isinstance(wanted, str) else None)
+        if asset is None:
+            raise SpecError(
+                f"no attached image called {str(wanted)!r}. Available: "
+                f"{assets_module.names(self.assets)}"
+            )
+        mode = "FIT" if str(edit.get("fit", "")).lower() in ("fit", "contain") else "FILL"
+        var = self.begin(node_id, "set_image")
+        self.lines.append(f"  if (!('fills' in {var})) {{ throw new Error('cannot hold a fill'); }}")
+        self.lines.append(
+            f"  {var}.fills = [{{ type: 'IMAGE', scaleMode: {_js(mode)}, "
+            f"imageHash: {_js(asset.image_hash)} }}];"
+        )
+        self.end(node_id, "set_image")
+
+    def set_interaction(self, node_id: str, edit: dict) -> None:
+        """Make clicking this node do something -- the prototype layer.
+
+        The destination is a screen NAME, resolved here against the real
+        frames, so a name that is not in the file is refused rather than
+        written as a dead link.
+        """
+        target = str(
+            edit.get("to") or edit.get("screen") or edit.get("on_click") or edit.get("value") or ""
+        ).strip()
+        action = str(edit.get("action") or "").strip().lower()
+        if not action:
+            action = "back" if target.lower() in ("back", "go back") else "navigate"
+        link = interactions.Link(
+            source_id=node_id,
+            action=action if action in interactions.ACTIONS else "navigate",
+            trigger=interactions.normalize_trigger(edit.get("trigger")),
+            transition=interactions.normalize_transition(edit.get("transition")),
+            url=target if target.lower().startswith("http") else "",
+        )
+        if link.action == "url" or link.url:
+            link = interactions.Link(
+                source_id=node_id, action="url", url=target, trigger=link.trigger
+            )
+        elif link.action != "back":
+            if not self.screens:
+                raise SpecError(
+                    "set_interaction needs somewhere to navigate to, and this file has no "
+                    "screen frames the harness could find."
+                )
+            destination = interactions.resolve_screen(target, self.screens)
+            if not destination:
+                raise SpecError(
+                    f"no screen called {target!r}. The screens in this file are: "
+                    + ", ".join(f'"{name}"' for name in self.screens)
+                )
+            link = interactions.Link(
+                source_id=node_id,
+                destination_id=destination,
+                destination_name=target,
+                trigger=link.trigger,
+                transition=link.transition,
+            )
+        var = self.begin(node_id, "set_interaction")
+        self.lines.append(
+            f"  if (!('setReactionsAsync' in {var})) "
+            "{ throw new Error('this node cannot hold an interaction'); }"
+        )
+        self.lines.append(
+            f"  await {var}.setReactionsAsync({_js([interactions.reaction(link)])});"
+        )
+        self.end(node_id, "set_interaction")
 
     def reorder(self, node_id: str, edit: dict) -> None:
         index = edit.get("index")
@@ -334,6 +433,8 @@ class _EditCompiler:
             self.roles,
             replace_ids=replace_ids,
             token_names=list(self.tokens.values()),
+            assets=self.assets,
+            screens=self.screens,
         )
         return _inline_render(code, parent, raw_parent)
 
@@ -369,7 +470,15 @@ def _inline_render(code: str, parent, raw_parent: bool) -> str:
     """
     body = code
     # Its own `return` would end the whole batch.
-    body = body.replace("return { createdNodeIds: created };", "for (const id of created) { madeIds.push(id); }")
+    # Matched as a pattern, not a fixed string: the renderer's return line
+    # grew a `wired` field, and a literal match that silently stopped matching
+    # would leave the inlined script's own `return` in place -- ending the
+    # whole batch at the first insert.
+    body = re.sub(
+        r"return \{ createdNodeIds: created[^}]*\};",
+        "for (const id of created) { madeIds.push(id); }",
+        body,
+    )
     # Its preamble redeclares things the batch owns. Rename the whole block's
     # bindings by scoping it -- a block statement gives every `const` in the
     # inlined script its own scope, so nothing collides.
@@ -415,6 +524,8 @@ def compile_edits(
     color_roles: dict[str, str],
     token_names: list[str] | None = None,
     protected_ids: set[str] | None = None,
+    assets: list | None = None,
+    screens: dict[str, str] | None = None,
 ) -> tuple[str, list[str]]:
     """Turn a list of edits into ONE script. Returns `(js, touched_node_ids)`.
 
@@ -428,7 +539,9 @@ def compile_edits(
     if len(edits) > MAX_EDITS:
         raise SpecError(f"{len(edits)} edits is more than {MAX_EDITS}; split this across steps")
 
-    compiler = _EditCompiler(color_roles, token_names or [], protected_ids or set())
+    compiler = _EditCompiler(
+        color_roles, token_names or [], protected_ids or set(), assets, screens
+    )
     for position, edit in enumerate(edits, start=1):
         if not isinstance(edit, dict):
             raise SpecError(f"edit {position} is not an object")

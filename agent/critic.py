@@ -75,6 +75,21 @@ function tokenBacked(node) {
   return false;
 }
 
+// Any VISIBLE paint at all, of any type. `solidFill` deliberately only reports
+// a solid colour -- an image or a gradient has no single RGB -- but "has no
+// colour we can reason about" is not the same as "nothing is painted here",
+// and treating them as the same made the harness report its own image blocks
+// as empty frames.
+function hasPaint(node) {
+  if (!('fills' in node)) { return false; }
+  const fills = node.fills;
+  if (!Array.isArray(fills)) { return false; }
+  for (const paint of fills) {
+    if (paint && paint.visible !== false && paint.type) { return true; }
+  }
+  return false;
+}
+
 function describe(node, depth) {
   const info = {
     id: node.id, name: node.name, type: node.type,
@@ -83,6 +98,7 @@ function describe(node, depth) {
     visible: node.visible !== false,
     layoutMode: 'layoutMode' in node ? node.layoutMode : null,
     fill: solidFill(node),
+    hasPaint: hasPaint(node),
     tokenBacked: tokenBacked(node),
     children: []
   };
@@ -408,7 +424,13 @@ def _check_self(node: dict, defects: list[Defect], background: tuple | None = No
         # filled block, so this rule was failing the harness's own output and
         # demoting finished sections to TODO placeholders over it.
         own = fill_rgb(node)
-        blank = own is None or (background is not None and own == background)
+        if own is not None:
+            blank = background is not None and own == background
+        else:
+            # No SOLID colour -- but an image or a gradient fill is still
+            # something to look at. A childless frame showing the user's
+            # photograph is the whole point of `kind: "image"` (section 22).
+            blank = not node.get("hasPaint")
         if width > 40 and height > 40 and blank:
             defects.append(
                 Defect(node_id, name, "empty-frame",

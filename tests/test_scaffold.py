@@ -5,12 +5,19 @@ the plugin evaluates it, so a syntax slip fails here rather than mid-run.
 """
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import subprocess
 
 import pytest
 
 from agent import scaffold
+
+
+def _node() -> bool:
+    """Is node available? The generated JS is RUN with it, not simulated."""
+    return shutil.which('node') is not None
 
 
 def compiles_as_async_body(code: str) -> bool:
@@ -446,3 +453,247 @@ def test_a_screen_frame_honours_its_own_starting_height():
 
     assert '"height": 844' in script
     assert "spec.height || 900" in script
+
+
+# ---- blank space BELOW everything -----------------------------------------
+#
+# Screen frames hug their content while they are built, which is what stops a
+# long page clipping -- and leaves a row of frames ending at assorted heights.
+# Levelling them all to the tallest fixed the raggedness and bought something
+# worse: a Category page whose content stopped halfway down a frame sized for a
+# five-section landing page, the rest blank canvas.
+
+FIT_HARNESS = """
+const body = process.argv[1];
+const frames = JSON.parse(process.argv[2]);
+const nodes = {};
+frames.forEach(function (f) {
+  nodes[f.id] = {
+    id: f.id, name: f.name, removed: false, width: 1440, height: f.content,
+    primaryAxisSizingMode: 'AUTO',
+    resize: function (w, h) { this.width = w; this.height = h;
+                              this.primaryAxisSizingMode = 'FIXED'; }
+  };
+});
+global.figma = { getNodeByIdAsync: async function (id) { return nodes[id]; } };
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+new AsyncFunction(body)().then(function (r) { console.log(JSON.stringify(r)); })
+  .catch(function (e) { console.log(JSON.stringify({ error: String(e.message || e) })); });
+"""
+
+
+def fit(contents, viewport=1024):
+    """Run the real script against fake frames of the given content heights."""
+    frames = [{"id": str(i), "name": "S" + str(i), "content": h}
+              for i, h in enumerate(contents)]
+    specs = [{"id": f["id"], "viewport": viewport} for f in frames]
+    result = subprocess.run(
+        ["node", "-e", FIT_HARNESS, "--",
+         scaffold.build_fit_screens_script(specs), json.dumps(frames)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert "error" not in payload, payload
+    return [row["height"] for row in payload["screens"]]
+
+
+@pytest.mark.skipif(not _node(), reason="node not installed")
+def test_a_page_that_fits_is_exactly_one_laptop_screen():
+    """1440x1024 is what a mockup of a website is supposed to look like."""
+    assert fit([860]) == [1024]
+    assert fit([1024]) == [1024]
+
+
+@pytest.mark.skipif(not _node(), reason="node not installed")
+def test_every_page_that_fits_comes_out_identical():
+    """"Equal" without the blank canvas: pages within a screenful all match."""
+    assert len(set(fit([700, 860, 1010]))) == 1
+
+
+@pytest.mark.skipif(not _node(), reason="node not installed")
+def test_a_long_page_grows_by_whole_screenfuls():
+    """A landing page IS taller than a viewport. It should still be a clean
+    number, not wherever the last section happened to stop -- as long as the
+    rounding does not cost most of a screen of blank canvas."""
+    assert fit([2570]) == [3072]   # 502px of slack: worth a clean number
+
+
+@pytest.mark.skipif(not _node(), reason="node not installed")
+def test_a_page_barely_over_one_screen_is_not_rounded_up_to_two():
+    """The exact failure a real run shipped. Content 156px past the viewport
+    became a 2048px frame: a whole screenful of blank canvas below the design,
+    with every full-height column stretched down into it. Slightly ragged beats
+    visibly empty."""
+    assert fit([1180]) == [1180]
+
+
+@pytest.mark.skipif(not _node(), reason="node not installed")
+def test_the_slack_is_never_more_than_one_screenful():
+    """The old rule levelled everything to the TALLEST: on these exact heights
+    the shortest page carried 1710px of blank canvas."""
+    contents = [2570, 1180, 860, 700]
+
+    slack = [h - c for h, c in zip(fit(contents), contents)]
+
+    assert max(slack) < 1024
+
+
+@pytest.mark.skipif(not _node(), reason="node not installed")
+def test_a_page_is_never_cut_shorter_than_its_content():
+    """Cutting a page down is the clipping the hugging existed to avoid."""
+    runaway = 40000  # past the viewport cap
+
+    assert fit([runaway]) == [runaway]
+
+
+@pytest.mark.skipif(not _node(), reason="node not installed")
+def test_a_phone_page_is_rounded_to_a_phone_viewport():
+    assert fit([600], viewport=844) == [844]
+    # ...but not to TWO phone screens for 56px of overflow.
+    assert fit([900], viewport=844) == [900]
+    assert fit([1500], viewport=844) == [1688]   # genuinely a two-screen page
+
+
+# ---- a screen that is only half built --------------------------------------
+#
+# `mark_unbuilt_screens` catches a screen with NO children. A real run slipped
+# past it: the Sign Up screen was built as a full-width editorial panel -- one
+# image, one quote -- and the form never arrived. It had a child, so from
+# Python it looked built, and the run reported success.
+
+
+def row(texts, controls=0, nodes=None):
+    return {"id": "1:2", "name": "Sign Up", "children": 1,
+            "texts": texts, "controls": controls,
+            "nodes": nodes if nodes is not None else texts + controls}
+
+
+def test_a_picture_and_a_quote_is_not_a_finished_screen():
+    assert scaffold.thin_screen_reason(row(texts=1), richest_texts=20)
+
+
+def test_a_screen_with_no_readable_content_at_all_is_thin():
+    assert scaffold.thin_screen_reason(row(texts=0), richest_texts=20)
+
+
+def test_a_screen_a_quarter_the_size_of_its_sibling_is_thin():
+    """It clears the absolute bar on its own and is still obviously unfinished
+    next to the screen beside it."""
+    assert scaffold.thin_screen_reason(row(texts=5, controls=1), richest_texts=40)
+
+
+def test_a_finished_screen_is_left_alone():
+    assert scaffold.thin_screen_reason(row(texts=18, controls=6), richest_texts=20) == ""
+
+
+def test_a_sparse_screen_with_real_controls_is_not_thin():
+    """A confirmation screen is genuinely short: a line of copy and a button.
+    Rebuilding it uninvited would be the agent overruling the design."""
+    assert scaffold.thin_screen_reason(row(texts=2, controls=2), richest_texts=6) == ""
+
+
+def test_a_lone_screen_is_only_judged_against_the_absolute_bar():
+    """With nothing to compare against, the sibling rule must not fire -- it
+    would call every single-screen design unfinished."""
+    assert scaffold.thin_screen_reason(row(texts=6, controls=2), richest_texts=6) == ""
+
+
+# ---- the brand font --------------------------------------------------------
+#
+# A design brief that says "Primary Display Font: Playfair Display" and comes
+# back set in Inter is not the design that was asked for. Every name here is a
+# GUESS until Figma confirms it, which is the same rule this project already
+# applies to style strings ("Inter SemiBold" killed a live run).
+
+FONT_BRIEF = """
+### Primary Display Font
+
+**Playfair Display**
+
+Use for the wordmark and headings.
+
+### UI Font
+
+**Inter**
+"""
+
+FIGMA_HAS = {
+    "Playfair Display": ["Regular", "Medium", "SemiBold", "Bold"],
+    "Inter": ["Regular", "Medium", "Semi Bold", "Bold"],
+}
+
+
+def test_the_display_font_is_read_out_of_the_brief():
+    candidates = scaffold.candidate_fonts(FONT_BRIEF)
+
+    assert "Playfair Display" in candidates
+
+
+def test_a_greedy_capture_is_offered_shortest_last_so_figma_decides():
+    """"Playfair Display Use for the wordmark" -- where a font name ends is not
+    something to be clever about, so every prefix is offered and the real API
+    picks."""
+    candidates = scaffold.candidate_fonts("Display Font: Playfair Display Use for headings")
+
+    assert candidates.index("Playfair Display Use") < candidates.index("Playfair Display")
+    assert scaffold.pick_display_family(candidates, FIGMA_HAS) == "Playfair Display"
+
+
+def test_a_font_the_file_does_not_have_is_never_used():
+    """A text style set to a missing family throws the moment anything uses it."""
+    assert scaffold.pick_display_family(["Canela", "GT Sectra"], FIGMA_HAS) == ""
+
+
+def test_inter_is_the_fallback_never_the_brand_font():
+    assert scaffold.pick_display_family(["Inter"], FIGMA_HAS) == ""
+
+
+def test_the_real_style_string_is_taken_from_the_family_itself():
+    """Inter spells it "Semi Bold", Playfair Display spells it "SemiBold".
+    Guessing either one throws "font not loaded"."""
+    assert scaffold.match_style("Semi Bold", FIGMA_HAS["Playfair Display"]) == "SemiBold"
+    assert scaffold.match_style("Semi Bold", FIGMA_HAS["Inter"]) == "Semi Bold"
+
+
+def test_a_weight_the_family_lacks_degrades_to_the_nearest_one_it_has():
+    assert scaffold.match_style("Semi Bold", ["Regular", "Bold"]) == "Bold"
+    assert scaffold.match_style("Bold", ["Regular"]) == "Regular"
+
+
+def test_headings_get_the_brand_font_and_ui_text_stays_inter():
+    """A serif at 13px inside an input is what makes a page hard to read."""
+    ramp = scaffold.ramp_fonts("Playfair Display", FIGMA_HAS)
+
+    assert ramp["Heading"] == ("Playfair Display", "SemiBold")
+    assert ramp["Display"][0] == "Playfair Display"
+    assert ramp["Body"][0] == "Inter"
+    assert ramp["Button"][0] == "Inter"
+    assert ramp["Caption"][0] == "Inter"
+
+
+def test_a_design_that_named_no_font_is_unchanged():
+    ramp = scaffold.ramp_fonts("", FIGMA_HAS)
+
+    assert {family for family, _ in ramp.values()} == {"Inter"}
+
+
+def test_the_text_style_script_carries_the_resolved_font():
+    script = scaffold.build_text_style_script(
+        scaffold.ramp_fonts("Playfair Display", FIGMA_HAS)
+    )
+
+    assert '"family": "Playfair Display"' in script
+    assert '"style": "SemiBold"' in script
+    assert compiles_as_async_body(script)
+
+
+def test_one_missing_family_costs_one_style_not_the_whole_ramp():
+    """And the run is told, rather than quietly shipping Inter and calling it
+    the brand font."""
+    script = scaffold.build_text_style_script(
+        scaffold.ramp_fonts("Playfair Display", FIGMA_HAS)
+    )
+
+    assert "fellBack.push" in script
+    assert "family: 'Inter', style: entry.fallback" in script

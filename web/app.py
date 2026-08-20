@@ -273,7 +273,8 @@ class DashboardServer:
             # means the design was already built without the reference.
             references = ""
             if attachments:
-                reference.check_readable(attachments, settings.has_vision)
+                for note in reference.check_readable(attachments, settings.has_vision):
+                    logger.info("%s", note)
                 logger.info("Reading %d attachment(s)...", len(attachments))
                 references, attach_warnings = reference.describe(
                     attachments, build_vision_client(settings)
@@ -292,6 +293,7 @@ class DashboardServer:
                     run_metrics=run_metrics,
                     should_stop=self._stop.is_set,
                     references=references,
+                    attachments=attachments,
                 )
             else:
                 result = loop.run(
@@ -306,6 +308,10 @@ class DashboardServer:
                     final_repair=bool(prefs["final_repair"]),
                     should_stop=self._stop.is_set,
                     references=references,
+                    # Read as words for the brief AND uploaded as real images
+                    # the design can place (agent/assets.py).
+                    attachments=attachments,
+                    prototype=bool(prefs["prototype"]),
                 )
             # Best-effort: the design is already built, so a failed thumbnail
             # refresh must not report the whole run as crashed and throw the
@@ -619,7 +625,7 @@ def _result_payload(result) -> dict:
     """
     optional = (
         "layout_defects", "design_notes", "requirements_met", "requirements_missing",
-        "screens",
+        "screens", "interactions",
     )
     shots = getattr(result, "screen_shots", []) or []
     payload = {

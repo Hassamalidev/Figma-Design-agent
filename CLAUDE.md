@@ -27,7 +27,13 @@ pipeline — see section 20 for why they are not the same job.
 And you do not have to type any of it. **Attach a screenshot** and it rebuilds what the
 screenshot shows; attach a spec document and it builds to that; **dictate** the instruction
 instead of typing it. All three become the same thing — words the pipeline already knows
-how to build from — see section 21.
+how to build from — see section 21. An attached picture is also **put into the design**:
+uploaded into the file once and painted onto whatever node the design says shows it, so a
+logo is the logo rather than a grey box (section 22).
+
+And the result is not a picture of a design. The finished file is **wired as a prototype** —
+the sign-in button really opens the dashboard, "Back" really goes back, a long page scrolls.
+Section 23.
 
 The agent does **not** know Figma from memory. It becomes competent through the harness:
 docs are retrieved into context on demand (section 9), work happens in small atomic steps,
@@ -66,7 +72,14 @@ tall column, and a re-run stamped fresh work over the old. Now:
   filter is spelling-proof, since "Hero Section" and "Navigation Bar" are the
   same mistake as "Hero" and "Nav".
 - The harness creates **one frame per screen**, positions computed in Python so
-  they can never overlap each other or existing work (section 6a). Each screen
+  they can never overlap each other or existing work (section 6a).
+- **A page frame is a whole number of screenfuls tall**, when that costs
+  nothing. Frames hug their content while they are built (which is what stops a
+  long page clipping) and are rounded up to a viewport multiple at the end, so
+  a page that fits is exactly 1440x1024 — a real laptop screen — and every page
+  that fits comes out identical. A screenful is what the **instruction** asked
+  for when it says so ("1440 × 900px"), and rounding stops where it would add
+  most of a blank screen. See 6a. Each screen
   advances by its **own** width, so a 390px phone frame beside a 1440px desktop
   one neither overlaps it nor leaves a chasm.
 - Each screen is **planned separately** and each step carries its `screen_index`,
@@ -151,6 +164,8 @@ Each part has one responsibility:
 | **Bridge** (`bridge/`) | WebSocket server + message protocol. Sends JS to the plugin, matches responses by id, tracks which file is connected. |
 | **State** (`agent/state.py`) | Holds the plan, created node IDs, tokens, per-step results. Feeds the model concise summaries, never full history. |
 | **Reference** (`agent/reference.py`) | Attachments -> text: a screenshot read by a vision model, a spec read as-is. One conversion at the front, so nothing downstream needs to know about images (section 21). |
+| **Assets** (`agent/assets.py`) | Attachments -> real images ON the canvas: uploaded once per run, then referenced by hash from any number of paints (section 22). |
+| **Interactions** (`agent/interactions.py`) | The prototype layer: what clicking a thing does, which screens are reachable, what scrolls (section 23). |
 | **Editor** (`agent/editor.py`) | The mirror of the renderer, for changing nodes that already exist: a declarative edit list compiled into correct Plugin API calls (section 20). |
 | **Inventory** (`agent/inventory.py`) | The canvas as an addressable index, so an edit can name a real node instead of guessing a selector (section 20). |
 | **Edit loop** (`agent/edit_loop.py`) | The edit pipeline: read the canvas -> adopt its styles -> plan changes -> apply and verify one at a time. |
@@ -180,6 +195,8 @@ figma-agent/
 |   |-- editor.py            # declarative edits -> Figma JS (section 20)
 |   |-- inventory.py         # the existing canvas, as addressable ids (section 20)
 |   |-- reference.py         # attachments -> reference text (section 21)
+|   |-- assets.py            # attachments -> images on the canvas (section 22)
+|   |-- interactions.py      # the prototype: links, flows, scrolling (section 23)
 |   |-- planner.py           # instruction -> design brief -> ordered plan
 |   |-- scaffold.py          # Python-authored Figma scripts (section 6a)
 |   |-- critic.py            # the visual gate + design-system checks (section 8)
@@ -229,6 +246,8 @@ figma-agent/
     |-- test_editor.py       # the edit compiler, weighted to what it REFUSES
     |-- test_inventory.py    # the canvas index, listing and id resolution
     |-- test_reference.py    # attachments: decoding, refusing, describing (section 21)
+    |-- test_assets.py       # placing a real picture, and refusing the wrong ones (s.22)
+    |-- test_interactions.py # prototype wiring, weighted to what it must NOT link (s.23)
     |-- test_generated_js.py # rules EVERY generated script obeys (banned sync APIs, removal guards)
     |-- test_loop.py         # loop logic with a fake ModelClient + fake bridge
     |-- test_planner.py      # screen decomposition, build order, the step budget
@@ -320,7 +339,7 @@ which is exactly what the swap point is for.
 ### Cost discipline
 
 Debug the **harness** (does the loop close, do tools fire, do the gates block) against the
-fakes in `tests/` — 572 tests run with no network, no Figma and no model. Spend real model
+fakes in `tests/` — 737 tests run with no network, no Figma and no model. Spend real model
 calls on genuine design runs.
 
 ---
@@ -439,6 +458,20 @@ deterministic, unit-tested, and compiled as JavaScript in CI.
 | **Section names that aren't screens** (`planner._is_section_name`) | The filter matched exact words, so `Hero` was dropped and `Hero Section` became a top-level frame — the same mistake, spelled out. Generic nouns (`section`, `bar`, `area`, `panel`…) are stripped before matching. `page` deliberately is **not**: "Settings Page" is a screen. |
 | **Build order** (`planner.order_steps`) | A screen frame is a VERTICAL auto-layout and every section step appends into it, so **step order IS visual order** — a plan that lists the footer first builds the footer at the top, and no gate can see it because each band is individually well formed. Steps that clearly name the top or the bottom of a screen are sorted; the sort is stable, so everything the harness cannot place keeps the order the model chose. |
 | **Fitting the step budget** (`planner.fit_steps`) | The per-screen budget was applied with a slice, which silently threw the end of the screen away: a five-band landing page capped at three shipped without its testimonials or its footer, and every step it *did* run passed, so nothing downstream could notice. The tail is now MERGED into the last step instead of dropped. |
+| **Deciding width LAST** (`renderer.sizing_pass`) | A finished design came back with a four-book grid filling a third of a 1440px page and the rest blank canvas. The cause was ORDER, not layout: the compiler emitted `setFill(n5)` and then `n5.resize(n5.width, 180)` two lines later, and **`resize()` resets both sizing modes to FIXED** — so every node's fill was destroyed by its own height resize, freezing it at whatever width it had *while the frame was still empty*. Worse, every fill was applied before the frame had any children, so there was nothing to resolve a width against. Width is now decided in ONE pass at the end of the script, outermost-first, after every node exists and every resize has run. Nothing downstream can undo it, and the ordering question disappears rather than being got right by hand. |
+| **Spreading a full-width row** (`renderer._default_justify`) | The other half of the same blank space. A header is a row of things that each HUG — a logo, some nav links, some icons — inside a row that fills the page. The default `MIN` packs all three against the left and leaves the rest of the 1440px empty. A row that genuinely fills, with two or more children, now gets `SPACE_BETWEEN`. It is a no-op exactly where it should be: a hugging row has no free space, and a grid whose cards all fill has none either. |
+| **Building the screens ROUND-ROBIN** (`_interleave_screens`) | The plan was screen-major — all of Home, then all of Shop, then all of Category. So a run that does not reach the end does not lose a little of each screen, **it loses whole screens**: a real four-screen run finished Home completely and left Shop, Category and Book Details as three empty frames. Nothing about that is recoverable afterwards, and the user cannot tell a design that ran out of time from one that was built wrong. Interleaving turns a cliff into a slope — the same budget, spent in the order "every screen's first section, then every screen's second", means a run cut short is thin everywhere instead of absent in three quarters of the file. Measured: with a 4-step budget the old order touched 2 screens, the new one touches all 4. Order WITHIN a screen is untouched, because step order is visual order. |
+| **Design consistency across screens** (`RunState.sections_elsewhere`) | Every screen was planned and built in isolation, so the header on the shop page had no idea what the header on the home page looked like and the two came out different — which is what makes a five-screen file read as five designs. Each step is now told what the rest of the design already contains and to MATCH it. This only became possible *because* of round-robin: under screen-major order the first screen was entirely finished before the second started, but the useful moment is when screen two's FIRST step runs and screen one's chrome already exists. `TODO` placeholders are withheld — a gap marker is not a design decision, and matching one would spread it. |
+| **Noticing a screen nothing reached** (`mark_unbuilt_screens`) | A run finished with a fully built Home beside a completely EMPTY Shop and reported success. The only visible symptom was that the two frames were wildly different heights — which reads as a sizing bug and is not one. **No height rule can fix an empty page:** a frame is sized to its content, and sizing an empty frame to match a full one is precisely the blank canvas that levelling-to-the-tallest was removed for. Every other way of failing already leaves a mark — a step that exhausts its retries drops a labelled `TODO` band — but a screen whose steps never ran at all left nothing behind, so nothing could tell it apart from a page somebody wanted blank. It now gets a `TODO` band, a warning naming it, and the run is not a success. Marked one step BEFORE the repair pass, so the screen becomes one of that pass's targets and gets a real attempt (section 18a2). **Read from the canvas, never inferred:** `record_section` only fires for steps the keyword heuristic calls a section, so a screen built by a step phrased any other way looks empty from Python while being full in Figma. |
+| **The screen size the user ASKED for** (`Screen.viewport_height`) | "Frame size for both: 1440 x 900px" is a decision, and the fit pass overruled it with the DESKTOP viewport (1024). A design specified as 1440x900 shipped as 1440x2048: a screenful of blank canvas under it, and every full-height column stretched down into the void, which read as a broken layout and was a sizing bug. The stated height is now the screenful this design is measured in, all the way to the end. |
+| **Not rounding a page up into a void** (`scaffold.MAX_SNAP_SLACK`) | The other half of the same failure. "A page is a whole number of screenfuls tall" is right up to the moment content sits a little OVER one viewport -- then rounding up adds most of a blank screen. Snapping is now free within the first viewport (which is what makes every page that fits come out identically 1440x1024) and is refused past 50% slack after that: slightly ragged beats visibly empty. |
+| **A screen that is only HALF built** (`scaffold.thin_screen_reason`) | `mark_unbuilt_screens` only catches a screen with NO children, and a real run walked straight past it: the Sign Up screen was built as a full-width editorial panel -- one image, one quote -- and the form never arrived. It had a child, so from Python it looked finished, and the run reported success. What is really INSIDE each screen is now counted, and a screen with almost no copy and nothing to interact with gets one real attempt at its missing content (`finish_thin_screens`) before it is reported as unfinished. |
+| **The brand font** (`scaffold.candidate_fonts`, `ramp_fonts`) | A brief that says "Primary Display Font: Playfair Display" and comes back set in Inter is not the design that was asked for. Font names in a brief are GUESSES, so the candidates are offered to `listAvailableFontsAsync` and only what Figma confirms is used -- the same rule this project already applied to style strings, since families spell the same weight differently ("Semi Bold" in Inter, "SemiBold" in Playfair Display) and guessing throws "font not loaded". Headings take the brand font; labels, inputs and buttons stay in the UI font, because a serif at 13px inside an input is what makes a page hard to read. |
+| **Page height in whole screenfuls** (`scaffold.build_fit_screens_script`) | Two failures, both visible as blank canvas. Frames that HUG end at assorted heights and read as a mistake; levelling them all to the TALLEST fixes that and buys something worse — on one real run the Category page's content stopped halfway down a frame sized for a five-section landing page, and the shortest page carried **1710px** of nothing. Rounding each frame up to a multiple of its own viewport gives both: a page that fits is exactly 1440x1024, pages that fit are all identical, a long page is a clean 2048 or 3072, and the slack is never more than one screenful. Never cuts a page shorter than its content — that is the clipping the hugging exists to avoid. |
+| **Uploading the user's pictures** (`assets.upload_assets`) | An image in Figma is a handle, not a node, and every paint that shows it references the same hash. Left to the model that is `createImage` + base64 + `getSizeAsync` + a paint literal, per picture, per node -- four API traps to get wrong for something with exactly one right answer. The harness uploads each attachment once and hands the model a NAME (section 22). |
+| **Which pictures can be placed at all** (`assets.placeable`) | `figma.createImage` takes PNG, JPEG and GIF; `reference.IMAGE_TYPES` also reads WEBP. So a WEBP was accepted, described, and then silently never appeared -- the user watching their attachment be ignored. It is now a warning naming the file and what to do about it. |
+| **Matching a button to the screen it opens** (`interactions.auto_link`) | "Sign up" opens the Sign Up screen. That is string matching, not judgement, and a model asked to do it across five screens gets enough of them wrong to matter. Python links what it can prove and the model is asked once, only about what is left (section 23). |
+| **Prototype entry points and scrolling** (`interactions.build_flow_script`) | A screen nothing links to cannot be reached in Presentation view at all, and a page taller than its viewport is cut off at the fold. Both are arithmetic against the heights the harness itself just decided -- and `flowStartingPoints` has to be MERGED, or a re-run throws away the user's own flows. |
 | **Tracking what's been built** (`record_section`) | `existing_sections` was filled in once, only when reusing a root frame — so on a fresh run every step was told the page was empty and duly rebuilt what was already there. Each completed section (and each TODO placeholder) is now recorded as it lands. |
 
 Consequence for the planner: it is told the root frame and all styles **already exist** and
@@ -500,7 +533,7 @@ it cannot hallucinate a defect:
 | `overflow` | A child extending outside its parent's bounds. |
 | `duplicate-section` | A section that rebuilds what a sibling already has. A dashboard run built its sidebar twice — once alone, then again inside the shell — and both copies were individually well-formed, so only their identical text gives them away. |
 | `overlap` | Two siblings overlapping by more than 2px — **only** checked when the parent is not auto-layout, since auto-layout cannot produce overlap (avoids false positives). |
-| `empty-frame` | A frame over 40×40 with no children **and nothing painted in it** — or painted the same colour as what is behind it. The fill test matters: the renderer's own `box` (chart areas, image placeholders, the glowing shapes in a hero) is a deliberately childless FILLED block, so without it the harness failed its own output. Frames under 40×40 are icon placeholders and ignored. |
+| `empty-frame` | A frame over 40×40 with no children **and nothing painted in it** — or painted the same colour as what is behind it. The fill test matters: the renderer's own `box` (chart areas, image placeholders, the glowing shapes in a hero) is a deliberately childless FILLED block, so without it the harness failed its own output. "Painted" means **any** visible paint, not just a solid colour — an IMAGE fill has no single RGB, so a frame showing the user's photograph (section 22) was reported as an empty region by the same rule. Frames under 40×40 are icon placeholders and ignored. |
 | `invisible` / `empty-text` | Hidden nodes and text with no characters. |
 | `contrast` | Text under ~3:1 against its resolved background — **invisible copy**. See 8b. |
 
@@ -560,7 +593,39 @@ or more requirements, zero met). One missing item is a flaw, not a failure — o
 zero-of-many is the wrong design. This closes the gap where a run could match nothing the
 user asked for and still report a green tick.
 
-### 8e. Screenshot critique (a SEPARATE vision model)
+### 8e. Screenshot critique — the builder reviews its own work
+
+**By default there is ONE model.** It builds a section, is shown a screenshot of
+what it built, and says what is visibly wrong with it. No second endpoint, no
+extra key, no configuration.
+
+That is a reversal, and the reason is that the old default was silently the worst
+of both worlds. Two models is the right split when they are genuinely different
+animals — the generator needs reliable tool calling, the critic needs eyes — but
+`CRITIC_MODEL_NAME` is blank in most setups, and a blank critic *hard-disabled*
+screenshot review. So the single most valuable check in this project was off, and
+gap #5 sat open run after run while multimodal tool-calling models became
+ordinary.
+
+`_enable_self_review` now probes the main model once per run with
+`agent/vision_probe.py` and, if it can genuinely see, makes it its own critic.
+
+- **Probed, never assumed.** A model name says nothing about whether it can see.
+  The dangerous case is not the endpoint that refuses the image — it is the one
+  that ACCEPTS it and answers from the text alone, where critique still comes
+  back and every defect in it is invented. The probe sends a solid blue square
+  and checks the model says "blue"; a model that says "red" is refused.
+- **One small call per run**, and only when no critic is configured. A text-only
+  endpoint costs that one probe instead of a 400 on every step.
+- **`CRITIC_*` still wins** when it is set. A dedicated vision critic is still
+  the better answer when the generator is a text-only model, and section 8e's
+  measured table below still applies to choosing one.
+
+Everything after this point — severity tags, section scoping, and never turning a
+visual complaint into a placeholder — is unchanged and is what makes either
+arrangement safe to switch on.
+
+### 8e1. Choosing a SEPARATE vision model
 
 **The critic is its own model** (`CRITIC_*` in `.env`, built by
 `llm.build_critic_client`). The generator needs reliable tool calling and runs ~50 times per
@@ -830,6 +895,10 @@ Full version lives in `knowledge/gotchas.md` and is always in context. Essential
   **verify the exact style string** with `listAvailableFontsAsync()` — Inter is `"Semi Bold"`
   *with a space*, not `"SemiBold"`. Guessing throws.
 - **`resize()` resets sizing modes to FIXED.** Call `resize()` *before* setting HUG/FILL.
+  This is subtler than it reads: it applies to a node's OWN later resizes too, so a
+  fill set at creation is destroyed by a height resize further down the script. The
+  renderer stopped trying to get the order right and now decides every width in one
+  pass at the end (section 6a) — the only ordering that cannot be got wrong.
 - **TEXT nodes ignore FILL by default** and collapse to ~0px wide. For wrapping text: set
   `textAutoResize='HEIGHT'` and an explicit width, then verify `node.width > 0`.
 - **HUG/FILL need an auto-layout parent.** Append the child first, *then* set
@@ -933,6 +1002,11 @@ MAX_RETRIES=3
 MAX_STEPS=40
 ```
 
+Two run preferences live only in the dashboard (`settings_store.PREF_SPECS`),
+both on by default: `final_repair` (go back and fix what the review found) and
+`prototype` (wire the finished design up so it can be clicked through --
+section 23).
+
 Three places must agree on host/port: `.env`, `figma_plugin/manifest.json`'s `networkAccess`,
 and the plugin's Bridge URL field (editable in its UI, saved in `clientStorage`).
 
@@ -1026,10 +1100,10 @@ Do not start a phase until the previous one runs end to end.
 4. ~~**No deterministic design checks** beyond geometry~~ **Done** — sections 8b and 8c.
    Contrast is now enforced against what landed (unreadable blocks, below-AA is advisory),
    and spacing-scale, type-ramp and token-backing are measured and reported.
-5. **No vision critic is configured yet.** The architecture is in place and safe to enable
-   (section 8b), but `CRITIC_MODEL_NAME` is blank, so screenshot critique never runs. This is
-   now the biggest single quality lever available — it is the only check that can see
-   contrast, balance and whether the screen reads as the product that was asked for.
+5. ~~**No vision critic is configured yet.**~~ **Closed** — section 8e. With no `CRITIC_*`
+   set, the builder now reviews its own work: one probed multimodal model builds a section
+   and then looks at a screenshot of it. What is still open is *measuring* whether it helps,
+   which is gap #1 again.
 6. Design quality on a 20B model. Real, but it was masked by the plumbing gaps above; retest
    it once the benchmark exists.
 7. Embeddings over `api_types.d.ts` are **built but off by default** (section 9): BM25 wins
@@ -1045,7 +1119,7 @@ Do not start a phase until the previous one runs end to end.
 
 ## 16. Testing
 
-**572 tests, no network, no Figma, no model.** `pytest` runs the whole suite in ~7 seconds.
+**737 tests, no network, no Figma, no model.** `pytest` runs the whole suite in ~15 seconds.
 
 | File | Covers |
 |---|---|
@@ -1056,6 +1130,8 @@ Do not start a phase until the previous one runs end to end.
 | `test_requirements.py` | Requirement coverage, weighted towards its false-positive rules: a wrongly-reported miss is worse than a missed check |
 | `test_metrics.py` | The run recorder: latency distributions, per-thread isolation, and that measuring never breaks what it measures |
 | `test_scaffold.py` | Palette parsing, screen placement (no returned rect touches another or anything already on the page), and that generated JS **actually compiles** via `new AsyncFunction(...)`, exactly as the plugin evals it |
+| `test_assets.py` | Attached pictures: which ones can be placed, how a name resolves, and that a name matching nothing is an error rather than a grey box |
+| `test_interactions.py` | Prototype wiring, weighted to what must NOT be linked: prose, a label inside its own button, a node already wired, a screen linking to itself |
 | `test_llm.py` | Tool-call recovery for models that emit them as text |
 | `test_settings.py` | Settings precedence (UI over `.env`), key masking, dashboard API |
 | `test_prompts.py` | That the step prompt actually carries the brief, the plan outline and the repair framing — the information-plumbing regressions |
@@ -1142,16 +1218,30 @@ which is evidence a password field was built, not proof it was built well. Read 
 | Change the model / provider | `.env` or the dashboard's Settings (only `agent/llm.py` defines access) |
 | Check a model can drive a run | `python check_model.py <name>` — a real tool call, not a capability flag (section 5) |
 | Find models on an endpoint | `python check_model.py --list` |
-| Turn on / change the vision critic | `CRITIC_*` in `.env` (section 8b) |
+| Turn on / change the vision critic | Nothing, if the main model is multimodal — it reviews its own work (section 8e). `CRITIC_*` in `.env` overrides. |
+| Change the order screens are built in | `agent/loop.py` — `_interleave_screens` (section 6a) |
+| Change what one screen knows about the others | `agent/state.py` — `sections_elsewhere`; the wording is `prompts.SHARED_DESIGN_NOTE` |
 | Set the model that reads attachments | Settings → Vision model, or `VISION_*` in `.env` (section 21) |
 | Handle a new provider quirk | `agent/llm.py` (section 5) |
 | Change how a run is orchestrated | `agent/loop.py` (create) / `agent/edit_loop.py` (edit) |
 | Add an edit operation | `agent/editor.py` — `OPS` + the method, then the schema in `tools/registry.py` (section 20) |
 | Change how an edit finds its target | `agent/inventory.py` — `find` / `resolve` (section 20) |
 | Change what a screenshot is read for | `agent/prompts.py` — `IMAGE_REFERENCE_PROMPT` (section 21) |
+| Change which attachments can be PLACED on the canvas | `agent/assets.py` — `PLACEABLE_TYPES` (section 22) |
+| Change how a spec names an attached picture | `agent/assets.py` — `find` / `asset_key`; the renderer's `paint_image` |
+| Add a way for a design to be clickable | `agent/interactions.py` — `ACTIONS` + `reaction` (section 23) |
+| Change which button gets linked to which screen | `agent/interactions.py` — `auto_link` / `_DESTINATION_HINTS` |
+| Change a prototype transition or trigger | `agent/interactions.py` — `TRANSITIONS` / `TRIGGERS` |
+| Change what starts a prototype flow, or what scrolls | `agent/interactions.py` — `build_flow_script`; called from `loop.set_prototype_flows` |
 | Accept another attachment type | `agent/reference.py` — `IMAGE_TYPES` / `TEXT_TYPES` |
 | Change how a colour gets its ROLE | `agent/scaffold.py` — `assign_roles` / `_ROLE_WORDS` (section 6a) |
 | Add a `kind` the spec can use | `agent/renderer.py` — `node()` dispatch + `ALIASES` |
+| Change how a node gets its width | `agent/renderer.py` — `sizing_pass` (section 6a) |
+| Change how a row distributes its children | `agent/renderer.py` — `_default_justify`, or `justify` in the spec |
+| Change how tall a page frame ends up | `agent/scaffold.py` — `build_fit_screens_script` + `MAX_SNAP_SLACK`; called from `loop.fit_screens_to_viewport` |
+| Change what counts as a HALF-built screen | `agent/scaffold.py` — `thin_screen_reason`; acted on by `loop.finish_thin_screens` |
+| Change which font a design is set in | `agent/scaffold.py` — `candidate_fonts` / `ramp_fonts` / `DISPLAY_STYLES` |
+| Change what counts as an unbuilt screen | `agent/loop.py` — `mark_unbuilt_screens` / `_empty_screen_ids` (section 6a) |
 | Change what the harness builds itself | `agent/scaffold.py` (section 6a) |
 | Tune the visual gate / add a defect check | `agent/critic.py` (section 8) |
 | Add a design-system rule (spacing, type, tokens) | `agent/critic.py` — `_check_design` (section 8c) |
@@ -1565,11 +1655,16 @@ your screenshot, ignored it, and built something generic while you watched. So:
   spends model calls and *then* reports it could not open the file. Limits:
   6 files, 6MB each, 16MB total, text trimmed at 6k characters (the whole
   conversation is resent every turn, so a long spec would crowd out the palette).
-- **An image with no vision model configured is refused**, naming the control
-  that fixes it. `Settings -> Vision model` really exists — `EDITABLE` in
-  `web/settings_store.py` includes `vision_model_name`, and
-  `Settings.vision_settings()` falls through `VISION_* -> CRITIC_* -> the main
-  model`, so naming a multimodal model is usually the only thing to do.
+- **An image with no vision model configured is refused** *when nothing else
+  can be done with it*, naming the control that fixes it. `Settings -> Vision
+  model` really exists — `EDITABLE` in `web/settings_store.py` includes
+  `vision_model_name`, and `Settings.vision_settings()` falls through
+  `VISION_* -> CRITIC_* -> the main model`, so naming a multimodal model is
+  usually the only thing to do. That line **moved** when images started being
+  placed as well as read (section 22): a PNG with no vision model is now a loud
+  warning rather than a refusal, because the picture can still genuinely appear
+  in the design — it just cannot be built to *resemble* it. A WEBP, which can
+  be neither read nor placed, is still refused.
 - **A PDF is refused with the thing to do instead** ("export the page as PNG"),
   rather than being parsed badly. Parsing PDFs needs a dependency this project
   does not want, and a half-read spec is worse than a refused one.
@@ -1592,3 +1687,136 @@ dictation is normally used to finish a sentence. Two things worth knowing:
 Attachments work in **edit mode** too — "make it look like this" is a real
 request — and the reference text reaches both the edit planner and every edit
 step.
+
+---
+
+## 22. The attached picture, in the design — not just described
+
+Section 21 turns an attachment into WORDS: a vision model writes the screenshot
+down as a brief, and everything downstream builds from that. That is the right
+answer for "make it look like this", and the only answer for a spec document.
+It is the wrong answer for "put my logo in the header" — the design ends up
+with a grey box where the picture should be, and no amount of describing a
+photograph reproduces the photograph.
+
+So an attachment now travels down **both** paths:
+
+```
+hero.jpg ──► [vision model] ──► reference text ──► brief, screens, PALETTE
+         └─► [figma.createImage] ──► image hash ──► an IMAGE fill on any node
+```
+
+The second path is `agent/assets.py`. An image in Figma is **not a node** — it
+is a handle stored in the file, referenced by hash from a paint. So it is
+uploaded **once per run** (one round trip per attachment, right after the
+tokens) and any number of nodes can then show it for free: the same logo on
+five screens costs one upload.
+
+In a spec, it is a `kind` and two extra keys the renderer understands:
+
+```json
+{"kind":"image","asset":"hero.png","height":320,"radius":"lg"}
+{"kind":"avatar","asset":"me.png","size":48}
+{"kind":"section","image":"hero.png","children":[]}
+```
+
+...an image block, a circular avatar cropped from a photo, and a photo sitting
+*behind* a whole section. Edit mode gets the same thing as an op:
+`{"op":"set_image","target":"1:9","asset":"hero.png"}`.
+
+### The rules, and the failure each one closes
+
+| Rule | Why |
+|---|---|
+| **PNG, JPEG and GIF only** | What `figma.createImage` actually accepts, verified against the typings. `reference.IMAGE_TYPES` happily *reads* a WEBP, so without this the file was accepted, described, and then silently never placed. It is now a warning naming the file and saying "export it as a PNG" — about one attachment, never a refused run. |
+| **`kind: "image"` with no attachment is still the placeholder `box`** | The word means "a picture goes here" either way. Failing a section because the user attached nothing would be a regression dressed up as a feature. |
+| **An asset name matching nothing is an ERROR** | The opposite case, and the one that matters: with attachments present, a misspelt name silently drew a grey box while the user watched their picture go unused. The message names the files that really exist, so the model corrects it on the next turn. |
+| **A name is matched loosely** | `"hero.png"`, `"hero"`, `"Hero"`, `"hero image"` and `"2"` all resolve. The model retypes the name out of a prompt; losing a step to a changed hyphen buys nothing. |
+| **One attachment and no name given is unambiguous; several is not** | Choosing which of three photographs is the hero is a design decision, so it stays with the model. |
+| **A screenshot of a UI must be REBUILT, not placed** | The one way this feature can make output worse: pasting the reference screenshot in as a hero image produces a picture of a design instead of a design. The step prompt says so explicitly. |
+| **A failed upload is a warning, and the run continues** | The reference text from the same attachment is already in the brief. Losing a whole design because one image would not decode is not a trade worth making. |
+| **Figma's error gets a hint attached** | Same idea as `ERROR_HINTS`: "Image is too large" does not tell you the limit is 4096px. `assets.upload_hint` does. |
+
+`bridge/server.py` had to grow with it: the websockets default caps a message
+at 1MB, which a full-page screenshot coming back already flirted with and an
+uploaded photo going out exceeds outright. Over the limit the library **closes
+the connection** rather than erroring, so it surfaced as "Figma disconnected"
+mid-run.
+
+---
+
+## 23. Making it dynamic — a prototype you can actually click
+
+Everything above builds a static mockup: frames, text, fills. Open it in Figma,
+press play, and nothing happens — the sign-in button is a purple rectangle with
+the word "Sign in" on it. A real Figma design is **wired**: clicking that button
+goes to the dashboard, "Back" goes back, a long page scrolls. That wiring is
+Figma's prototype layer, and it is as much a part of a design file as the pixels.
+
+The Plugin API calls it a `Reaction`: a TRIGGER (`ON_CLICK`) plus ACTIONS
+(navigate to this frame, with this transition). Under
+`documentAccess: "dynamic-page"` the `reactions` property is **read-only**, so
+`await node.setReactionsAsync([...])` is the only way to set one.
+
+```
+┌── Login ──────────┐            ┌── Dashboard ──────┐
+│  [ Sign in ] ─────┼─ ON_CLICK ─┼──►                │
+│  Create account ──┼────────────┼─► Sign Up         │
+└───────────────────┘            └───────────────────┘
+```
+
+`agent/interactions.py` owns it, and the work splits three ways on the same
+principle as everything else in this file:
+
+1. **The model wires what it builds, as it builds it.** Any node in a
+   `render_ui` spec may carry `"on_click": "Dashboard"` (or `"back"`, or a
+   URL). Only the model knows which button is the primary action of the section
+   it just designed. Everything mechanical about it — which frame that name
+   means, which transition, what a bare "back" does — is decided by the harness.
+2. **Matching a label to a screen is arithmetic, so Python does it.** After the
+   build, the harness reads every clickable thing off the real canvas and links
+   "Sign up" to the Sign Up screen, "Back" to BACK, a nav item to the screen it
+   names. One round trip, no tokens, no judgement.
+3. **The model is asked once, and only about what is left.** If a screen is
+   still unreachable and there are unlinked buttons, one call asks which of them
+   opens it — "Explore the collection" points at the Shop screen for reasons no
+   string comparison can see. Skipped entirely when step 2 already connected
+   everything.
+
+Then every screen is given a way to be reached and long pages are told to
+scroll. `RunResult.interactions` lists what was wired, and the dashboard shows it.
+
+### The rules, and the failure each one closes
+
+| Rule | Why |
+|---|---|
+| **A node that already has a reaction is never overwritten** | It was wired by the model while building, or by the user in a previous session. Both know more about intent than a name match does. |
+| **The outermost match wins** | A `Button / Sign in` frame and the TEXT inside it both say "Sign in". Wiring both means the label swallows the click and the button's own reaction never fires. The canvas reader walks breadth-first, so the button is seen first. |
+| **Only short, button-shaped labels are considered** | "Welcome back to your dashboard" contains the word "dashboard". Linking a page heading is worse than linking nothing, so anything over ~30 characters or four words is prose and is ignored. |
+| **Nothing links to the screen it is already on** | A nav item labelled "Home" on the Home screen is a state, not a link. |
+| **A hint never invents a screen** | "Sign in" means "the dashboard" only when there IS a dashboard. The synonym table's values are matched against real screen names; if none match, no link is made. |
+| **An unresolvable `on_click` is SKIPPED, never fatal** | A missing interaction is worth far less than the section it would take down — and the end-of-run pass reads the real canvas and gets another go at it anyway. |
+| **The model's link plan is verified id by id** | Same contract as `inventory.resolve`: an id it invented never reaches Figma, and a destination that is not a real screen is dropped with a reason. |
+| **The apply script is NOT atomic** | Same reasoning as `agent/editor.py`: one stale node id must not discard nineteen good interactions. Each link is wrapped on its own, and the script returns `applied` and `failed` separately. |
+| **`flowStartingPoints` is MERGED, not replaced** | Assigning that property overwrites the whole list. A re-run would otherwise throw away flows the user set up by hand. |
+| **A stranded screen becomes its own starting point** | A finished screen nothing links to cannot be reached in Presentation view at all — you would only find it by scrolling the canvas. It gets its own flow, and a design note saying so. |
+| **Wiring runs AFTER the screens are sized** | Whether a screen scrolls (`overflowDirection = 'VERTICAL'`) depends on how tall it ended up, and `fit_screens_to_viewport` decides that. |
+| **It is a preference (`prototype`), on by default** | It costs one model call at most, and a design nobody can click through is half a design. Turned off, it does not spend even the one round trip finding out what it could have wired. |
+
+Edit mode gets the same capability as an op — `{"op":"set_interaction",
+"target":"1:9","to":"Dashboard"}` — because "make this button open the settings
+screen" is a real edit request. A destination that is not a screen in the file
+is refused rather than written as a dead link.
+
+### What this deliberately does NOT do
+
+- **No hover or pressed states.** Those need component variants
+  (`combineAsVariants` + `CHANGE_TO`), and section 6a already refuses component
+  steps because a real run lost five of them. A static mockup gains nothing
+  from a hover state; a wired one gains a whole class of failure.
+- **No overlays, scroll-to anchors, or `SET_VARIABLE` actions.** The vocabulary
+  is four actions on purpose — one the model cannot overreach is worth more
+  than one that covers every prototype feature.
+- **No wiring during a stopped run.** Like the repair pass: spending anything
+  on a run somebody just asked to stop is precisely what they asked not to
+  happen.

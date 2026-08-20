@@ -35,6 +35,13 @@ class Screen:
     # desktop | tablet | mobile. Decides the frame width, so "a mobile
     # sign-in screen and a desktop dashboard" stops making both 1440 wide.
     device: str = "desktop"
+    # One screenful, when the INSTRUCTION said what that is ("1440 x 900px").
+    # Kept apart from `height`, which is only where the frame started: the
+    # end-of-run fit pass rounds a frame up to a whole number of viewports, and
+    # it used the DEVICE viewport (1024) even when the user had asked for 900 --
+    # so a design specified as 1440x900 shipped as 1440x2048, with a screenful
+    # of blank canvas under it and every full-height column stretched into it.
+    viewport_height: int | None = None
     # Where the frame actually sits. Filled in by the harness when it places a
     # new screen, and read off the canvas when it adopts an existing one, so
     # the next screen is positioned against real coordinates.
@@ -111,6 +118,10 @@ class RunResult:
     # reasons (agent/metrics.py). Filled in by `loop.run`, so it is present on
     # every result rather than only when someone remembered to ask for it.
     metrics: dict = field(default_factory=dict)
+    # Prototype wiring: which element on which screen navigates where, as
+    # readable lines. A static mockup has none; a design you can click through
+    # has one per link (agent/interactions.py).
+    interactions: list[str] = field(default_factory=list)
     # Per-step outcomes. The benchmark scores build quality from these (how
     # many steps failed, how many fell back to a placeholder, whether any
     # section was built twice) -- none of which is visible from node ids alone.
@@ -145,7 +156,30 @@ class RunState:
     bound_node_count: int = 0  # nodes auto-rebound from a hardcoded colour to a token
     token_names: list[str] = field(default_factory=list)  # paint styles the harness created
     text_style_names: list[str] = field(default_factory=list)
+    # The user's attached pictures, uploaded into this Figma file once and then
+    # painted onto as many nodes as the design wants (agent/assets.py). Empty
+    # on a run with no attachments, which is what makes `kind: "image"` fall
+    # back to a placeholder box instead of failing.
+    assets: list = field(default_factory=list)
+    # The raw attachments, held only until their images are uploaded into the
+    # file. Everything after that reads `assets`, which is small.
+    attachments: list = field(default_factory=list)
+    # Wire the finished design up as a clickable prototype. A user preference,
+    # on by default, because a design nobody can click through is half a design.
+    prototype_enabled: bool = True
+    # Prototype links that were actually wired, as readable lines
+    # ("Login · 'Sign in' -> Dashboard"). See agent/interactions.py.
+    interactions: list[str] = field(default_factory=list)
     font_styles: list[str] = field(default_factory=list)  # real Inter styles, read at runtime
+    # The brand font the instruction asked for, IF this file really has it --
+    # "Playfair Display" for an editorial bookstore, "" for a design that never
+    # named one. Verified against Figma, never taken from the wording alone.
+    display_family: str = ""
+    # Ramp style name -> the (family, style) it really uses. Every string in
+    # here came back from `listAvailableFontsAsync`, so nothing downstream has
+    # to guess "SemiBold" vs "Semi Bold" (the two real spellings this project
+    # has already lost a run to).
+    text_fonts: dict = field(default_factory=dict)
     # None = not yet known. Set once, the first time we try a screenshot critique.
     model_sees_images: bool | None = None
     # A separate vision model for critique, or None to skip it entirely.
@@ -228,6 +262,39 @@ class RunState:
 
     def screen_names(self) -> list[str]:
         return [s.name for s in self.screens]
+
+    def screen_map(self) -> dict[str, str]:
+        """Screen name -> frame id, for wiring `"on_click": "Dashboard"`.
+
+        Every screen frame exists before the first step runs (the harness
+        creates them all up front), so a section can be wired to a screen that
+        has not been designed yet -- which is exactly what a prototype link
+        from the first screen to the last one needs.
+        """
+        return {s.name: s.frame_id for s in self.screens if s.frame_id}
+
+    def sections_elsewhere(self, screen_index: int) -> list[str]:
+        """Sections already built on the OTHER screens, most recent last.
+
+        Every screen is planned and built in isolation, so the header on the
+        shop page had no idea what the header on the home page looked like and
+        the two came out different -- which is what makes a multi-screen file
+        read as several designs rather than one. Now that screens are built
+        round-robin, the first screen's chrome exists by the time the second
+        screen's first step runs, so this is real information rather than an
+        empty list.
+
+        `TODO` placeholders are left out: a gap marker is not a design
+        decision, and telling a screen to match one would spread it.
+        """
+        seen: list[str] = []
+        for index, screen in enumerate(self.screens):
+            if index == screen_index:
+                continue
+            for name in screen.sections:
+                if not name.startswith("TODO") and name not in seen:
+                    seen.append(name)
+        return seen
 
     def record_section(self, name: str, screen_index: int = 0) -> None:
         """Note a section as built, so later steps are told not to recreate it.
@@ -328,4 +395,5 @@ class RunState:
             requirements_met=list(self.requirements_met),
             requirements_missing=list(self.requirements_missing),
             step_results=list(self.step_results),
+            interactions=list(self.interactions),
         )

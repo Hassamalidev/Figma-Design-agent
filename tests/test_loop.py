@@ -31,17 +31,37 @@ class FakeModelClient:
     test that IS about several screens passes `screens=[...]`.
     """
 
-    def __init__(self, responses: list, screens: list[str] | None = None):
+    def __init__(self, responses: list, screens: list[str] | None = None, sees_images: bool = False):
         self._responses = list(responses)
         self._screens = screens or ["Screen"]
+        # With no critic configured the run probes THIS model to see whether it
+        # can look at its own work. Answered automatically, like the screens
+        # question: almost every test here is about the build, and making each
+        # of them script a probe reply would mean editing forty tests for a
+        # line none of them care about. Default is "cannot see", so the visual
+        # gate stays off unless a test is about it.
+        self._sees_images = sees_images
         self.calls: list[dict] = []
 
     def complete(self, messages, tools=None):
         self.calls.append({"messages": messages, "tools": tools})
+        if self._is_vision_probe(messages):
+            return message(content="blue" if self._sees_images else "I cannot view images.")
         if self._is_screens_question(messages):
             return message(content=json.dumps(self._screens))
         assert self._responses, "FakeModelClient ran out of scripted responses"
         return self._responses.pop(0)
+
+    @staticmethod
+    def _is_vision_probe(messages) -> bool:
+        """An image sent with no tools is the vision probe, not a build step."""
+        for entry in messages or []:
+            content = entry.get("content")
+            if isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") == "image_url" for part in content
+            ):
+                return True
+        return False
 
     @staticmethod
     def _is_screens_question(messages) -> bool:
@@ -174,6 +194,26 @@ class FakeBridge:
     def _is_audit(code: str) -> bool:
         return "unboundFillNodeIds" in code
 
+    # What the viewport fit reports back: one screenful each, unless a test
+    # scripts otherwise.
+    _fitted_height = 1024
+
+    @staticmethod
+    def _is_fit_screens(code: str) -> bool:
+        return "MAX_VIEWPORTS" in code and "viewport" in code
+
+    # How many children each screen frame is reported to have. Non-zero by
+    # default, so the empty-screen check stays quiet unless a test is about it.
+    _screen_child_count = 3
+    # ...and how much is really INSIDE it. Rich by default for the same reason:
+    # the half-built-screen check must stay quiet unless a test is about it.
+    _screen_texts = 12
+    _screen_controls = 4
+
+    @staticmethod
+    def _is_screen_content(code: str) -> bool:
+        return "const screens = [];" in code and "children" in code
+
     @staticmethod
     def _is_screen_script(code: str) -> bool:
         return "failedScreens" in code
@@ -205,6 +245,10 @@ class FakeBridge:
     def _is_placeholder(code: str) -> bool:
         return "TODO" in code
 
+    # Which families the file is reported to have. Inter only by default, so
+    # a test that is not about fonts sees exactly the old behaviour.
+    _font_families: dict | None = None
+
     @staticmethod
     def _is_font_script(code: str) -> bool:
         return "listAvailableFontsAsync" in code
@@ -224,6 +268,32 @@ class FakeBridge:
     @staticmethod
     def _is_hug_fix(code: str) -> bool:
         return "primaryAxisSizingMode = 'AUTO'" in code and "createFrame" not in code
+
+    # -- attachments and the prototype ------------------------------------
+    #
+    # Both are harness-authored, both run on every ordinary build, and neither
+    # is what most of these tests are about -- so they are answered by default
+    # exactly like the token and font scripts.
+
+    @staticmethod
+    def _is_asset_upload(code: str) -> bool:
+        return "figma.createImage(" in code
+
+    @staticmethod
+    def _is_prototype_read(code: str) -> bool:
+        return "const candidates = [];" in code
+
+    @staticmethod
+    def _is_prototype_apply(code: str) -> bool:
+        return "setReactionsAsync(link.reactions)" in code
+
+    @staticmethod
+    def _is_prototype_flows(code: str) -> bool:
+        return "flowStartingPoints" in code
+
+    # What the canvas reports back when asked what is clickable. Empty by
+    # default, so a test that is not about the prototype wires nothing.
+    _clickable: list | None = None
 
     def _harness_response(self, request) -> Response | None:
         code = request.code or ""
@@ -258,9 +328,16 @@ class FakeBridge:
                 result={"createdNodeIds": [], "removedNodeIds": asked},
             )
         if FakeBridge._is_font_script(code):
+            families = self._font_families or {
+                "Inter": ["Regular", "Semi Bold", "Bold"]
+            }
             return Response(
                 id=request.id, ok=True,
-                result={"createdNodeIds": [], "interStyles": ["Regular", "Semi Bold", "Bold"]},
+                result={
+                    "createdNodeIds": [],
+                    "interStyles": families.get("Inter") or [],
+                    "families": families,
+                },
             )
         if FakeBridge._is_layout_script(code):
             # A clean tree by default, so the visual gate passes unless a test
@@ -275,6 +352,68 @@ class FakeBridge:
             )
         if FakeBridge._is_audit(code):
             return Response(id=request.id, ok=True, result={"createdNodeIds": [], "unboundFillNodeIds": []})
+        if FakeBridge._is_screen_content(code):
+            ids = json.loads(re.search(r"const ids = (\[.*?\]);", code, re.DOTALL).group(1))
+            return Response(
+                id=request.id, ok=True,
+                result={
+                    "createdNodeIds": [],
+                    "screens": [
+                        {
+                            "id": i, "name": i,
+                            "children": self._screen_child_count,
+                            "nodes": self._screen_texts + self._screen_controls,
+                            "texts": self._screen_texts,
+                            "controls": self._screen_controls,
+                        }
+                        for i in ids
+                    ],
+                },
+            )
+        if FakeBridge._is_asset_upload(code):
+            return Response(
+                id=request.id, ok=True,
+                result={"createdNodeIds": [], "imageHash": "img-hash", "width": 1600, "height": 900},
+            )
+        if FakeBridge._is_prototype_read(code):
+            return Response(
+                id=request.id, ok=True,
+                result={"createdNodeIds": [], "candidates": list(self._clickable or [])},
+            )
+        if FakeBridge._is_prototype_apply(code):
+            links = json.loads(re.search(r"const links = (\[.*?\]);", code, re.DOTALL).group(1))
+            return Response(
+                id=request.id, ok=True,
+                result={
+                    "createdNodeIds": [],
+                    "applied": [link["label"] for link in links],
+                    "failed": [],
+                },
+            )
+        if FakeBridge._is_prototype_flows(code):
+            specs = json.loads(re.search(r"const specs = (\[.*?\]);", code, re.DOTALL).group(1))
+            return Response(
+                id=request.id, ok=True,
+                result={
+                    "createdNodeIds": [],
+                    "flows": [s["name"] for s in specs if s.get("start")],
+                    "scrolled": [s["name"] for s in specs if s.get("scrolls")],
+                },
+            )
+        if FakeBridge._is_fit_screens(code):
+            specs = json.loads(re.search(r"const specs = (\[.*?\]);", code, re.DOTALL).group(1))
+            return Response(
+                id=request.id, ok=True,
+                result={
+                    "createdNodeIds": [],
+                    "screens": [
+                        {"id": spec["id"], "name": spec["id"], "screens": 1,
+                         "height": FakeBridge._fitted_height}
+                        for spec in specs
+                    ],
+                    "failed": [],
+                },
+            )
         return None
 
     def model_exec_requests(self) -> list:
@@ -1901,13 +2040,50 @@ def test_a_step_is_told_which_screen_it_is_building_and_what_the_others_are():
 
 
 def test_sections_are_remembered_per_screen_not_globally():
-    """A header on the dashboard does not mean the sign-in screen has one."""
+    """A header on the dashboard does not mean the sign-in screen has one.
+
+    The distinction is which LIST a section lands in. "This frame already
+    contains X, do not rebuild it" must stay strictly per screen -- telling the
+    dashboard it already has a header because the login screen does is how a
+    screen ends up missing one. Naming it as something the rest of the design
+    has, to be matched, is the opposite and is the point of `sections_elsewhere`.
+    """
+    _, _, llm = _multi_screen_run(["Login", "Dashboard"])
+
+    dashboard_prompt = step_prompts(llm)[1]
+    finished_block = dashboard_prompt.split("This frame already contains")[-1].split("\n\n")[0]
+
+    assert "Login Body" not in finished_block
+
+
+def test_a_screen_is_told_what_the_rest_of_the_design_looks_like():
+    """Every screen was designed from scratch, so a file of five screens read
+    as five designs: five different headers, five ideas about spacing."""
     _, _, llm = _multi_screen_run(["Login", "Dashboard"])
 
     dashboard_prompt = step_prompts(llm)[1]
 
-    # The login screen's finished section must not be listed as the dashboard's.
-    assert "Login Body" not in dashboard_prompt
+    assert "ALREADY BUILT ON THE OTHER SCREENS" in dashboard_prompt
+    assert "Login Body" in dashboard_prompt
+    assert "build it to MATCH" in dashboard_prompt
+
+
+def test_the_first_screen_is_told_nothing_it_cannot_know():
+    """Nothing else exists yet when the first screen's first step runs."""
+    _, _, llm = _multi_screen_run(["Login", "Dashboard"])
+
+    assert "ALREADY BUILT ON THE OTHER SCREENS" not in step_prompts(llm)[0]
+
+
+def test_a_placeholder_is_never_offered_as_a_pattern_to_match():
+    """A gap marker is not a design decision, and matching one spreads it."""
+    state = loop.RunState(instruction="x")
+    state.screens = [loop.Screen(name="Login", frame_id="1:2"),
+                     loop.Screen(name="Shop", frame_id="1:3")]
+    state.record_section("Header", 0)
+    state.record_section("TODO — Hero", 0)
+
+    assert state.sections_elsewhere(1) == ["Header"]
 
 
 def test_each_screen_is_planned_on_its_own():
@@ -2715,7 +2891,8 @@ def test_a_step_stops_once_its_refusals_stop_teaching_it_anything():
     # eight turns it is allowed.
     metadata_reads = [r for r in bridge.sent if r.type == "metadata"]
     assert len(metadata_reads) == 1
-    planning_calls = 3  # brief, screens, plan
+    # probe (can this model see its own work?), brief, screens, plan.
+    planning_calls = 4
     assert len(llm.calls) == planning_calls + 1 + loop.MAX_REFUSALS_PER_STEP
     # ...which is strictly fewer than letting it run out the turn budget.
     assert len(llm.calls) < planning_calls + loop.MAX_TOOL_TURNS_PER_STEP
@@ -2810,7 +2987,7 @@ def _run_with_reference(references: str):
 def test_an_attached_screenshot_reaches_the_brief_and_the_screen_plan():
     llm, _, _ = _run_with_reference(REFERENCE_TEXT)
 
-    brief_prompt = llm.calls[0]["messages"][-1]["content"]
+    brief_prompt = _calls_with(llm, "creative brief")[0]
     assert "1440x900 sign-in" in brief_prompt
     screens_prompt = llm.calls[1]["messages"][-1]["content"]
     assert "REFERENCE 1" in screens_prompt
@@ -2894,3 +3071,633 @@ def test_a_new_screen_joins_the_row_the_reused_one_is_already_on():
     assert dashboard["name"] == "Dashboard"
     assert dashboard["y"] == 1200
     assert not _rects_overlap(_spec_rects([dashboard])[0], (400, 1200, 1840, 2100))
+
+
+def test_the_screens_are_fitted_once_after_everything_else():
+    """A repair changes how tall a screen is, so the fit has to come last --
+    and before the screens are photographed."""
+    _, bridge, _ = _multi_screen_run(["Login", "Dashboard"])
+
+    fits = [i for i, r in enumerate(bridge.sent)
+            if r.type == "exec" and FakeBridge._is_fit_screens(r.code or "")]
+    built = max(i for i, r in enumerate(bridge.sent)
+                if r.type == "exec" and bridge._harness_response(r) is None)
+    captures = [i for i, r in enumerate(bridge.sent) if r.type == "screenshot" and r.node_id]
+
+    assert len(fits) == 1, "the screens are fitted exactly once"
+    assert fits[0] > built, "fitting runs after everything that builds or repairs"
+    assert captures and fits[0] < min(captures), "and before they are photographed"
+
+
+def test_every_built_screen_is_fitted():
+    _, bridge, _ = _multi_screen_run(["Login", "Dashboard"])
+
+    code = [r.code for r in bridge.sent
+            if r.type == "exec" and FakeBridge._is_fit_screens(r.code or "")][0]
+    specs = json.loads(re.search(r"const specs = (\[.*?\]);", code, re.DOTALL).group(1))
+
+    assert [s["id"] for s in specs] == [ROOT_ID, "screen:2"]
+    assert all(s["viewport"] > 0 for s in specs)
+
+
+def test_fitting_never_takes_a_finished_design_down():
+    """The last cosmetic step of a run. Losing a finished design over it would
+    be absurd."""
+    from bridge.protocol import Response as _Response
+
+    state = loop.RunState(instruction="x")
+    state.screens = [loop.Screen(name="Login", frame_id="1:2")]
+
+    class _Failing:
+        def send(self, request, timeout=None):
+            return _Response(id=request.id, ok=False, error="boom")
+
+    loop.fit_screens_to_viewport(state, _Failing())  # must not raise
+
+
+# ---- a screen nothing reached ---------------------------------------------
+#
+# A real run finished with a fully built Home beside a completely empty Shop,
+# reported SUCCESS, and the only visible symptom was that the two frames were
+# wildly different heights -- which reads as a sizing bug and is not one. No
+# height rule can fix an empty page: a frame is sized to its content, and
+# sizing an empty frame to match a full one is the blank canvas that levelling
+# to the tallest was removed for.
+
+
+def test_an_empty_screen_is_reported_and_fails_the_run():
+    """Every other way of failing leaves a mark -- a failed step drops a TODO
+    band. A screen whose steps never ran at all left nothing behind, so nothing
+    could tell it apart from a screen somebody wanted blank."""
+    llm = FakeModelClient(
+        [message(content="brief"), message(content='["Add the hero"]'), message(content="done")]
+    )
+    bridge = FakeBridge({"screenshot": [Response(id="s1", ok=True, image_base64="")]})
+    bridge._screen_child_count = 0  # the canvas says the frame is empty
+
+    result = loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
+
+    assert result.success is False
+    assert any("is empty" in w for w in result.warnings)
+
+
+def test_a_screen_with_content_is_left_alone():
+    llm = FakeModelClient(
+        [message(content="brief"), message(content='["Add the hero"]'), message(content="done")]
+    )
+    bridge = FakeBridge({"screenshot": [Response(id="s1", ok=True, image_base64="")]})
+
+    result = loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
+
+    assert not any("is empty" in w for w in result.warnings)
+
+
+def test_an_empty_screen_is_marked_before_the_repair_pass():
+    """A TODO placeholder is one of the repair pass's targets, so the screen
+    gets a real attempt at being built rather than only being complained
+    about."""
+    llm = FakeModelClient(
+        [message(content="brief"), message(content='["Add the hero"]'), message(content="done")]
+    )
+    bridge = FakeBridge({"screenshot": [Response(id="s1", ok=True, image_base64="")]})
+    bridge._screen_child_count = 0
+
+    loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
+
+    placeholders = [i for i, r in enumerate(bridge.sent)
+                    if r.type == "exec" and FakeBridge._is_placeholder(r.code or "")]
+    fits = [i for i, r in enumerate(bridge.sent)
+            if r.type == "exec" and FakeBridge._is_fit_screens(r.code or "")]
+
+    assert placeholders, "an empty screen is marked on the canvas"
+    assert placeholders[0] < fits[0], "and marked before the frames are sized"
+
+
+def test_a_failed_content_read_never_declares_a_screen_empty():
+    """A check that cannot see the canvas must not start failing finished runs
+    over screens it could not measure."""
+    state = loop.RunState(instruction="x")
+    state.screens = [loop.Screen(name="Login", frame_id="1:2")]
+
+    class _Failing:
+        def send(self, request, timeout=None):
+            return Response(id=request.id, ok=False, error="boom")
+
+    loop.mark_unbuilt_screens(state, _Failing())
+
+    assert state.warnings == []
+    assert state.failed_steps == []
+
+
+# ---- a run that stops must not lose whole screens -------------------------
+#
+# A real four-screen run finished Home completely and left Shop, Category and
+# Book Details as three empty frames. The plan was screen-major -- all of Home,
+# then all of Shop -- so a run that does not reach the end does not lose a
+# little of each screen, it loses whole screens.
+
+
+def _plan_of(screens, max_steps=40, steps_each=3):
+    """The plan `plan_all_screens` builds for these screens."""
+    state = loop.RunState(instruction="x")
+    state.screens = [loop.Screen(name=n, frame_id=f"f:{i}") for i, n in enumerate(screens)]
+    replies = [message(content=json.dumps(
+        [f"Add the {n} part {i + 1} into the frame." for i in range(steps_each)]))
+        for n in screens]
+    return loop.plan_all_screens(state, FakeModelClient(replies), max_steps)
+
+
+def test_screens_are_built_round_robin():
+    """Every screen's first section before any screen's second."""
+    plan = _plan_of(["Home", "Shop", "Category"])
+
+    assert [step.screen_index for step in plan] == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+
+
+def test_a_run_cut_short_leaves_every_screen_with_something():
+    """The property that matters. Whatever the budget, the first N steps touch
+    as many different screens as possible."""
+    plan = _plan_of(["Home", "Shop", "Category", "Book Details"])
+
+    reached = {step.screen_index for step in plan[:4]}
+
+    assert reached == {0, 1, 2, 3}, "four steps in, every screen has been started"
+
+
+def test_a_screens_own_steps_keep_their_order():
+    """Step order is visual order -- a header must still land above the footer
+    beneath it, interleaving or not."""
+    plan = _plan_of(["Home", "Shop"])
+
+    home = [s.description for s in plan if s.screen_index == 0]
+
+    assert home == ["Add the Home part 1 into the frame.",
+                    "Add the Home part 2 into the frame.",
+                    "Add the Home part 3 into the frame."]
+
+
+def test_a_single_screen_plan_is_unchanged():
+    plan = _plan_of(["Home"])
+
+    assert [s.screen_index for s in plan] == [0, 0, 0]
+
+
+# ---- one model that builds AND looks at what it built ----------------------
+#
+# Two models is the right split when they are different animals, but it left
+# the most valuable check in the project switched off by default: a blank
+# CRITIC_MODEL_NAME hard-disabled screenshot review, so nothing ever looked.
+
+
+def test_the_builder_reviews_its_own_work_when_it_can_see():
+    llm = FakeModelClient(
+        [message(content="brief"), message(content='["Add the hero"]'), message(content="done")],
+        sees_images=True,
+    )
+    bridge = FakeBridge({"screenshot": [Response(id="s1", ok=True, image_base64="PNG")]})
+    state = loop.RunState(instruction="x")
+
+    loop._enable_self_review(state, llm)
+
+    assert state.critic_llm is llm
+    assert state.model_sees_images is True
+
+
+def test_a_text_only_model_never_becomes_its_own_critic():
+    """The probe exists because a model NAME says nothing about whether it can
+    see -- and sending images to one that cannot costs a 400 per step."""
+    state = loop.RunState(instruction="x")
+
+    loop._enable_self_review(state, FakeModelClient([], sees_images=False))
+
+    assert state.critic_llm is None
+    assert state.model_sees_images is False
+
+
+def test_a_model_that_answers_without_looking_is_refused():
+    """The dangerous case is not the endpoint that refuses the image -- it is
+    the one that ACCEPTS it and answers from the text alone, where critique
+    still comes back and every defect in it is invented."""
+    class Guesser:
+        def complete(self, messages, tools=None):
+            return message(content="It looks like a red square.")
+
+    state = loop.RunState(instruction="x")
+
+    loop._enable_self_review(state, Guesser())
+
+    assert state.critic_llm is None
+    assert state.model_sees_images is False
+
+
+def test_turning_the_visual_gate_off_skips_the_probe_entirely():
+    """No point paying for a probe whose answer cannot be used."""
+    llm = FakeModelClient([], sees_images=True)
+    state = loop.RunState(instruction="x")
+    state.visual_gate_enabled = False
+
+    loop._enable_self_review(state, llm)
+
+    assert state.model_sees_images is False
+    assert llm.calls == []
+
+
+def test_the_probe_runs_once_per_run_not_once_per_step():
+    llm = FakeModelClient(
+        [message(content="brief"),
+         message(content='["Add the hero", "Add the footer"]'),
+         message(content="done"), message(content="done")],
+        sees_images=True,
+    )
+    bridge = FakeBridge({"screenshot": [Response(id="s1", ok=True, image_base64="PNG")]})
+
+    loop.run("a landing page", bridge, llm, max_retries=1, max_steps=10)
+
+    probes = [c for c in llm.calls if FakeModelClient._is_vision_probe(c["messages"])]
+
+    assert len(probes) == 1
+
+
+# ---- the attached picture actually reaches the canvas -----------------------
+#
+# `references` proved the attachment reaches the BRIEF. These are about the
+# other half: the picture itself, as an image on the design. A run that read
+# the screenshot, described it, and then drew a grey box where it should be is
+# the failure this closes.
+
+from agent.reference import Attachment  # noqa: E402
+
+
+def _run_with_attachment(attachment, prototype=False, clickable=None, llm=None):
+    llm = llm or FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the hero into the root frame."]'),
+            message(tool_calls=[render_call("c1", "Hero")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:50", "name": "Hero", "type": "FRAME"})],
+        }
+    )
+    bridge._clickable = clickable
+    result = loop.run(
+        "rebuild this", bridge, llm, max_retries=1, max_steps=10,
+        final_repair=False, prototype=prototype,
+        attachments=[attachment] if attachment else [],
+    )
+    return llm, bridge, result
+
+
+def test_an_attached_png_is_uploaded_into_the_file_once():
+    _, bridge, result = _run_with_attachment(Attachment(name="hero.png", data=b"\x89PNGdata"))
+
+    uploads = [r for r in bridge.sent if "figma.createImage(" in (r.code or "")]
+    assert len(uploads) == 1
+    assert result.success
+
+
+def test_the_uploaded_picture_is_offered_to_the_step_that_builds():
+    """A picture nothing knows about is a picture nothing places."""
+    llm, _, _ = _run_with_attachment(Attachment(name="hero.png", data=b"\x89PNGdata"))
+
+    assert any("hero.png" in prompt for prompt in step_prompts(llm))
+
+
+def test_a_webp_is_read_but_not_uploaded_and_the_run_says_so():
+    """figma.createImage takes PNG/JPEG/GIF only. Silently skipping it would
+    leave the user watching a design get built without their picture."""
+    _, bridge, result = _run_with_attachment(Attachment(name="shot.webp", data=b"RIFFdata"))
+
+    assert not [r for r in bridge.sent if "figma.createImage(" in (r.code or "")]
+    assert any("shot.webp" in w for w in result.warnings)
+
+
+def test_a_run_with_no_attachment_uploads_nothing():
+    _, bridge, result = _run_with_attachment(None)
+
+    assert not [r for r in bridge.sent if "figma.createImage(" in (r.code or "")]
+    assert result.success
+
+
+# ---- the design is clickable ------------------------------------------------
+
+
+CLICKABLE_BUTTON = [{
+    "id": "1:60", "name": "Button / Dashboard", "type": "FRAME",
+    "label": "Dashboard", "screenId": ROOT_ID, "path": [ROOT_ID],
+    "wired": False, "width": 200, "height": 48,
+}]
+
+
+def _two_screen_run(prototype=True, clickable=None, extra_responses=None):
+    llm = FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the sign-in card."]'),          # Login plan
+            message(content='["Add the overview."]'),              # Dashboard plan
+            message(tool_calls=[render_call("c1", "Sign in")]),
+            message(content="done"),
+            message(tool_calls=[render_call("c2", "Overview")]),
+            message(content="done"),
+        ]
+        + list(extra_responses or []),
+        screens=["Login", "Dashboard"],
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [
+                Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]}),
+                Response(id="e2", ok=True, result={"createdNodeIds": ["1:60"]}),
+            ],
+            "metadata": [
+                Response(id="m1", ok=True, result={"id": "1:50", "name": "Sign in", "type": "FRAME"}),
+                Response(id="m2", ok=True, result={"id": "1:60", "name": "Overview", "type": "FRAME"}),
+            ],
+        }
+    )
+    bridge._clickable = clickable
+    result = loop.run(
+        "a login and a dashboard", bridge, llm, max_retries=1, max_steps=10,
+        final_repair=False, prototype=prototype,
+    )
+    return llm, bridge, result
+
+
+def test_a_button_naming_another_screen_is_wired_up_at_the_end():
+    _, bridge, result = _two_screen_run(clickable=CLICKABLE_BUTTON)
+
+    applied = [r for r in bridge.sent if "setReactionsAsync(link.reactions)" in (r.code or "")]
+    assert applied
+    assert any("Dashboard" in line for line in result.interactions)
+
+
+def test_the_prototype_pass_can_be_turned_off():
+    """It is a preference, and a run that was told not to wire anything must
+    not spend a single round trip finding out what it could have wired."""
+    _, bridge, result = _two_screen_run(prototype=False, clickable=CLICKABLE_BUTTON)
+
+    assert not [r for r in bridge.sent if "const candidates = [];" in (r.code or "")]
+    assert result.interactions == []
+
+
+def test_every_screen_gets_a_way_to_be_reached():
+    """A finished screen nothing links to can only be found by scrolling the
+    canvas. Its own flow starting point is what makes it playable."""
+    _, bridge, _ = _two_screen_run(clickable=None)
+
+    flows = next(r for r in bridge.sent if "flowStartingPoints" in (r.code or ""))
+    specs = json.loads(re.search(r"const specs = (\[.*?\]);", flows.code, re.DOTALL).group(1))
+    assert [s["name"] for s in specs if s["start"]] == ["Login", "Dashboard"]
+
+
+def test_a_wired_screen_is_not_given_a_redundant_starting_point():
+    _, bridge, _ = _two_screen_run(clickable=CLICKABLE_BUTTON)
+
+    flows = next(r for r in bridge.sent if "flowStartingPoints" in (r.code or ""))
+    specs = json.loads(re.search(r"const specs = (\[.*?\]);", flows.code, re.DOTALL).group(1))
+    assert [s["name"] for s in specs if s["start"]] == ["Login"]
+
+
+def test_the_model_is_only_asked_about_links_that_matching_could_not_make():
+    """One model call per run, and only when a screen is genuinely unreachable
+    -- name matching is free and already handled the ordinary cases."""
+    llm, _, _ = _two_screen_run(clickable=CLICKABLE_BUTTON)
+
+    assert _calls_with(llm, "wiring a finished Figma design") == []
+
+
+def test_the_model_is_asked_when_a_screen_has_no_way_in():
+    spare = [{
+        "id": "1:70", "name": "Button / Explore", "type": "FRAME",
+        "label": "Explore the collection", "screenId": ROOT_ID, "path": [ROOT_ID],
+        "wired": False, "width": 200, "height": 48,
+    }]
+    llm, bridge, result = _two_screen_run(
+        clickable=spare,
+        extra_responses=[message(content='[{"id": "1:70", "to": "Dashboard"}]')],
+    )
+
+    assert _calls_with(llm, "wiring a finished Figma design")
+    assert any("Dashboard" in line for line in result.interactions)
+
+
+def test_the_screens_are_wired_after_they_are_sized():
+    """Whether a screen SCROLLS depends on how tall it ended up, so the fit
+    pass has to have run first."""
+    _, bridge, _ = _two_screen_run(clickable=CLICKABLE_BUTTON)
+
+    codes = [r.code or "" for r in bridge.sent if r.type == "exec"]
+    fit = next(i for i, c in enumerate(codes) if "MAX_VIEWPORTS" in c)
+    wire = next(i for i, c in enumerate(codes) if "flowStartingPoints" in c)
+    assert fit < wire
+
+
+def test_a_link_the_model_wired_while_building_is_still_reported():
+    """The end-of-run pass deliberately skips a node that already has a
+    reaction, so without this the link works in Figma and appears in no report
+    of the run -- which reads as the feature not having worked."""
+    llm = FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the sign-in card."]'),
+            message(tool_calls=[render_call("c1", "Sign in")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={
+                "createdNodeIds": ["1:50"], "wired": ["'Sign in' -> Dashboard"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:50", "name": "Sign in", "type": "FRAME"})],
+        }
+    )
+
+    result = loop.run(
+        "a login screen", bridge, llm, max_retries=1, max_steps=10, final_repair=False,
+    )
+
+    assert "'Sign in' -> Dashboard" in result.interactions
+
+
+def test_a_screen_size_the_user_asked_for_survives_to_the_end():
+    """"Frame size for both: 1440 x 900px" is a decision, and the fit pass used
+    to overrule it with the DESKTOP viewport (1024) -- so a design specified as
+    1440x900 shipped 1440x2048, with a screenful of blank canvas under it."""
+    llm = FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the sign-in card."]'),
+            message(tool_calls=[render_call("c1", "Sign in")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:50", "name": "Sign in", "type": "FRAME"})],
+        }
+    )
+
+    loop.run(
+        "a login screen, frame size 1440 x 900px", bridge, llm,
+        max_retries=1, max_steps=10, final_repair=False, prototype=False,
+    )
+
+    fit = next(r for r in bridge.sent if "MAX_VIEWPORTS" in (r.code or ""))
+    specs = json.loads(re.search(r"const specs = (\[.*?\]);", fit.code, re.DOTALL).group(1))
+    assert [s["viewport"] for s in specs] == [900]
+
+
+def _half_built_run(llm_responses, texts=1, controls=0):
+    """A two-screen run where the canvas reports the SECOND screen as thin."""
+    llm = FakeModelClient(llm_responses, screens=["Login", "Sign Up"])
+    bridge = FakeBridge(
+        {
+            "exec": [
+                Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]}),
+                Response(id="e2", ok=True, result={"createdNodeIds": ["1:60"]}),
+                Response(id="e3", ok=True, result={"createdNodeIds": ["1:70"]}),
+            ],
+            "metadata": [
+                Response(id="m1", ok=True, result={"id": "1:50", "name": "Sign in", "type": "FRAME"}),
+                Response(id="m2", ok=True, result={"id": "1:60", "name": "Artwork", "type": "FRAME"}),
+                Response(id="m3", ok=True, result={"id": "1:70", "name": "Sign up form", "type": "FRAME"}),
+            ],
+        }
+    )
+    bridge._screen_texts = texts
+    bridge._screen_controls = controls
+    result = loop.run(
+        "a login and a sign up screen", bridge, llm,
+        max_retries=1, max_steps=10, final_repair=True, prototype=False,
+    )
+    return llm, bridge, result
+
+
+BUILD_TWO_SCREENS = [
+    message(content="brief"),
+    message(content='["Add the sign-in card."]'),
+    message(content='["Add the artwork panel."]'),
+    message(tool_calls=[render_call("c1", "Sign in")]),
+    message(content="done"),
+    message(tool_calls=[render_call("c2", "Artwork")]),
+    message(content="done"),
+]
+
+
+def test_a_screen_that_is_only_artwork_gets_its_missing_content_built():
+    """The exact failure a real run shipped: a Sign Up screen built as a
+    full-width picture and a quote, with the form never arriving. It has a
+    child, so the empty-screen check could not see it."""
+    llm, _, _ = _half_built_run(
+        BUILD_TWO_SCREENS + [
+            message(tool_calls=[render_call("c3", "Sign up form")]),
+            message(content="done"),
+        ]
+    )
+
+    finishing = [p for p in step_prompts(llm) if "currently has" in p]
+    assert finishing, "the half-built screen was never noticed"
+    assert "Build the main content" in finishing[0]
+
+
+def test_finishing_a_screen_appends_rather_than_replacing_what_is_there():
+    """What IS built is fine as far as it goes. A repair-style replace would
+    throw away the one part of the screen that did get made."""
+    llm, _, _ = _half_built_run(
+        BUILD_TWO_SCREENS + [
+            message(tool_calls=[render_call("c3", "Sign up form")]),
+            message(content="done"),
+        ]
+    )
+
+    finishing = [p for p in step_prompts(llm) if "currently has" in p][0]
+    assert "DO NOT START OVER" not in finishing   # not framed as a repair
+
+
+def test_a_screen_that_cannot_be_finished_is_reported_rather_than_shipped():
+    llm, _, result = _half_built_run(
+        BUILD_TWO_SCREENS + [message(content="I am not going to build that.")]
+    )
+
+    assert not result.success
+    assert any("part-built" in w for w in result.warnings)
+
+
+def test_a_run_whose_screens_are_all_full_never_asks_for_more():
+    llm, _, result = _half_built_run(BUILD_TWO_SCREENS, texts=14, controls=5)
+
+    assert not [p for p in step_prompts(llm) if "currently has" in p]
+    assert result.success
+
+
+def test_the_brand_font_the_brief_asked_for_is_used_for_headings():
+    """A brief that says "Primary Display Font: Playfair Display" and comes back
+    set in Inter is not the design that was asked for."""
+    llm = FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the sign-in card."]'),
+            message(tool_calls=[tool_call("c1", "render_ui", {"spec": {
+                "kind": "section", "name": "Sign in", "children": [
+                    {"kind": "text", "style": "Heading", "value": "Welcome back"},
+                    {"kind": "text", "style": "Body", "value": "Sign in to continue"}]}})]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:50", "name": "Sign in", "type": "FRAME"})],
+        }
+    )
+    bridge._font_families = {
+        "Playfair Display": ["Regular", "SemiBold", "Bold"],
+        "Inter": ["Regular", "Medium", "Semi Bold", "Bold"],
+    }
+
+    loop.run(
+        "a login screen. Primary Display Font: Playfair Display. UI Font: Inter.",
+        bridge, llm, max_retries=1, max_steps=10, final_repair=False, prototype=False,
+    )
+
+    styles = next(r for r in bridge.sent if "createTextStyle" in (r.code or ""))
+    assert "Playfair Display" in styles.code
+    # ...and the section itself is set in it, or applying the style would throw
+    # for a font nothing loaded.
+    section = next(r for r in bridge.model_exec_requests() if "createText()" in (r.code or ""))
+    assert 'family: "Playfair Display", style: "SemiBold"' in section.code
+    # ...and the body copy underneath it is still Inter.
+    assert 'family: "Inter", style: "Regular"' in section.code
+
+
+def test_a_font_this_file_does_not_have_is_never_written_into_a_style():
+    """Figma is asked which families exist; a name the file lacks would throw
+    the moment a text style used it."""
+    llm = FakeModelClient(
+        [
+            message(content="brief"),
+            message(content='["Add the sign-in card."]'),
+            message(tool_calls=[render_call("c1", "Sign in")]),
+            message(content="done"),
+        ]
+    )
+    bridge = FakeBridge(
+        {
+            "exec": [Response(id="e1", ok=True, result={"createdNodeIds": ["1:50"]})],
+            "metadata": [Response(id="m1", ok=True, result={"id": "1:50", "name": "Sign in", "type": "FRAME"})],
+        }
+    )
+    bridge._font_families = {"Inter": ["Regular", "Semi Bold", "Bold"]}
+
+    loop.run(
+        "a login screen. Display Font: Canela Deck.",
+        bridge, llm, max_retries=1, max_steps=10, final_repair=False, prototype=False,
+    )
+
+    styles = next(r for r in bridge.sent if "createTextStyle" in (r.code or ""))
+    assert "Canela" not in styles.code

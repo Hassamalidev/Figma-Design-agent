@@ -99,7 +99,8 @@ def main() -> int:
     references = ""
     if attachments:
         try:
-            reference.check_readable(attachments, settings.has_vision)
+            for note in reference.check_readable(attachments, settings.has_vision):
+                print(f"  ! {note}")
         except reference.ReferenceError as exc:
             print(f"Attachment problem: {exc}")
             bridge.stop()
@@ -115,12 +116,16 @@ def main() -> int:
         if editing:
             result = edit_loop.run(
                 instruction, bridge, llm, settings.max_retries, references=references,
+                attachments=attachments,
             )
         else:
             result = loop.run(
                 instruction, bridge, llm, settings.max_retries, settings.max_steps,
                 critic_llm=build_critic_client(settings),
                 references=references,
+                # The attachments travel BOTH ways: read as words above, and
+                # placed on the canvas as real images (agent/assets.py).
+                attachments=attachments,
             )
     finally:
         bridge.stop()

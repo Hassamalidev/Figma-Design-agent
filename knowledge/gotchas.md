@@ -467,6 +467,72 @@ const set = figma.combineAsVariants([a, b], figma.currentPage);
 For a static mockup you usually don't need variants at all -- hover/active
 states are not visible in a screenshot. Prefer one plain component.
 
+## Images are HANDLES, not nodes -- and the paint references the hash
+
+`figma.createImage(bytes)` stores an image in the FILE and returns a handle.
+It is not a node and cannot be appended to anything. To show it, put an IMAGE
+paint on a node's `fills`:
+
+```javascript
+// WRONG: there is no createImageNode, and an Image has no .id
+const img = figma.createImage(bytes);
+frame.appendChild(img);            // throws -- an Image is not a node
+
+// RIGHT
+const image = figma.createImage(figma.base64Decode(base64String));
+const size = await image.getSizeAsync();          // async: it may still be loading
+const frame = figma.createFrame();
+frame.resize(600, Math.round(600 / (size.width / size.height)));
+frame.fills = [{ type: 'IMAGE', scaleMode: 'FILL', imageHash: image.hash }];
+```
+
+- `data` must be **PNG, JPEG or GIF**. WEBP and SVG throw. (For SVG there is
+  `figma.createNodeFromSvg(svgString)`, which returns a real FRAME.)
+- Maximum **4096px** in width or height. Bigger throws "Image is too large".
+- `scaleMode` is `'FILL' | 'FIT' | 'CROP' | 'TILE'`. `FILL` crops to cover;
+  `FIT` shows the whole picture.
+- One upload can be referenced by any number of paints -- reuse `image.hash`
+  rather than uploading the same picture again per node.
+
+## Prototype interactions: `reactions` is READ-ONLY, use setReactionsAsync
+
+With `documentAccess: "dynamic-page"` (this plugin's manifest) assigning
+`node.reactions` throws. The setter is async:
+
+```javascript
+// WRONG
+button.reactions = [ ... ];        // read-only under dynamic-page access
+
+// RIGHT
+await button.setReactionsAsync([{
+  trigger: { type: 'ON_CLICK' },
+  actions: [{
+    type: 'NODE',
+    destinationId: dashboardFrame.id,     // a FRAME on the page
+    navigation: 'NAVIGATE',
+    transition: { type: 'DISSOLVE', easing: { type: 'EASE_OUT' }, duration: 0.3 }
+  }]
+}]);
+```
+
+- `trigger`: `ON_CLICK | ON_HOVER | ON_PRESS | ON_DRAG`, or `MOUSE_ENTER` /
+  `MOUSE_LEAVE` / `MOUSE_UP` / `MOUSE_DOWN` (those need a `delay`), or
+  `AFTER_TIMEOUT` (needs `timeout`).
+- `actions` (plural) is the current field; `action` (singular) is deprecated.
+- `{ type: 'BACK' }` and `{ type: 'CLOSE' }` take **no** transition. Adding one
+  fails validation.
+- `{ type: 'URL', url: '...' }` opens a link.
+- `navigation`: `NAVIGATE | SWAP | OVERLAY | SCROLL_TO | CHANGE_TO`.
+- A transition is either simple (`DISSOLVE | SMART_ANIMATE | SCROLL_ANIMATE`
+  with `easing` + `duration`) or directional (`MOVE_IN | MOVE_OUT | PUSH |
+  SLIDE_IN | SLIDE_OUT`, which additionally need `direction` and
+  `matchLayers`). Mixing the two shapes fails validation.
+- `page.flowStartingPoints = [{ nodeId, name }]` sets the prototype entry
+  points -- assigning it REPLACES the whole list, so merge rather than
+  overwrite.
+- `frame.overflowDirection = 'VERTICAL'` makes a tall frame scroll in the
+  prototype instead of being cut off at the fold.
+
 ## Canonical script shape
 
 ```javascript

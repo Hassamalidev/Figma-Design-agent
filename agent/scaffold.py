@@ -37,6 +37,108 @@ TEXT_STYLES: list[tuple[str, str, int, float]] = [
     ("Button", "Semi Bold", 15, 20),
 ]
 
+# The ramp entries that carry the BRAND voice. A display font belongs on the
+# wordmark and the headings; labels, inputs and buttons stay in the UI font,
+# because a serif at 13px inside an input is what makes a page hard to read.
+DISPLAY_STYLES = ("Display", "Heading", "Subheading")
+
+DEFAULT_FONT_FAMILY = "Inter"
+
+# "Primary Display Font: Playfair Display", "UI Font / Inter", "Font: Playfair
+# Display". The captured phrase is deliberately greedy and is then offered to
+# Figma longest-first (see `candidate_fonts`): guessing where a font name ends
+# is exactly the kind of thing to ask the real API about.
+_FONT_HINT = re.compile(
+    r"\bfont\b[^A-Za-z]{0,12}([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})",
+    re.IGNORECASE,   # the KEYWORD is case-insensitive; the NAME must be capitalised
+)
+MAX_FONT_CANDIDATES = 10
+
+
+def candidate_fonts(text: str) -> list[str]:
+    """Font families the instruction might be naming, in the order it names them.
+
+    Every one is a GUESS. `loop.discover_fonts` asks Figma which of them really
+    exist, which is the same rule this project already applies to font STYLE
+    strings -- "Inter SemiBold" killed a live run because the real style is
+    "Semi Bold". Nothing is ever used because it looked like a font name.
+    """
+    flat = re.sub(r"[*#`_>|]", " ", str(text or ""))
+    flat = re.sub(r"\s+", " ", flat)
+    found: list[str] = []
+    for match in _FONT_HINT.finditer(flat):
+        words = match.group(1).split()
+        # Longest first: "Playfair Display" beats "Playfair", and the trailing
+        # word a greedy match picks up ("Playfair Display Use") is dropped by
+        # Figma simply not having a family called that.
+        for length in range(len(words), 0, -1):
+            name = " ".join(words[:length])
+            if name not in found:
+                found.append(name)
+    return found[:MAX_FONT_CANDIDATES]
+
+
+def pick_display_family(candidates: list[str], available: dict) -> str:
+    """The brand font: the first CANDIDATE that Figma actually has.
+
+    Never Inter -- that is the fallback, not a choice -- and never a name the
+    file cannot render, which would throw the moment a text style used it.
+    """
+    real = {str(name).strip().lower(): str(name) for name in (available or {})}
+    for candidate in candidates or []:
+        key = candidate.strip().lower()
+        if key == DEFAULT_FONT_FAMILY.lower():
+            continue
+        if key in real:
+            return real[key]
+    return ""
+
+
+def match_style(wanted: str, available: list[str]) -> str:
+    """The real style string for a weight, out of what the family actually has.
+
+    Families spell the same weight differently -- Inter has "Semi Bold" with a
+    space, Playfair Display has "SemiBold" without one -- and guessing throws
+    "font not loaded". So the wanted weight is matched against the strings
+    Figma reported, then degraded to the nearest weight the family does have.
+    """
+    def key(value: str) -> str:
+        return re.sub(r"[^a-z]", "", str(value).lower())
+
+    have = {key(style): style for style in available or []}
+    if not have:
+        return wanted
+    ladder = {
+        "bold": ("bold", "semibold", "medium", "regular"),
+        "semibold": ("semibold", "demibold", "bold", "medium", "regular"),
+        "medium": ("medium", "semibold", "regular"),
+        "regular": ("regular", "book", "normal", "medium"),
+    }
+    for step in ladder.get(key(wanted), (key(wanted), "regular")):
+        if step in have:
+            return have[step]
+    return next(iter(have.values()))
+
+
+def ramp_fonts(display_family: str, families: dict) -> dict[str, tuple[str, str]]:
+    """Ramp style name -> the (family, style) that style should really use.
+
+    Resolved in Python from what Figma reported, so no generated script ever
+    contains a font string nobody has checked.
+    """
+    inter_styles = list((families or {}).get(DEFAULT_FONT_FAMILY) or [])
+    display_styles = list((families or {}).get(display_family) or []) if display_family else []
+    resolved: dict[str, tuple[str, str]] = {}
+    for name, style, _size, _line in TEXT_STYLES:
+        if display_family and display_styles and name in DISPLAY_STYLES:
+            resolved[name] = (display_family, match_style(style, display_styles))
+        elif inter_styles:
+            resolved[name] = (DEFAULT_FONT_FAMILY, match_style(style, inter_styles))
+        else:
+            resolved[name] = (DEFAULT_FONT_FAMILY, style)
+    return resolved
+
+
 _HEX = r"#[0-9a-fA-F]{6}"
 # "--color-primary: #0066FF", "Primary Blue (#0066FF)", "Accent — #0066FF"
 _NAMED = re.compile(rf"([A-Za-z][\w \-/]{{1,38}}?)\s*[:(\-–—]\s*[`'\"]?({_HEX})")
@@ -460,12 +562,22 @@ return { createdNodeIds: [], tokenNames: names, failedTokens: failed, unboundTok
 """
 
 
-def build_text_style_script() -> str:
-    """Create the default type scale, skipping any that already exist."""
-    entries = [
-        {"name": name, "style": style, "size": size, "line": line}
-        for name, style, size, line in TEXT_STYLES
-    ]
+def build_text_style_script(fonts: dict[str, tuple[str, str]] | None = None) -> str:
+    """Create the type scale, skipping any that already exist.
+
+    `fonts` maps a ramp style NAME to the (family, style) it should use,
+    resolved against the fonts Figma really has (`ramp_fonts`). So a design
+    that asks for Playfair Display headings gets them, and one that asks for
+    nothing gets Inter exactly as before.
+    """
+    resolved = fonts or {}
+    entries = []
+    for name, style, size, line in TEXT_STYLES:
+        family, real_style = resolved.get(name, (DEFAULT_FONT_FAMILY, style))
+        entries.append({
+            "name": name, "family": family, "style": real_style,
+            "fallback": style, "size": size, "line": line,
+        })
     return _TEXT_STYLE_SCRIPT.replace("__ENTRIES__", json.dumps(entries))
 
 
@@ -473,17 +585,27 @@ _TEXT_STYLE_SCRIPT = """\
 const entries = __ENTRIES__;
 const existing = await figma.getLocalTextStylesAsync();
 const names = [];
+const fellBack = [];
 for (const entry of entries) {
-  await figma.loadFontAsync({ family: 'Inter', style: entry.style });
+  let font = { family: entry.family, style: entry.style };
+  try {
+    await figma.loadFontAsync(font);
+  } catch (e) {
+    // A family this file turns out not to have must cost ONE style, not the
+    // whole ramp -- and the run is told, rather than quietly shipping Inter.
+    font = { family: 'Inter', style: entry.fallback };
+    await figma.loadFontAsync(font);
+    fellBack.push(entry.name + ' (' + entry.family + ')');
+  }
   let style = null;
   for (const s of existing) { if (s.name === entry.name) { style = s; } }
   if (!style) { style = figma.createTextStyle(); style.name = entry.name; }
-  style.fontName = { family: 'Inter', style: entry.style };
+  style.fontName = font;
   style.fontSize = entry.size;
   style.lineHeight = { unit: 'PIXELS', value: entry.line };
   names.push(entry.name);
 }
-return { createdNodeIds: [], textStyleNames: names };
+return { createdNodeIds: [], textStyleNames: names, fellBack: fellBack };
 """
 
 
@@ -704,10 +826,13 @@ EXISTING_CLEARANCE = 200
 # because "a mobile sign-in screen and a desktop dashboard" used to produce two
 # frames of identical width -- the instruction was read for ONE width and every
 # screen got it.
+# The VIEWPORT each device shows: one screenful. A page frame is a whole
+# number of these tall (see `build_fit_screens_script`), so a screen that fits
+# is exactly the size of the real thing.
 DEVICE_WIDTHS: dict[str, tuple[int, int]] = {
-    "mobile": (390, 844),
-    "tablet": (834, 1194),
-    "desktop": (1440, 900),
+    "mobile": (390, 844),      # iPhone 14
+    "tablet": (834, 1194),     # iPad Pro 11"
+    "desktop": (1440, 1024),   # Figma's own Desktop preset -- a laptop screen
 }
 
 
@@ -883,6 +1008,181 @@ for (const spec of specs) {
 }
 return { createdNodeIds: ids, screens: made, failedScreens: failed };
 """
+
+
+# A page may be taller than one screenful -- a landing page always is -- but it
+# should be a whole number of screenfuls, not a ragged number ending wherever
+# the last section happened to stop.
+MAX_VIEWPORTS_PER_SCREEN = 6
+
+# How much blank canvas rounding up to ANOTHER whole viewport may add, as a
+# share of one viewport. Past this the frame keeps its content height instead.
+#
+# "A page frame is a whole number of screenfuls tall" is the right rule and it
+# had one bad case, which a real run hit squarely: content a little OVER one
+# viewport rounds to two, so a design specified as 1440x900 shipped 1440x2048 --
+# a screenful of empty canvas under it, and every full-height column stretched
+# down into the void. Snapping is worth some slack; it is not worth most of a
+# screen.
+#
+# It only applies from the SECOND screenful on. A page whose content fits
+# inside one viewport is always snapped up to it: that is the property that
+# makes every page that fits come out exactly 1440x1024.
+MAX_SNAP_SLACK = 0.5
+
+
+def build_fit_screens_script(specs: list[dict]) -> str:
+    """Size every screen frame to a whole number of its own viewports.
+
+    Two failures this replaces, both from real runs and both visible as blank
+    canvas:
+
+    - **Frames hugged their content**, so a row of pages ended at assorted
+      heights and read as a mistake rather than a design.
+    - **Levelling them all to the TALLEST** fixed that and created something
+      worse: a Category page whose content stops halfway down a frame sized for
+      a five-section landing page, more than half of it empty. "Equal" bought
+      at the price of a screen and a half of nothing is not a good trade.
+
+    Rounding up to a viewport gives both. A page that fits is EXACTLY
+    1440x1024 -- a real laptop screen, which is what a mockup is supposed to
+    look like -- and pages that fit are also all identical, which is what
+    "equal" was asking for. A long page becomes 2048 or 3072: still a clean
+    number, still obviously the same design system, and never more than one
+    screenful of slack.
+
+    ...and it snaps only when snapping is nearly free. Rounding content that
+    is a little over one viewport up to TWO adds most of a screen of blank
+    canvas, which is the very thing this pass replaced. Past `MAX_SNAP_SLACK`
+    the frame keeps its content height instead: slightly ragged beats visibly
+    empty.
+
+    Each spec is {id, viewport}. Arithmetic, so Python owns it (section 7).
+    """
+    return (
+        _FIT_SCREENS_SCRIPT.replace("__SPECS__", json.dumps(specs))
+        .replace("__MAX_VIEWPORTS__", str(int(MAX_VIEWPORTS_PER_SCREEN)))
+        .replace("__MAX_SLACK__", repr(float(MAX_SNAP_SLACK)))
+    )
+
+
+# Wrapped per frame: one screen that cannot be resized must not cost the rest
+# their sizing.
+_FIT_SCREENS_SCRIPT = """const specs = __SPECS__;
+const MAX_VIEWPORTS = __MAX_VIEWPORTS__;
+const MAX_SLACK = __MAX_SLACK__;
+const sized = [];
+const failed = [];
+
+for (const spec of specs) {
+  try {
+    const frame = await figma.getNodeByIdAsync(spec.id);
+    if (!frame || frame.removed || !('resize' in frame)) { continue; }
+    const viewport = Math.max(1, Math.round(spec.viewport));
+    // What the content needs right now. The frame has been hugging until this
+    // point, which is what stopped a long page clipping.
+    const content = Math.ceil(frame.height);
+    let screens = Math.ceil(content / viewport);
+    if (screens < 1) { screens = 1; }
+    if (screens > MAX_VIEWPORTS) { screens = MAX_VIEWPORTS; }
+    const target = viewport * screens;
+    // Snap only when it is nearly free. Content 150px over one viewport would
+    // otherwise round to two, and the extra screenful is blank canvas.
+    const snapped = screens <= 1 || (target - content) <= viewport * MAX_SLACK;
+    const height = snapped ? Math.max(target, content) : content;
+    // A hugging frame ignores a resize on that axis, so the mode goes first.
+    if ('primaryAxisSizingMode' in frame) { frame.primaryAxisSizingMode = 'FIXED'; }
+    // Never SHORTER than the content: cutting a page down is the clipping the
+    // hugging existed to avoid, and the cap only bites on a runaway page.
+    frame.resize(frame.width, height);
+    sized.push({
+      id: frame.id, name: frame.name, screens: screens, snapped: snapped,
+      height: Math.round(frame.height)
+    });
+  } catch (e) {
+    failed.push(spec.id + ': ' + String(e && e.message ? e.message : e));
+  }
+}
+return { createdNodeIds: [], screens: sized, failed: failed };
+"""
+
+
+def build_screen_content_script(frame_ids: list[str]) -> str:
+    """How many children each screen frame really has.
+
+    Ground truth, because the in-memory answer is wrong. `record_section` only
+    fires for steps the keyword heuristic calls a section (`_is_section_step`),
+    so a screen built by a step phrased any other way looks empty from Python
+    while being full on the canvas. Reading it back is CLAUDE.md's rule for
+    exactly this: never assume canvas state.
+    """
+    return _SCREEN_CONTENT_SCRIPT.replace(
+        "__IDS__", json.dumps([str(i) for i in frame_ids if i])
+    )
+
+
+_SCREEN_CONTENT_SCRIPT = """const ids = __IDS__;
+const CONTROLS = /button|input|field|checkbox|toggle|select|link|cta|nav|tab/i;
+const MAX_DEPTH = 8;
+
+// Not just "does this frame have children". A screen that got its artwork and
+// none of its form has one child and looks built from the outside -- which is
+// exactly how a Sign Up screen shipped as a picture and a quote.
+function tally(node, depth, acc) {
+  if (!('children' in node) || depth > MAX_DEPTH) { return; }
+  for (const child of node.children) {
+    acc.nodes += 1;
+    if (child.type === 'TEXT' && String(child.characters).trim()) { acc.texts += 1; }
+    if (CONTROLS.test(child.name)) { acc.controls += 1; }
+    tally(child, depth + 1, acc);
+  }
+}
+
+const screens = [];
+for (const id of ids) {
+  const node = await figma.getNodeByIdAsync(id);
+  if (!node || node.removed) { continue; }
+  const acc = { nodes: 0, texts: 0, controls: 0 };
+  tally(node, 0, acc);
+  screens.push({
+    id: node.id,
+    name: node.name,
+    children: 'children' in node ? node.children.length : 0,
+    nodes: acc.nodes,
+    texts: acc.texts,
+    controls: acc.controls
+  });
+}
+return { createdNodeIds: [], screens: screens };
+"""
+
+
+# A real screen has more copy on it than this. Below it, whatever is there is
+# scaffolding -- a picture, a heading, a stray label -- and the screen the user
+# asked for was never built.
+MIN_SCREEN_TEXTS = 3
+# ...and a screen with a fraction of what its siblings got is unfinished even
+# when it clears that bar on its own.
+THIN_VS_SIBLING = 4
+
+
+def thin_screen_reason(row: dict, richest_texts: int) -> str:
+    """Why this screen looks half-built, or "" if it looks finished.
+
+    Arithmetic on what is really on the canvas (CLAUDE.md section 7), and
+    deliberately conservative: the cost of a false positive is one extra build
+    attempt, and the cost of a false NEGATIVE is shipping a screen that is a
+    picture and a quote where a sign-up form should be.
+    """
+    texts = int(row.get("texts") or 0)
+    controls = int(row.get("controls") or 0)
+    if texts <= 0:
+        return "nothing on it reads as content"
+    if texts < MIN_SCREEN_TEXTS and controls == 0:
+        return f"only {texts} piece(s) of copy and nothing to interact with"
+    if richest_texts >= MIN_SCREEN_TEXTS * THIN_VS_SIBLING and texts * THIN_VS_SIBLING <= richest_texts:
+        return f"{texts} pieces of copy where another screen has {richest_texts}"
+    return ""
 
 
 def build_clear_page_script() -> str:

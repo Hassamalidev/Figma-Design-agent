@@ -106,6 +106,12 @@ python main.py --attach reference.png "rebuild this for Nexora AI"
 python main.py --attach brand.md --attach hero.png "a landing page to this spec"
 ```
 
+An attachment is used twice over: read as words (so the brief, the screens and
+the palette come from it), and **placed on the canvas as a real image** — the
+logo you attached is the logo, not a grey placeholder. Figma accepts PNG, JPEG
+and GIF for that; a WEBP is still read as a reference, and the run says so
+rather than quietly dropping it. See CLAUDE.md section 22.
+
 An image needs a multimodal model — name one under **Settings → Vision model**,
 or set `VISION_MODEL_NAME` in `.env` (a configured `CRITIC_MODEL_NAME` already
 counts). Without one, the run says so rather than quietly ignoring the file and
@@ -148,6 +154,31 @@ that isn't currently open just waits (with a message in the log panel) until
 you open that file in Figma Desktop and start the plugin, then starts the run
 automatically.
 
+## It builds what the brief actually says
+
+Two things a brief states that used to be quietly dropped:
+
+- **The frame size.** "Frame size for both: 1440 x 900px" is honoured to the
+  end of the run. It used to be applied when the frame was created and then
+  overruled by the end-of-run fit pass, which rounded every desktop screen to a
+  multiple of 1024 — so a 1440x900 design came back 1440x2048 with a screenful
+  of blank canvas under it.
+- **The typeface.** A brief that names a display font ("Playfair Display") gets
+  it on the headings, with the UI font kept for labels, inputs and buttons.
+  Font names are checked against the fonts Figma really has before anything
+  uses one; a family this file does not have falls back to Inter and says so.
+
+## The design is clickable
+
+The finished file is wired as a **prototype**, not just drawn: the sign-in
+button opens the dashboard, "Back" goes back, a page taller than the screen
+scrolls, and every screen has a way to be reached when you press play in Figma.
+Most of it is decided by matching labels to screen names in Python; the model
+is asked once, and only about the screens nothing obviously opens. Turn it off
+with the **Clickable prototype** preference. See CLAUDE.md section 23.
+
+In edit mode, "make this button open the settings screen" is a normal request.
+
 ## Project layout
 
 See CLAUDE.md section 4 for the full map. Short version:
@@ -184,5 +215,6 @@ model-generated plan, and the web dashboard are all wired end-to-end (Phases
 the tokens-before-components-before-composition discipline in code
 (currently just prompted), and a real embeddings-backed retriever if the
 keyword one proves too coarse.
-#   F i g m a - D e s i g n - a g e n t  
+#   F i g m a - D e s i g n - a g e n t 
+ 
  

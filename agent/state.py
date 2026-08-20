@@ -26,6 +26,20 @@ class Screen:
     name: str
     frame_id: str | None = None
     width: int = 1440
+    height: int = 900  # starting height; the frame hugs its content afterwards
+    # One line about what this screen is FOR, from the same answer that named
+    # it. The per-screen plan is written from the whole design's brief, so
+    # without this the plan for "Dashboard" was derived from a brief that
+    # mostly talks about signing in.
+    purpose: str = ""
+    # desktop | tablet | mobile. Decides the frame width, so "a mobile
+    # sign-in screen and a desktop dashboard" stops making both 1440 wide.
+    device: str = "desktop"
+    # Where the frame actually sits. Filled in by the harness when it places a
+    # new screen, and read off the canvas when it adopts an existing one, so
+    # the next screen is positioned against real coordinates.
+    x: int | None = None
+    y: int | None = None
     # Sections already inside THIS screen. Per-screen, because "the page
     # already has a header" is only true of the screen that has one.
     sections: list[str] = field(default_factory=list)

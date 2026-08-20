@@ -438,16 +438,31 @@ A SECTION is a part of one screen: a nav bar, a hero, a feature row, a footer,
 a sidebar, a form, a card grid. Sections are NOT screens.
 
 Rules:
-- Most requests are ONE screen. Return exactly one name then -- do not invent
-  extra screens the user did not ask for.
+- Most requests are ONE screen. Return exactly one then -- do not invent extra
+  screens the user did not ask for.
 - Only return several when the request genuinely names several destinations
   ("a login and a signup screen", "the whole onboarding flow", "sign in,
   dashboard and profile").
-- At most 6, in the order they should appear left to right.
+- At most 6, listed in the order a user would MEET them: the entry point
+  first, then what follows it. That order is the order they are built in and
+  the order they are laid out left to right, so it must read as the flow.
 - Name each one the way a designer would label the frame: "Login", "Sign Up",
   "Dashboard", "Settings". Two or three words maximum, no numbering.
 
-Respond with ONLY a JSON array of screen names. No prose, no markdown fences.
+Describe each screen with three fields:
+- "name": the frame label.
+- "purpose": ONE short sentence saying what this screen is for and the main
+  things on it. This is all the planner for that screen is told about it, so
+  a screen whose purpose is vague gets a vague design.
+- "device": "desktop", "tablet" or "mobile" -- whichever the request implies
+  for THIS screen. It sets the frame width, so guess "desktop" unless the
+  request points at a phone or a tablet.
+
+Respond with ONLY a JSON array of objects, like:
+[{"name": "Login", "purpose": "Sign in with email and password, or Google.",
+  "device": "desktop"}]
+
+No prose, no markdown fences.
 """
 
 SCREENS_USER_TEMPLATE = """\
@@ -507,6 +522,10 @@ Rules:
   out stacked vertically with the form under the artwork instead of beside it.
   Plan it as: "Build the whole <screen> screen: <left> beside <right>." 
 - Each step must describe a region that no other step touches.
+- **List the steps in TOP-TO-BOTTOM visual order.** Each step appends to the
+  BOTTOM of the screen frame, so the order you list them in is the order they
+  appear on the screen. A nav bar listed after the hero is built underneath
+  it. Header first, footer last, everything else in between.
 - **Keep each step to ONE SHORT SENTENCE, under about 20 words.** Name the
   section and what it contains; do not specify exact pixel values, hex
   colours, font names, node names or per-child instructions. Those are
@@ -538,8 +557,15 @@ What currently exists on the canvas:
 
 SCREEN_PLANNING_NOTE = """
 THE SCREEN YOU ARE PLANNING: "{screen}"
-{siblings}
+{purpose}{siblings}
 Plan the sections of "{screen}" and nothing else.
+"""
+
+# The brief describes the WHOLE design, so without this the plan for a
+# dashboard was written from a document that mostly talks about signing in.
+SCREEN_PURPOSE_NOTE = """\
+What this screen is for: {purpose}
+
 """
 
 SIBLING_SCREENS_NOTE = """\
@@ -736,6 +762,7 @@ def planning_user_message(
     existing_sections: list[str] | None = None,
     screen: str = "",
     other_screens: list[str] | None = None,
+    screen_purpose: str = "",
 ) -> str:
     existing_work = (
         CONTINUING_NOTE.format(sections="\n".join(f"  - {s}" for s in existing_sections))
@@ -749,7 +776,14 @@ def planning_user_message(
             if other_screens
             else ""
         )
-        screen_note = SCREEN_PLANNING_NOTE.format(screen=screen, siblings=siblings)
+        purpose = (
+            SCREEN_PURPOSE_NOTE.format(purpose=screen_purpose.strip())
+            if screen_purpose and screen_purpose.strip()
+            else ""
+        )
+        screen_note = SCREEN_PLANNING_NOTE.format(
+            screen=screen, purpose=purpose, siblings=siblings
+        )
     return PLANNING_USER_TEMPLATE.format(
         instruction=instruction,
         screen_note=screen_note,
@@ -789,8 +823,19 @@ Rules that decide whether an edit lands:
    name from the palette table. A hex value is refused.
 4. **One `edit_ui` call should carry the whole change.** Batch the edits; do not
    make one call per node.
-5. **`delete` is the only destructive op.** Nothing else removes anything, and
-   nothing implies it. Use it only when the user asked for something to go.
+5. **TWO ops remove things: `delete` and `replace`.** `replace` takes the old
+   node away before it builds the new one, so it is every bit as destructive as
+   `delete` -- treat it that way. Use either one only when the user asked for
+   something to go or to be swapped.
+   - NEVER target a top-level frame with them. Those are whole SCREENS, and
+     removing one empties the page. To change a screen, change the sections
+     inside it.
+   - NEVER use a `{...}` selector with them. A selector matches more than you
+     can see, and `{"type":"FRAME"}` matches everything on the page. Name the
+     specific ids you mean. Selectors are for bulk RECOLOURING and relabelling,
+     which are reversible; removal is not.
+   - This is somebody's real file. If you are unsure whether something should
+     go, leave it and say so.
 6. Use `get_metadata` if the listing does not tell you enough. Do not read the
    same node twice.
 
@@ -812,7 +857,8 @@ The ops, and what each needs:
 `target` may also be a list of ids, or a selector the harness resolves for you:
 `{"name":"Button"}`, `{"text":"Log in"}`, `{"type":"TEXT"}`, `{"screen":"Login"}`
 (combinable, plus `"limit":N`). Use a selector when the change is genuinely
-"all of these"; use ids when it is specific.
+"all of these"; use ids when it is specific. **Not for `delete` or `replace`** --
+see rule 5.
 
 `gap`/`padding` are names: xs sm md lg xl 2xl. `radius`: sm md lg xl.
 `style` is one of the text styles listed below.
@@ -846,6 +892,9 @@ Rules:
   has the canvas listing and the palette.
 - Never plan a step the user did not ask for. No "and while we're here, tidy up
   the spacing". This is the user's own work.
+- Never plan to remove or replace a whole screen. If the user wants a screen
+  rebuilt, that is Create mode's job, not an edit -- say what should change
+  inside the screen instead.
 - Never plan to rebuild or recreate a screen. If something must change
   structurally, say what to replace or insert and where.
   - GOOD: "Change every primary button's fill to the accent colour."

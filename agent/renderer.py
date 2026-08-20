@@ -392,7 +392,13 @@ if (!root0) {{ throw new Error('parent frame not found'); }}
 // the broken one -- and `render_ui` cannot edit nodes in place.
 for (const _oldId of {replace_ids}) {{
   const _old = await figma.getNodeByIdAsync(_oldId);
-  if (_old && !_old.removed) {{ try {{ _old.remove(); }} catch (e) {{}} }}
+  if (!_old || _old.removed) {{ continue; }}
+  // Never a top-level frame: that is a whole SCREEN, and replacing one empties
+  // the page. Callers already check this, and checking again here means no
+  // future caller can get it wrong -- an edit run emptied a real user's file
+  // through exactly this line.
+  if (_old.parent && _old.parent.type === 'PAGE') {{ continue; }}
+  try {{ _old.remove(); }} catch (e) {{}}
 }}
 {fonts}
 const _paint = await figma.getLocalPaintStylesAsync();

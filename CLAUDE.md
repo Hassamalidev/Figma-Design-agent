@@ -58,11 +58,17 @@ dashboard" produced a sign-in form stacked on top of a dashboard in a single
 tall column, and a re-run stamped fresh work over the old. Now:
 
 - `planner.plan_screens` asks one small question — *which screens does this
-  need?* — before anything is drawn. Sections (hero, nav, footer) are filtered
-  out deterministically, because promoting one to a top-level frame scatters a
-  screen's parts across the canvas.
+  need?* — before anything is drawn. Each screen comes back **described**, not
+  just named: a one-line `purpose` (which is what that screen's own plan is
+  written from) and a `device` (which decides its frame width). Sections
+  (hero, nav, footer) are filtered out deterministically, because promoting one
+  to a top-level frame scatters a screen's parts across the canvas — and the
+  filter is spelling-proof, since "Hero Section" and "Navigation Bar" are the
+  same mistake as "Hero" and "Nav".
 - The harness creates **one frame per screen**, positions computed in Python so
-  they can never overlap each other or existing work (section 6a).
+  they can never overlap each other or existing work (section 6a). Each screen
+  advances by its **own** width, so a 390px phone frame beside a 1440px desktop
+  one neither overlaps it nor leaves a chasm.
 - Each screen is **planned separately** and each step carries its `screen_index`,
   so a dashboard step cannot append into the login frame.
 - A re-run matches a screen to an existing frame **by name**, so it extends
@@ -134,6 +140,7 @@ Each part has one responsibility:
 
 | Component | Responsibility |
 |---|---|
+| **Probes** (`agent/tool_probe.py`, `agent/vision_probe.py`) | Prove a model can do the one thing the run needs — call a tool, or see an image — before a run depends on it. `check_model.py` / `check_critic.py` are their CLIs. |
 | **Model client** (`agent/llm.py`) | The only place the model is configured. One method: `complete(messages, tools)`. The swap point. Also normalizes tool calls that small models emit as plain text. |
 | **Agent loop** (`agent/loop.py`) | Drives the run: inspect -> scaffold -> plan -> per-step (generate -> execute -> structural gate -> visual gate -> retry). Hand-rolled. |
 | **Planner** (`agent/planner.py`) | Expands the instruction into a design brief, then into an ordered plan. |
@@ -222,7 +229,9 @@ figma-agent/
     |-- test_editor.py       # the edit compiler, weighted to what it REFUSES
     |-- test_inventory.py    # the canvas index, listing and id resolution
     |-- test_reference.py    # attachments: decoding, refusing, describing (section 21)
+    |-- test_generated_js.py # rules EVERY generated script obeys (banned sync APIs, removal guards)
     |-- test_loop.py         # loop logic with a fake ModelClient + fake bridge
+    |-- test_planner.py      # screen decomposition, build order, the step budget
     |-- test_critic.py      # the visual gate's geometry, contrast + design checks
     |-- test_requirements.py# requirement coverage, and its false-positive rules
     |-- test_metrics.py     # the run recorder: cost, latency, failure reasons
@@ -259,9 +268,28 @@ MODEL_API_KEY=ollama
 MODEL_NAME=gpt-oss:20b-cloud
 ```
 
-Not every `:cloud` model is free — `glm-5.2:cloud` returns 403 "requires a subscription".
-**Verify with a real request** (the dashboard's "Test connection" button does exactly this)
-rather than assuming from the name.
+Not every `:cloud` model is free, and names rot fast. **Verify with a real request**, and
+verify the thing that actually matters: `python check_model.py <name>` makes a real tool call
+with a `spec`-shaped argument and reports whether the model made it. The dashboard's "Test
+connection" button only proves the endpoint answers — a model can pass that and still reply
+in prose to every tool call, which reads like an agent bug and is not one.
+
+`--list` shows what the endpoint offers, with the `capabilities` it *claims*. That is a
+filter, never a verdict: `tools` in that list is precisely the claim the probe exists to
+check. Measured on this project's endpoint:
+
+| Model | Tool call | Notes |
+|---|---|---|
+| `gpt-oss:120b-cloud` | ✅ 3.9s | current default |
+| `gemma4:cloud` | ✅ 4.6s | also multimodal — can serve as the critic, but then the two share a quota |
+| `gpt-oss:20b-cloud` | ✅ 4.7s | the previous default; hit its free limit |
+| `gemma4:31b-cloud` | ✅ 6.8s | |
+| `glm-5.2:cloud` | ❌ | 403, needs a paid subscription |
+| `qwen3-coder:480b`, `deepseek-v3.1:671b`, `kimi-k2:1t`, `glm-4.6`, `minimax-m2`, `deepseek-v3.2` | ❌ | all **retired** by the provider |
+
+**Free tiers are per-model quota buckets.** When one rate-limits mid-project, switching
+`MODEL_NAME` to the next verified line is the fix — which is why the list above is kept in
+`.env` next to the setting, rather than only here.
 
 ### Interface
 
@@ -292,7 +320,7 @@ which is exactly what the swap point is for.
 ### Cost discipline
 
 Debug the **harness** (does the loop close, do tools fire, do the gates block) against the
-fakes in `tests/` — 367 tests run with no network, no Figma and no model. Spend real model
+fakes in `tests/` — 572 tests run with no network, no Figma and no model. Spend real model
 calls on genuine design runs.
 
 ---
@@ -406,6 +434,11 @@ deterministic, unit-tested, and compiled as JavaScript in CI.
 | **Removing work that failed** (`discard_nodes`) | Every build is additive, so the attempt that ENDS a step left its output on the canvas with nothing to remove it. A run shipped a 1440x900 white void, a `TODO` band marking the gap that void already filled, and four stacked copies of one sign-in form. |
 | **Refusing to split a screen sideways** (`_collapse_side_by_side`) | A screen frame is a VERTICAL auto-layout, so "add the left panel" then "add the right panel" appends two full-width bands and the form lands UNDER the artwork. Both bands are individually well-formed, so no gate can see it. The planning prompt says this; the prompt was ignored. |
 | **Field labels** (`_without_duplicate_labels`) | `input` renders its own label, so a spec that also writes the label out produced "Email" stacked on "Email". The vision critic caught it correctly — but judgement cannot fail a step, so a whole repair budget went on it and nothing was fixed. The renderer owns field layout, so the renderer resolves the collision. |
+| **Screen size** (`planner._infer_device`, `scaffold.device_size`) | The frame width was read ONCE from the whole instruction and handed to every screen, so "a mobile sign-in screen and a desktop dashboard" produced two 1440px frames and the phone screen was a mockup of nothing. Device is decided per screen: what that screen declares, then its own wording, then the run's dominant declared device -- the instruction is read only when NO screen declared one, because "a login, a phone dashboard and settings" made the *settings* screen 390px wide off a word about the screen beside it. An explicit `1600 x 1200` in the instruction still wins over all of it. |
+| **Screen placement** (`scaffold.place_screens`) | Positions are arithmetic (section 7), so the overlap guarantee is *checked* rather than hoped for: every candidate frame is tested against every rect already on the page and slid right until it clears them. The old rule — "start right of the widest thing, then add a shared width each time" — broke on both mixed widths and a second sketch further along the canvas. New screens also join the row a **reused** screen is already on, instead of appearing 1000px below the design they belong with. |
+| **Section names that aren't screens** (`planner._is_section_name`) | The filter matched exact words, so `Hero` was dropped and `Hero Section` became a top-level frame — the same mistake, spelled out. Generic nouns (`section`, `bar`, `area`, `panel`…) are stripped before matching. `page` deliberately is **not**: "Settings Page" is a screen. |
+| **Build order** (`planner.order_steps`) | A screen frame is a VERTICAL auto-layout and every section step appends into it, so **step order IS visual order** — a plan that lists the footer first builds the footer at the top, and no gate can see it because each band is individually well formed. Steps that clearly name the top or the bottom of a screen are sorted; the sort is stable, so everything the harness cannot place keeps the order the model chose. |
+| **Fitting the step budget** (`planner.fit_steps`) | The per-screen budget was applied with a slice, which silently threw the end of the screen away: a five-band landing page capped at three shipped without its testimonials or its footer, and every step it *did* run passed, so nothing downstream could notice. The tail is now MERGED into the last step instead of dropped. |
 | **Tracking what's been built** (`record_section`) | `existing_sections` was filled in once, only when reusing a root frame — so on a fresh run every step was told the page was empty and duly rebuilt what was already there. Each completed section (and each TODO placeholder) is now recorded as it lands. |
 
 Consequence for the planner: it is told the root frame and all styles **already exist** and
@@ -986,7 +1019,8 @@ Do not start a phase until the previous one runs end to end.
    tree, and reported as `requirements_met` / `requirements_missing`. `success` now fails a
    run that satisfied none of a clearly-specified instruction.
 3. **The planner emits `list[PlanStep]`** — each step now carries the `screen_index` it
-   belongs to, so screen assignment is data rather than a guess. Section detection is still
+   belongs to, so screen assignment is data rather than a guess, and screens now carry a
+   `purpose` and a `device` rather than only a name. Section detection is still
    keyword-matched English (`_is_section_step`), and per-section acceptance criteria are
    still not emitted; that half of the gap is open.
 4. ~~**No deterministic design checks** beyond geometry~~ **Done** — sections 8b and 8c.
@@ -1011,16 +1045,17 @@ Do not start a phase until the previous one runs end to end.
 
 ## 16. Testing
 
-**367 tests, no network, no Figma, no model.** `pytest` runs the whole suite in ~7 seconds.
+**572 tests, no network, no Figma, no model.** `pytest` runs the whole suite in ~7 seconds.
 
 | File | Covers |
 |---|---|
 | `test_bridge.py` | Protocol round-trips over a real loopback socket, the `hello` handshake, timeouts, abrupt disconnects |
 | `test_loop.py` | The loop with `FakeModelClient` (scripted tool calls) + `FakeBridge` (canned results): retries, both gates, root-frame reuse, repeat guard, doc-query budget, placeholder fallback |
+| `test_planner.py` | Screen decomposition (weighted to what must NOT become a screen), device sizing, build order, and that an over-budget plan MERGES its tail rather than dropping it |
 | `test_critic.py` | The visual gate: geometry, contrast (including what must NOT be flagged), design-system adherence — and that a clean tree reports **nothing** |
 | `test_requirements.py` | Requirement coverage, weighted towards its false-positive rules: a wrongly-reported miss is worse than a missed check |
 | `test_metrics.py` | The run recorder: latency distributions, per-thread isolation, and that measuring never breaks what it measures |
-| `test_scaffold.py` | Palette parsing, and that generated JS **actually compiles** via `new AsyncFunction(...)`, exactly as the plugin evals it |
+| `test_scaffold.py` | Palette parsing, screen placement (no returned rect touches another or anything already on the page), and that generated JS **actually compiles** via `new AsyncFunction(...)`, exactly as the plugin evals it |
 | `test_llm.py` | Tool-call recovery for models that emit them as text |
 | `test_settings.py` | Settings precedence (UI over `.env`), key masking, dashboard API |
 | `test_prompts.py` | That the step prompt actually carries the brief, the plan outline and the repair framing — the information-plumbing regressions |
@@ -1105,6 +1140,8 @@ which is evidence a password field was built, not proof it was built well. Read 
 | I want to... | Look in |
 |---|---|
 | Change the model / provider | `.env` or the dashboard's Settings (only `agent/llm.py` defines access) |
+| Check a model can drive a run | `python check_model.py <name>` — a real tool call, not a capability flag (section 5) |
+| Find models on an endpoint | `python check_model.py --list` |
 | Turn on / change the vision critic | `CRITIC_*` in `.env` (section 8b) |
 | Set the model that reads attachments | Settings → Vision model, or `VISION_*` in `.env` (section 21) |
 | Handle a new provider quirk | `agent/llm.py` (section 5) |
@@ -1129,6 +1166,10 @@ which is evidence a password field was built, not proof it was built well. Read 
 | Fix a Figma API mistake pattern | `knowledge/gotchas.md` (section 11) |
 | Map a recurring error to its fix | `ERROR_HINTS` in `agent/loop.py` |
 | Change what a "design" decomposes into | `agent/planner.py` (plan) / `enhance_instruction` (brief) |
+| Change how screens are sized (device widths) | `agent/scaffold.py` — `DEVICE_WIDTHS`; inference in `planner._infer_device` |
+| Change where screens are laid out on the canvas | `agent/scaffold.py` — `place_screens` (section 6a) |
+| Change the order sections are built in | `agent/planner.py` — `order_steps` |
+| Change what a name must look like to be a screen | `agent/planner.py` — `_SECTION_WORDS` / `_SECTION_SUFFIXES` |
 | Know whether a change actually helped | `python -m bench.run --all --repeat 3` (section 16a) |
 | Add a benchmark task or criterion | `bench/tasks/*.json` — data, no code change |
 | Change how design quality is scored | `bench/score.py`, then `--rescore` past results |
@@ -1395,10 +1436,8 @@ more than one that covers every Figma property.
 
 ### Three safety properties
 
-1. **Nothing is destructive by default.** `delete` is the only op that removes
-   anything, nothing else implies it, and it **refuses to delete a top-level
-   screen frame** — far too much damage for one mis-parsed word. Delete the
-   section inside it instead.
+1. **Removal is bounded on every axis.** This is the one that was got wrong, and
+   it cost a user their page — see "How an edit emptied a file" below.
 2. **The batch is not atomic, and says so.** Atomicity is right for building one
    section and wrong for a batch of independent edits: one stale target would
    discard nine good changes. Each edit is wrapped, and the script returns
@@ -1410,6 +1449,44 @@ more than one that covers every Figma property.
    work and may well have had problems before the agent arrived. Failing an edit
    for one of those would have the agent undoing a change it was asked to make
    in order to fix something nobody mentioned.
+
+### How an edit emptied a file, and what now stops it
+
+A real run **deleted everything on the page**. The cause was a single missing
+check: `delete` was guarded against removing a whole screen frame, and
+`replace` was not — even though `replace` removes its target just as surely,
+through the renderer's `replace_ids`. So `{"op":"replace","target":"<a
+top-level frame>"}` threw an entire screen away, and the same op with a
+`{"type":"FRAME"}` selector fanned out across every frame on the page.
+
+The lesson is not "guard replace". It is that the property worth guarding is
+**"this removes something"**, not the word that was used for it. So:
+
+| Guard | What it stops |
+|---|---|
+| `DESTRUCTIVE_OPS` + `guard_removal` | One code path for every op that removes a node. A new destructive op cannot be added without a guard — there is a test that reads the source and checks. |
+| No destructive op on a top-level frame | A top-level frame is a whole SCREEN. Rebuilding one is Create mode's job. |
+| `MAX_SELECTOR_REMOVALS = 2` | A **selector** may not remove more than a couple of nodes. Bulk *recolouring* everything matching `{"type":"FRAME"}` is a fine edit and reversible; bulk *removing* it is how a page disappears — and unlike a list of ids, the model never sees how far a selector reaches. To remove several things it must name them, so the count is something it chose rather than something it discovered. |
+| `MAX_REMOVALS_PER_BATCH = 6` | More than a handful is a redesign, not an edit. |
+| Fails **closed** | If `protected_ids` is empty — an inventory that failed to read, a caller that forgot to pass the screens — destructive ops are refused outright rather than silently unlocked. |
+| The guard is in the generated **JavaScript** too | `if (_old.parent.type === 'PAGE') continue;` in the renderer's preamble and an explicit throw in `replace`. The inventory is a snapshot and the canvas can move under it, and a future caller must not be able to reintroduce the hole by forgetting a Python check. |
+| `canvas_was_gutted` | The loop compares the node count against what the file started with. Losing more than half of it stops the run, because the failure that actually happened was noticed by nobody and the agent kept editing a blank page. |
+
+Nothing here can put the design back — the Plugin API has no undo to call. What
+the run *can* do is notice immediately, while Figma's own undo still has it,
+and say so in words: *"Press Ctrl+Z in Figma NOW."*
+
+Two related fixes found while closing this:
+
+- **`_placeLast` used `figma.getNodeById`**, the sync getter, which throws under
+  `documentAccess: "dynamic-page"`. It threw *after* a `replace` had removed the
+  old node, so the edit reported failure with the original already gone. It is
+  `await figma.getNodeByIdAsync` now, and `tests/test_generated_js.py` checks
+  **every** script this project generates for that and the other banned calls —
+  a compile check cannot catch an API misuse that parses.
+- **Two `replace`s in one batch collided**: `const old` was emitted at the top
+  level, so the second was a redeclaration and the whole script died before
+  anything ran. Each is block-scoped now.
 
 ### It adopts the file's styles rather than imposing its own
 

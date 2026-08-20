@@ -2834,3 +2834,63 @@ def test_a_run_with_no_attachment_is_completely_unchanged():
 
     assert result.success
     assert "REFERENCE" not in llm.calls[0]["messages"][-1]["content"]
+
+
+def _rects_overlap(a, b):
+    return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
+
+
+def _spec_rects(specs):
+    return [(s["x"], s["y"], s["x"] + s["width"], s["y"] + s["height"]) for s in specs]
+
+
+def test_screens_never_overlap_each_other_or_the_work_already_there():
+    """Positions are computed in Python from every rect on the page, so the
+    guarantee is checkable rather than hoped for."""
+    existing = [
+        {"id": "1:1", "name": "Old sketch", "type": "RECTANGLE",
+         "x": 0, "y": 0, "width": 800, "height": 600, "layoutMode": None, "children": []}
+    ]
+
+    _, bridge, _ = _multi_screen_run(["Login", "Dashboard"], existing=existing)
+
+    specs = _screen_specs(bridge)
+    rects = _spec_rects(specs)
+    assert specs[0]["x"] == 1000  # 800 wide + 200 clearance
+    assert not _rects_overlap(rects[0], rects[1])
+    assert all(not _rects_overlap(rect, (0, 0, 800, 600)) for rect in rects)
+
+
+def test_a_mobile_screen_is_not_given_the_desktop_width():
+    """The frame width used to be read once from the whole instruction and
+    handed to every screen, so a phone screen came out 1440px wide."""
+    _, bridge, _ = _multi_screen_run(["Sign In"], instruction="a mobile sign-in screen")
+
+    assert _screen_specs(bridge)[0]["width"] == 390
+
+
+def test_an_explicit_size_in_the_instruction_beats_the_device_default():
+    """"1600 x 1200" is a decision, not a guess."""
+    _, bridge, _ = _multi_screen_run(
+        ["Home"], instruction="a landing page, desktop frame 1600 x 1200"
+    )
+
+    spec = _screen_specs(bridge)[0]
+
+    assert (spec["width"], spec["height"]) == (1600, 1200)
+
+
+def test_a_new_screen_joins_the_row_the_reused_one_is_already_on():
+    """Screens 700px below the frame they belong with read as a second,
+    unrelated row on the canvas."""
+    existing = [{
+        "id": "9:1", "name": "Login", "type": "FRAME", "x": 400, "y": 1200,
+        "width": 1440, "height": 900, "layoutMode": "VERTICAL", "children": [],
+    }]
+
+    _, bridge, _ = _multi_screen_run(["Login", "Dashboard"], existing=existing)
+
+    dashboard = _screen_specs(bridge)[0]
+    assert dashboard["name"] == "Dashboard"
+    assert dashboard["y"] == 1200
+    assert not _rects_overlap(_spec_rects([dashboard])[0], (400, 1200, 1840, 2100))

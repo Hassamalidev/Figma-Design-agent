@@ -285,23 +285,28 @@ def create_screens(state: RunState, bridge: Bridge) -> None:
       existing frame BY NAME, so a second run extends "Login" rather than
       stamping a fresh copy over whatever happened to be biggest.
     """
-    width = _root_width(state.instruction)
-    x = _free_x(state.existing_nodes)
-    pending: list[dict] = []
+    width, height = _explicit_size(state.instruction)
+    pending: list[Screen] = []
 
     for screen in state.screens:
-        screen.width = width
+        # A size spelled out in the instruction beats the one the screen's
+        # device implies -- "1440 x 1024" is a decision, not a guess. Without
+        # one, each screen keeps its own device size, so a mobile screen beside
+        # a desktop one is 390px wide rather than sharing the desktop width.
+        if width:
+            screen.width = width
+        if height:
+            screen.height = height
         existing = _match_existing_screen(state.existing_nodes, screen.name)
         # With a single screen, fall back to the old "continue whatever design
         # is here" behaviour -- a lone frame from an earlier run rarely happens
         # to carry this run's screen name, and duplicating it is the worse error.
         if existing is None and len(state.screens) == 1:
-            existing = _find_reusable_root(state.existing_nodes, width)
+            existing = _find_reusable_root(state.existing_nodes, screen.width)
         if existing is not None:
             _adopt_existing(state, screen, existing)
             continue
-        pending.append({"name": screen.name, "x": x, "y": SCREEN_Y, "width": width})
-        x += width + scaffold.SCREEN_GAP
+        pending.append(screen)
 
     if pending:
         _create_pending_screens(state, bridge, pending)
@@ -317,6 +322,12 @@ def _adopt_existing(state: RunState, screen: Screen, node: dict) -> None:
     """Continue an existing frame instead of stamping a second copy on it."""
     screen.frame_id = node["id"]
     screen.is_existing = True
+    # Real coordinates, so the screens created next are placed against where
+    # this frame IS rather than against a default row position it may not sit on.
+    screen.x = int(node.get("x") or 0)
+    screen.y = int(node.get("y") or 0)
+    if node.get("width"):
+        screen.width = int(node["width"])
     for child in node.get("children") or []:
         screen.record_section(str(child.get("name", "?")))
     for name in screen.sections:
@@ -329,9 +340,40 @@ def _adopt_existing(state: RunState, screen: Screen, node: dict) -> None:
     )
 
 
-def _create_pending_screens(state: RunState, bridge: Bridge, pending: list[dict]) -> None:
-    """One atomic script for every screen that still needs a frame."""
-    result = execute_figma_js(bridge, scaffold.build_screen_frames_script(pending))
+def _create_pending_screens(state: RunState, bridge: Bridge, pending: list[Screen]) -> None:
+    """One atomic script for every screen that still needs a frame.
+
+    The positions are computed first, in Python, from every rectangle already
+    on the page (CLAUDE.md section 7). That is the whole overlap guarantee:
+    each new screen is slid right until it clears everything already placed --
+    existing work, frames this run adopted, and the screens beside it -- and
+    each one advances by its OWN width, so a 390px phone frame next to a
+    1440px desktop one neither overlaps it nor leaves a chasm.
+    """
+    positions = scaffold.place_screens(
+        [(screen.width, screen.height) for screen in pending],
+        scaffold.occupied_rects(state.existing_nodes),
+        y=_row_y(state),
+        clearance=NEW_FRAME_GAP,
+    )
+    specs = []
+    for screen, (x, y) in zip(pending, positions):
+        screen.x, screen.y = x, y
+        specs.append(
+            {
+                "name": screen.name,
+                "x": x,
+                "y": y,
+                "width": screen.width,
+                "height": screen.height,
+            }
+        )
+        logger.info(
+            "Screen '%s' placed at (%d, %d), %dx%d [%s]",
+            screen.name, x, y, screen.width, screen.height, screen.device,
+        )
+
+    result = execute_figma_js(bridge, scaffold.build_screen_frames_script(specs))
     if not result["ok"]:
         state.warnings.append(f"Could not create the screen frames: {result['error']}")
         logger.info("Screen frame creation FAILED: %s", result["error"])
@@ -351,6 +393,17 @@ def _create_pending_screens(state: RunState, bridge: Bridge, pending: list[dict]
     for failure in payload.get("failedScreens") or []:
         logger.info("Screen frame skipped -- %s", failure)
         state.warnings.append(f"Screen frame could not be created: {failure}")
+
+
+def _row_y(state: RunState) -> int:
+    """The baseline every screen sits on, so they read as one row.
+
+    A run that continues an existing design lines up with THAT design rather
+    than with the default row: screens 700px below the frame they belong with
+    are a second, unrelated-looking row on the canvas.
+    """
+    adopted = [s.y for s in state.screens if s.is_existing and s.y is not None]
+    return min(adopted) if adopted else SCREEN_Y
 
 
 def plan_all_screens(state: RunState, llm: ModelClient, max_steps: int) -> list[PlanStep]:
@@ -379,7 +432,12 @@ def plan_all_screens(state: RunState, llm: ModelClient, max_steps: int) -> list[
             screen=screen.name if multi else "",
             other_screens=others if multi else None,
             existing_sections=screen.sections,
-        )[:per_screen]
+            screen_purpose=screen.purpose,
+        )
+        # Fit, never truncate: slicing the budget off the end silently dropped
+        # the bottom of a screen -- a landing page shipped without its footer
+        # and every step it did run passed, so nothing could notice.
+        described = planner.fit_steps(described, per_screen)
         steps.extend(PlanStep(description=text, screen_index=index) for text in described)
 
     if len(steps) > max_steps:
@@ -503,21 +561,17 @@ def _find_reusable_root(nodes: list[dict], width: int) -> dict | None:
     return max(pool, key=lambda n: (n.get("width") or 0) * (n.get("height") or 0))
 
 
-def _free_x(nodes: list[dict]) -> int:
-    """X coordinate clear of everything already on the page."""
-    if not nodes:
-        return 200
-    right_edge = max((n.get("x") or 0) + (n.get("width") or 0) for n in nodes)
-    return int(right_edge) + NEW_FRAME_GAP
-
-
 # "1440 x 1024", "1440 × 1024px", "1440 by 1024" -- the FIRST number is width.
 _DIMENSIONS = re.compile(r"(\d{3,4})\s*(?:x|\u00d7|\u2715|by)\s*(\d{3,4})", re.IGNORECASE)
 _WIDTH_PX = re.compile(r"(\d{3,4})\s*px", re.IGNORECASE)
 
 
-def _root_width(instruction: str) -> int:
-    """Honour an explicit frame width in the instruction.
+def _explicit_size(instruction: str) -> tuple[int | None, int | None]:
+    """The frame size the instruction actually states, or (None, None).
+
+    None matters: it is what lets a screen keep the size its own DEVICE
+    implies. A width was previously always returned, so the default silently
+    overrode every per-screen size and a mobile screen came out 1440px wide.
 
     A "WIDTHxHEIGHT" spelling is checked FIRST. "Desktop frame: 1440 x 1024px"
     used to be read by a bare pixel pattern, which matched `1024px` -- the
@@ -525,9 +579,9 @@ def _root_width(instruction: str) -> int:
     """
     match = _DIMENSIONS.search(instruction or "")
     if match:
-        width = int(match.group(1))
+        width, height = int(match.group(1)), int(match.group(2))
         if 200 <= width <= 4000:
-            return width
+            return width, (height if 200 <= height <= 4000 else None)
 
     # No explicit pair: take the LARGEST plausible pixel value rather than the
     # first, so "border radius: 8px ... 1440px wide" is not read as an 8px page.
@@ -535,7 +589,12 @@ def _root_width(instruction: str) -> int:
         int(value) for value in _WIDTH_PX.findall(instruction or "")
         if 200 <= int(value) <= 4000
     ]
-    return max(candidates) if candidates else DEFAULT_ROOT_WIDTH
+    return (max(candidates) if candidates else None), None
+
+
+def _root_width(instruction: str) -> int:
+    """The width a whole-design fallback should use when nothing else says."""
+    return _explicit_size(instruction)[0] or DEFAULT_ROOT_WIDTH
 
 
 def run_step(

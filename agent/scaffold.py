@@ -599,13 +599,19 @@ def build_remove_nodes_script(node_ids: list[str]) -> str:
 
 _REMOVE_NODES_SCRIPT = """const ids = __IDS__;
 const removed = [];
+const skipped = [];
 for (const id of ids) {
   try {
     const node = await figma.getNodeByIdAsync(id);
-    if (node && !node.removed) { node.remove(); removed.push(id); }
+    if (!node || node.removed) { continue; }
+    // A top-level frame is a whole SCREEN. No cleanup pass has any business
+    // removing one, and refusing here closes the class of mistake rather than
+    // the one instance of it that was found.
+    if (node.parent && node.parent.type === 'PAGE') { skipped.push(id); continue; }
+    node.remove(); removed.push(id);
   } catch (e) {}
 }
-return { createdNodeIds: [], removedNodeIds: removed };
+return { createdNodeIds: [], removedNodeIds: removed, skippedNodeIds: skipped };
 """
 
 
@@ -686,6 +692,149 @@ return {{ createdNodeIds: [section.id] }};
 # as separate screens rather than one design that happens to have a seam.
 SCREEN_GAP = 160
 
+# Where the first screen goes on an empty page. Never (0,0) -- gotchas.md.
+SCREEN_START_X = 200
+SCREEN_START_Y = 200
+
+# Clearance left between work that was already on the page and anything this
+# run creates, so a second run never lands on top of the first.
+EXISTING_CLEARANCE = 200
+
+# Frame width per device. A screen's device is decided once, in the planner,
+# because "a mobile sign-in screen and a desktop dashboard" used to produce two
+# frames of identical width -- the instruction was read for ONE width and every
+# screen got it.
+DEVICE_WIDTHS: dict[str, tuple[int, int]] = {
+    "mobile": (390, 844),
+    "tablet": (834, 1194),
+    "desktop": (1440, 900),
+}
+
+
+def device_size(device: str) -> tuple[int, int]:
+    """(width, height) for a device name, defaulting to desktop."""
+    return DEVICE_WIDTHS.get((device or "").strip().lower(), DEVICE_WIDTHS["desktop"])
+
+
+def occupied_rects(nodes: list[dict]) -> list[tuple[int, int, int, int]]:
+    """(left, top, right, bottom) for everything already on the page.
+
+    Anything without real geometry is skipped rather than treated as a rect at
+    the origin -- a node we cannot measure must not push every screen to the
+    right of a phantom box.
+    """
+    rects: list[tuple[int, int, int, int]] = []
+    for node in nodes or []:
+        try:
+            x = int(node.get("x") or 0)
+            y = int(node.get("y") or 0)
+            width = int(node.get("width") or 0)
+            height = int(node.get("height") or 0)
+        except (TypeError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        rects.append((x, y, x + width, y + height))
+    return rects
+
+
+def place_screens(
+    sizes: list[tuple[int, int]],
+    occupied: list[tuple[int, int, int, int]] | None = None,
+    y: int = SCREEN_START_Y,
+    gap: int = SCREEN_GAP,
+    clearance: int = EXISTING_CLEARANCE,
+) -> list[tuple[int, int]]:
+    """Left-to-right positions for new screens that can overlap NOTHING.
+
+    Placement is arithmetic, so Python owns it (CLAUDE.md section 7) and the
+    guarantee is checkable rather than hoped for: no returned rect touches
+    another, and none touches anything already on the page.
+
+    Two holes this closes that a running `x += width + gap` had:
+
+    - **Screens of different widths.** The advance used one shared width, so a
+      390px mobile frame beside a 1440px desktop one either overlapped it or
+      left a chasm. Each screen now advances by its OWN width.
+    - **Existing work below or beside the row.** The start was "right of the
+      widest thing on the page", which is clear of a tall sketch but not of a
+      second one further right, and not of anything that appears at the row's
+      own height. Every candidate is now tested against every rect and slid
+      right until it is genuinely clear.
+    """
+    taken = list(occupied or [])
+    placed: list[tuple[int, int]] = []
+    x = _first_free_x(taken, clearance)
+
+    for width, height in sizes:
+        x = _slide_clear(x, y, int(width), int(height), taken, gap)
+        placed.append((x, y))
+        taken.append((x, y, x + int(width), y + int(height)))
+        x += int(width) + gap
+    return placed
+
+
+def _first_free_x(taken: list[tuple[int, int, int, int]], clearance: int) -> int:
+    """Start to the right of everything already on the page."""
+    if not taken:
+        return SCREEN_START_X
+    return max(right for _, _, right, _ in taken) + clearance
+
+
+def _slide_clear(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    taken: list[tuple[int, int, int, int]],
+    gap: int,
+) -> int:
+    """Push x right until this rect clears every rect already taken.
+
+    Bounded by the number of rects: each pass moves past at least one of them,
+    so it cannot loop -- an unbounded "try again" here would hang the run
+    before a single node was created.
+    """
+    for _ in range(len(taken) + 1):
+        blocker = _first_blocker(x, y, width, height, taken, gap)
+        if blocker is None:
+            return x
+        x = blocker[2] + gap
+    return x
+
+
+def _first_blocker(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    taken: list[tuple[int, int, int, int]],
+    gap: int,
+) -> tuple[int, int, int, int] | None:
+    """The furthest-right rect this candidate collides with, gap included.
+
+    Furthest-right, so one pass jumps past a whole cluster rather than landing
+    between two overlapping boxes and having to slide again.
+    """
+    hits = [
+        rect
+        for rect in taken
+        if _collides((x, y, x + width, y + height), rect, gap)
+    ]
+    return max(hits, key=lambda r: r[2]) if hits else None
+
+
+def _collides(
+    a: tuple[int, int, int, int], b: tuple[int, int, int, int], gap: int
+) -> bool:
+    """Do two rects overlap, counting the gap that must stay between them?"""
+    return (
+        a[0] < b[2] + gap
+        and a[2] + gap > b[0]
+        and a[1] < b[3] + gap
+        and a[3] + gap > b[1]
+    )
+
 
 def build_screen_frames_script(specs: list[dict]) -> str:
     """Create one top-level FRAME per screen, laid out left to right.
@@ -717,7 +866,7 @@ for (const spec of specs) {
   try {
     const frame = figma.createFrame();
     frame.name = spec.name;
-    frame.resize(spec.width, 900);
+    frame.resize(spec.width, spec.height || 900);
     figma.currentPage.appendChild(frame);
     frame.x = spec.x;
     frame.y = spec.y;

@@ -168,7 +168,11 @@ def _recover_tool_call_from_content(message: ChatCompletionMessage, tools: list[
         calls.extend(_calls_from(block, known_names, by_argument))
     if not calls:
         return message
-    return SimpleNamespace(content=None, tool_calls=calls)
+    # Flagged, not inferred. `check_model.py` reports a model that needs this
+    # as WEAKER than one that calls tools natively -- recovery works, but the
+    # model still burned a turn printing the call as prose, on every step. The
+    # loop itself neither reads nor cares about this.
+    return SimpleNamespace(content=None, tool_calls=calls, recovered_from_text=True)
 
 
 def _tools_by_sole_argument(tools: list[dict]) -> dict[str, str]:

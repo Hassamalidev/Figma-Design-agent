@@ -9,6 +9,8 @@ The generated JavaScript is compiled exactly as the plugin evaluates it.
 from __future__ import annotations
 
 import functools
+import json
+import re
 import subprocess
 
 import pytest
@@ -155,7 +157,7 @@ def test_a_whole_screen_frame_cannot_be_deleted(resolve):
     with pytest.raises(SpecError) as caught:
         compile_one(resolve, {"op": "delete", "target": "1:2"})
 
-    assert "whole screen" in str(caught.value)
+    assert "whole screen frame" in str(caught.value)
 
 
 def test_a_section_inside_a_screen_CAN_be_deleted(resolve):
@@ -200,3 +202,141 @@ def test_a_real_token_name_works_where_no_role_does(resolve):
     code, _ = compile_one(resolve, {"op": "set_fill", "target": "1:9", "color": "color/card"})
 
     assert '"color/card"' in code
+
+
+# ---- a real trace: an edit run emptied the user's page ---------------------
+#
+# `delete` was guarded against removing a whole screen frame and `replace` was
+# not -- and `replace` removes its target just as surely, via the renderer's
+# replace_ids. So one edit took a whole screen away, and the same op with a
+# `{"type":"FRAME"}` selector fanned out across every frame on the page.
+#
+# These tests are the boundary of what an edit may destroy. Loosening any of
+# them is how a user loses work, so each one says what it is protecting.
+
+WIDE_PAGE = {
+    "roots": [
+        {"id": "1:2", "name": "Login", "type": "FRAME", "width": 1440, "height": 900,
+         "children": [
+             {"id": "1:3", "name": "Card", "type": "FRAME", "width": 440, "height": 520,
+              "children": []},
+             {"id": "1:4", "name": "Old banner", "type": "FRAME", "width": 440, "height": 80,
+              "children": []}]},
+        {"id": "2:2", "name": "Sign Up", "type": "FRAME", "width": 1440, "height": 900,
+         "children": [
+             {"id": "2:3", "name": "Card", "type": "FRAME", "width": 440, "height": 520,
+              "children": []}]},
+    ]
+}
+SCREENS = frozenset({"1:2", "2:2"})
+
+
+@pytest.fixture
+def wide():
+    return functools.partial(inventory.resolve, inventory.build(WIDE_PAGE))
+
+
+def removed_by(code: str) -> list[str]:
+    """Every node id the script would actually take off the canvas."""
+    gone = re.findall(r"for \(const _oldId of (\[[^\]]*\])\)", code)
+    ids = [i for group in gone for i in json.loads(group)]
+    ids += re.findall(r'getNodeByIdAsync\("([^"]+)"\);\s*\n\s*if \(!n\d+ \|\| n\d+\.removed\)', code)
+    return ids
+
+
+@pytest.mark.parametrize("op, extra", [("delete", {}), ("replace", {"spec": {"kind": "text", "value": "x"}})])
+def test_no_destructive_op_may_target_a_whole_screen(wide, op, extra):
+    """The exact bug: `replace` on a top-level frame emptied the page."""
+    with pytest.raises(SpecError) as caught:
+        editor.compile_edits([{"op": op, "target": "1:2", **extra}], wide, ROLES, TOKENS, set(SCREENS))
+
+    assert "whole screen frame" in str(caught.value)
+
+
+@pytest.mark.parametrize("op, extra", [("delete", {}), ("replace", {"spec": {"kind": "text", "value": "x"}})])
+def test_a_wide_selector_may_not_remove_what_it_matches(wide, op, extra):
+    """`{"type":"FRAME"}` matches everything. Bulk RECOLOURING everything is a
+    fine edit; bulk REMOVING it is how a page disappears -- and unlike a list of
+    ids, the model never sees how far a selector reaches."""
+    with pytest.raises(SpecError) as caught:
+        editor.compile_edits(
+            [{"op": op, "target": {"type": "FRAME"}, **extra}], wide, ROLES, TOKENS, set(SCREENS)
+        )
+
+    assert "removes what it matches" in str(caught.value)
+
+
+def test_a_wide_selector_is_still_fine_for_a_NON_destructive_edit(wide):
+    """The cap must not cost the legitimate bulk edit it was never about."""
+    code, touched = editor.compile_edits(
+        [{"op": "set_fill", "target": {"type": "FRAME"}, "color": "accent"}],
+        wide, ROLES, TOKENS, set(SCREENS),
+    )
+
+    assert len(touched) == 5 and compiles_as_async_body(code)
+
+
+def test_a_batch_may_not_remove_more_than_a_handful(wide):
+    """Removing more than a few nodes is a redesign, not an edit."""
+    with pytest.raises(SpecError) as caught:
+        editor.compile_edits(
+            [{"op": "delete", "target": "1:3"}] * (editor.MAX_REMOVALS_PER_BATCH + 1),
+            wide, ROLES, TOKENS, set(SCREENS),
+        )
+
+    assert "redesign, not an edit" in str(caught.value)
+
+
+def test_removal_fails_CLOSED_when_the_screens_are_unknown(wide):
+    """If the inventory read failed, or a caller forgot to pass the screens, the
+    guard has nothing to compare against. That must refuse, never allow."""
+    with pytest.raises(SpecError) as caught:
+        editor.compile_edits([{"op": "delete", "target": "1:3"}], wide, ROLES, TOKENS, set())
+
+    assert "could not work out which frames are whole screens" in str(caught.value)
+
+
+def test_the_generated_script_refuses_a_screen_at_runtime_too(wide):
+    """Belt and braces: the inventory is a snapshot, and the canvas can move
+    under it. The script re-checks against Figma itself."""
+    code, _ = editor.compile_edits(
+        [{"op": "replace", "target": "1:4", "spec": {"kind": "text", "value": "x"}}],
+        wide, ROLES, TOKENS, set(SCREENS),
+    )
+
+    assert "target.type === 'PAGE'" in code
+    assert "would empty the page" in code
+
+
+def test_two_replaces_in_one_batch_do_not_collide(wide):
+    """`const old` was emitted at the top level, so a second replace was a
+    redeclaration and the whole script died before anything ran."""
+    spec = {"kind": "text", "value": "x"}
+    code, _ = editor.compile_edits(
+        [{"op": "replace", "target": "1:3", "spec": spec},
+         {"op": "replace", "target": "1:4", "spec": spec}],
+        wide, ROLES, TOKENS, set(SCREENS),
+    )
+
+    assert compiles_as_async_body(code)
+
+
+def test_a_legitimate_replace_and_delete_still_work(wide):
+    """The guard has to leave the real job intact."""
+    code, touched = editor.compile_edits(
+        [{"op": "replace", "target": "1:4", "spec": {"kind": "text", "value": "x"}},
+         {"op": "delete", "target": "1:3"}],
+        wide, ROLES, TOKENS, set(SCREENS),
+    )
+
+    assert touched == ["1:4", "1:3"] and compiles_as_async_body(code)
+
+
+def test_every_destructive_op_is_covered_by_the_guard():
+    """A new op that removes something must not be addable without one."""
+    import inspect
+
+    source = inspect.getsource(editor._EditCompiler)
+    for op in editor.DESTRUCTIVE_OPS:
+        body = source.split(f"def {op}(self")[1].split("\n    def ")[0]
+        assert "guard_removal" in body, f"{op} removes nodes but is not guarded"

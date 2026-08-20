@@ -58,6 +58,19 @@ OPS = (
 # A batch bigger than this is a rebuild, not an edit.
 MAX_EDITS = 40
 
+# The destructive budget. An edit run wiped a user's page by expanding one
+# `replace` across every frame on it, so removal is now capped twice: by how
+# many nodes a whole batch may remove, and -- much more tightly -- by how many
+# a SELECTOR may remove. An over-broad selector is precisely how "swap the old
+# label" becomes "swap everything", and unlike a list of ids the model never
+# sees how far it reaches.
+MAX_REMOVALS_PER_BATCH = 6
+MAX_SELECTOR_REMOVALS = 2
+
+# Ops that take something off the canvas. The guard hangs off this set rather
+# than off the op name, so a new destructive op cannot be added without one.
+DESTRUCTIVE_OPS = ("delete", "replace")
+
 
 def _js(value) -> str:
     return json.dumps(value)
@@ -72,6 +85,8 @@ class _EditCompiler:
         # single mis-parsed word.
         self.protected = protected
         self.lines: list[str] = []
+        # How many nodes this batch removes, across every op that removes one.
+        self.removals = 0
         self.fonts: set[tuple[str, str]] = set()
         self.touched: list[str] = []
 
@@ -224,12 +239,45 @@ class _EditCompiler:
         )
         self.end(node_id, "reorder")
 
-    def delete(self, node_id: str, edit: dict) -> None:
-        if node_id in self.protected:
+    # -- the destructive ops -----------------------------------------------
+    #
+    # `delete` was guarded and `replace` was not, and `replace` removes its
+    # target just as surely -- so `{"op":"replace","target":"<a screen frame>"}`
+    # threw a whole screen away, and the same op with a `{"type":"FRAME"}`
+    # selector fanned out and emptied the page. Both now go through one guard,
+    # because the property that matters is "this removes something", not which
+    # word was used for it.
+
+    def guard_removal(self, node_id: str, op: str) -> None:
+        """Refuse a removal that is too big to be an edit."""
+        if not self.protected:
+            # A plumbing mistake (an inventory that failed to read, a caller
+            # that forgot to pass the screens) must not silently unlock
+            # deleting screens. Fail closed.
             raise SpecError(
-                f"{node_id} is a whole screen frame. Deleting it would throw the entire "
-                "screen away; delete the specific section inside it instead."
+                f"{op} is not available: the harness could not work out which frames are "
+                "whole screens, and will not risk removing one."
             )
+        if node_id in self.protected:
+            fix = (
+                "Rebuild a whole screen with Create mode"
+                if op == "replace"
+                else "Remove the specific section inside it instead"
+            )
+            raise SpecError(
+                f"{node_id} is a whole screen frame, and {op} removes what it targets -- "
+                f"this would empty the page. {fix}, or target a section inside it."
+            )
+        self.removals += 1
+        if self.removals > MAX_REMOVALS_PER_BATCH:
+            raise SpecError(
+                f"this batch would remove {self.removals} nodes, more than the "
+                f"{MAX_REMOVALS_PER_BATCH} an edit is allowed. Removing more than that is a "
+                "redesign, not an edit -- do it in smaller, explicit steps."
+            )
+
+    def delete(self, node_id: str, edit: dict) -> None:
+        self.guard_removal(node_id, "delete")
         var = self.begin(node_id, "delete")
         self.lines.append(f"  {var}.remove();")
         self.end(node_id, "delete")
@@ -246,32 +294,57 @@ class _EditCompiler:
         spec = edit.get("spec")
         if not isinstance(spec, dict):
             raise SpecError("replace needs a `spec` (a UI tree, same shape as render_ui)")
+        self.guard_removal(node_id, "replace")
+        self.touched.append(node_id)
         # Build into the node's PARENT and remove the old one, which is what
         # "replace" has to mean -- a node cannot be rendered into itself.
-        self.lines.append(f"const old = await figma.getNodeByIdAsync({_js(node_id)});")
-        self.lines.append("if (!old || old.removed) { throw new Error('node to replace is gone'); }")
-        self.lines.append("const target = old.parent;")
-        self.lines.append("if (!target) { throw new Error('node to replace has no parent'); }")
-        self.lines.append("const at = target.children.indexOf(old);")
-        self._render_into(
-            "target", edit["spec"], replace_ids=[node_id], label="replace", index="at", raw_parent=True
+        #
+        # Everything is scoped to a block: `const old` at the top level meant a
+        # second replace in one batch was a redeclaration, and the whole script
+        # died as a syntax error before anything ran.
+        self.lines.append("try {")
+        self.lines.append("{")
+        self.lines.append(f"  const old = await figma.getNodeByIdAsync({_js(node_id)});")
+        self.lines.append("  if (!old || old.removed) { throw new Error('node to replace is gone'); }")
+        self.lines.append("  const target = old.parent;")
+        self.lines.append("  if (!target) { throw new Error('node to replace has no parent'); }")
+        # The last line of defence, checked against Figma itself rather than
+        # against the inventory we read a moment ago: a node whose parent is the
+        # PAGE is a screen, and replacing one is never an edit.
+        self.lines.append(
+            "  if (target.type === 'PAGE') { throw new Error("
+            "'that node is a whole screen -- replacing it would empty the page'); }"
         )
+        self.lines.append("  const at = target.children.indexOf(old);")
+        self.lines.append(self._render_body("target", spec, [node_id], raw_parent=True))
+        self.lines.append("  await _placeLast(at);")
+        self.lines.append("}")
+        self.lines.append(f"  applied.push({_js(f'replace on {node_id}')});")
+        self.lines.append("} catch (e) {")
+        self.lines.append(
+            f"  failed.push({_js(f'replace on {node_id}')} + ': ' "
+            "+ String(e && e.message ? e.message : e));"
+        )
+        self.lines.append("}")
 
-    def _render_into(self, parent, spec, replace_ids, label, index=None, raw_parent=False):
+    def _render_body(self, parent, spec, replace_ids, raw_parent=False) -> str:
         code, _ = renderer.compile_spec(
             spec,
-            parent if raw_parent else parent,
+            parent,
             self.roles,
             replace_ids=replace_ids,
             token_names=list(self.tokens.values()),
         )
+        return _inline_render(code, parent, raw_parent)
+
+    def _render_into(self, parent, spec, replace_ids, label, index=None, raw_parent=False):
         # The renderer emits a standalone script. Inline its body, keeping the
         # ids it creates, so a batch of edits stays one round trip.
-        body = _inline_render(code, parent, raw_parent)
+        body = self._render_body(parent, spec, replace_ids, raw_parent)
         self.lines.append("try {")
         self.lines.append(body)
         if index is not None:
-            self.lines.append(f"  _placeLast({index});")
+            self.lines.append(f"  await _placeLast({index});")
         self.lines.append(f"  applied.push({_js(label)});")
         self.lines.append("} catch (e) {")
         self.lines.append(
@@ -322,9 +395,13 @@ const _texts = await figma.getLocalTextStylesAsync();
 const _textByName = {};
 for (const t of _texts) { _textByName[t.name] = t; }
 // Move whatever was just inserted to a specific position among its siblings.
-function _placeLast(at) {
+// ASYNC on purpose: the sync `figma.getNodeById` throws under this plugin's
+// documentAccess: "dynamic-page" (knowledge/gotchas.md), and it threw AFTER the
+// replace had already removed the old node -- so the edit reported failure with
+// the original gone.
+async function _placeLast(at) {
   if (typeof at !== 'number' || at < 0 || !madeIds.length) { return; }
-  const node = figma.getNodeById(madeIds[madeIds.length - 1]);
+  const node = await figma.getNodeByIdAsync(madeIds[madeIds.length - 1]);
   if (node && node.parent) {
     node.parent.insertChild(Math.max(0, Math.min(at, node.parent.children.length - 1)), node);
   }
@@ -366,9 +443,22 @@ def compile_edits(
             compiler.insert(ids[0], edit)
             continue
 
-        ids, error = resolve(edit.get("target"))
+        target = edit.get("target")
+        ids, error = resolve(target)
         if error:
             raise SpecError(f"edit {position} ({op}): {error}")
+        # A SELECTOR that removes things is the dangerous shape. `set_fill` on
+        # everything matching "Button" is a fine bulk edit; `replace` on the
+        # same match silently deleted every frame on a real user's page. The
+        # model can still remove several nodes -- it just has to name them, so
+        # the count is something it chose rather than something it discovered.
+        if op in DESTRUCTIVE_OPS and isinstance(target, dict) and len(ids) > MAX_SELECTOR_REMOVALS:
+            raise SpecError(
+                f"edit {position} ({op}): that selector matches {len(ids)} nodes, and "
+                f"{op} removes what it matches. Name the specific ids you mean "
+                f"(at most {MAX_SELECTOR_REMOVALS} per selector), so nothing is removed "
+                "by accident."
+            )
         for node_id in ids:
             getattr(compiler, op)(node_id, edit)
 

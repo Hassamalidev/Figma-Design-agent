@@ -324,3 +324,64 @@ def test_losing_figma_mid_edit_keeps_the_changes_that_landed():
     assert "1:9" in result.created_node_ids
     assert any("ended early" in w for w in result.warnings)
     assert not result.success
+
+
+# ---- a real trace: an edit run emptied the user's page ---------------------
+
+
+def test_a_run_that_guts_the_canvas_stops_instead_of_carrying_on():
+    """Nothing here can put the design back -- the Plugin API has no undo for us
+    to call. What the run CAN do is notice immediately, while Figma's own undo
+    still has it, and above all not spend the next four steps editing a blank
+    page."""
+    emptied = {"pageId": "0:1", "pageName": "Nexora", "selection": [], "roots": []}
+
+    class ShrinkingBridge(FakeBridge):
+        """Full page first, empty from the moment an edit runs."""
+
+        def send(self, request, timeout: float = 30.0):
+            code = request.code or ""
+            if self.edit_scripts and "selection" in code and "roots" in code:
+                return Response(id=request.id, ok=True, result=dict(emptied, createdNodeIds=[]))
+            return super().send(request, timeout)
+
+    llm = FakeModelClient([
+        message(content='["Remove the old banner.", "Then recolour the button."]'),
+        message(tool_calls=[edit_call("c1", [{"op": "delete", "target": "1:9"}])]),
+        message(content="Done."),
+        message(tool_calls=[edit_call("c2", [{"op": "set_fill", "target": "1:9", "color": "accent"}])]),
+        message(content="Done."),
+    ])
+    bridge = ShrinkingBridge()
+
+    result = edit_loop.run("tidy this up", bridge, llm, max_retries=1)
+
+    assert len(bridge.edit_scripts) == 1, "it kept editing a page it had just emptied"
+    assert not result.success
+    warning = " ".join(result.warnings)
+    assert "STOPPED" in warning and "Ctrl+Z" in warning
+
+
+def test_a_normal_edit_does_not_trip_the_gutted_check():
+    """The guard must not fire on a design that merely got smaller."""
+    llm = FakeModelClient([
+        message(content='["Remove the old banner."]'),
+        message(tool_calls=[edit_call("c1", [{"op": "delete", "target": "1:10"}])]),
+        message(content="Done."),
+    ])
+    bridge = FakeBridge()
+
+    result = edit_loop.run("remove the old banner", bridge, llm, max_retries=1)
+
+    assert result.success
+    assert not any("STOPPED" in w for w in result.warnings)
+
+
+def test_the_prompt_tells_the_model_that_replace_removes_things():
+    """The model was told `delete` was the only destructive op, so `replace` on
+    a screen frame looked like an ordinary edit."""
+    from agent.prompts import EDIT_SYSTEM_PROMPT
+
+    assert "`delete` and `replace`" in EDIT_SYSTEM_PROMPT
+    assert "top-level frame" in EDIT_SYSTEM_PROMPT
+    assert "selector" in EDIT_SYSTEM_PROMPT

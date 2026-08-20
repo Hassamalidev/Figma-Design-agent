@@ -356,3 +356,93 @@ def test_a_missing_role_is_derived_rather_than_aliased_onto_the_page_fill():
 def test_completing_a_palette_that_needs_nothing_changes_nothing():
     complete = scaffold.complete_palette(PALETTE)
     assert complete[: len(PALETTE)] == PALETTE
+
+
+# ---- screen placement: overlap is arithmetic, so it is a guarantee --------
+#
+# Getting this wrong cascades: every later step appends into one of these
+# frames, so a frame at the wrong coordinates means a whole screen rendered on
+# top of another one.
+
+
+def _rects(placed, sizes):
+    return [(x, y, x + w, y + h) for (x, y), (w, h) in zip(placed, sizes)]
+
+
+def _overlaps(a, b):
+    return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
+
+
+def _assert_all_clear(rects, existing=()):
+    for i, rect in enumerate(rects):
+        for other in list(rects[i + 1:]) + list(existing):
+            assert not _overlaps(rect, other), f"{rect} overlaps {other}"
+
+
+def test_screens_are_laid_out_left_to_right_on_an_empty_page():
+    placed = scaffold.place_screens([(1440, 900), (1440, 900)])
+
+    assert placed[0] == (scaffold.SCREEN_START_X, scaffold.SCREEN_START_Y)
+    assert placed[1][0] == placed[0][0] + 1440 + scaffold.SCREEN_GAP
+
+
+def test_each_screen_advances_by_its_own_width():
+    """One shared width either overlapped the frame beside a narrow screen or
+    left a chasm beside a wide one."""
+    sizes = [(390, 844), (1440, 900), (390, 844)]
+
+    placed = scaffold.place_screens(sizes)
+
+    _assert_all_clear(_rects(placed, sizes))
+    assert placed[1][0] - placed[0][0] == 390 + scaffold.SCREEN_GAP
+
+
+def test_new_screens_start_clear_of_work_already_on_the_page():
+    existing = [(0, 0, 800, 600)]
+
+    placed = scaffold.place_screens([(1440, 900)], existing, clearance=200)
+
+    assert placed[0][0] == 1000
+
+
+def test_a_screen_slides_past_anything_in_its_way():
+    """The guarantee is checked against every rect, not inferred from where the
+    row starts -- so it still holds for a caller that starts the row inside
+    existing work."""
+    existing = [(0, 0, 800, 600), (1200, 100, 2000, 1400)]
+    sizes = [(600, 900), (600, 900)]
+
+    placed = scaffold.place_screens(sizes, existing, y=200, clearance=-2000)
+
+    _assert_all_clear(_rects(placed, sizes), existing)
+
+
+def test_placement_is_bounded_by_the_rects_it_is_given():
+    """An unbounded 'try again' here would hang the run before a single node
+    was created."""
+    existing = [(i * 100, 0, i * 100 + 900, 900) for i in range(40)]
+
+    placed = scaffold.place_screens([(1440, 900)] * 4, existing)
+
+    _assert_all_clear(_rects(placed, [(1440, 900)] * 4), existing)
+
+
+def test_unmeasurable_nodes_are_not_read_as_a_box_at_the_origin():
+    """A node we cannot measure must not push every screen to the right of a
+    phantom rect."""
+    nodes = [
+        {"id": "1:1", "x": None, "y": None, "width": 0, "height": 0},
+        {"id": "1:2", "x": "nonsense", "y": 0, "width": 10, "height": 10},
+        {"id": "1:3", "x": 10, "y": 20, "width": 100, "height": 50},
+    ]
+
+    assert scaffold.occupied_rects(nodes) == [(10, 20, 110, 70)]
+
+
+def test_a_screen_frame_honours_its_own_starting_height():
+    script = scaffold.build_screen_frames_script(
+        [{"name": "Phone", "x": 0, "y": 0, "width": 390, "height": 844}]
+    )
+
+    assert '"height": 844' in script
+    assert "spec.height || 900" in script

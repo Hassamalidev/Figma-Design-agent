@@ -128,6 +128,11 @@ def _apply(state: RunState, bridge: Bridge, llm: ModelClient, max_retries: int, 
     state.plan = [PlanStep(description=s, screen_index=0, render_only=False) for s in steps]
     metrics.current().steps_planned = len(state.plan)
 
+    # What the file looked like before we touched it. Every step is measured
+    # against this, because the one failure an edit run must never sit through
+    # is quietly emptying somebody's page.
+    started_with = len(canvas.nodes)
+
     for index, step in enumerate(state.plan, start=1):
         _stop_if_asked(state)
         label = f"Edit {index}/{len(state.plan)}"
@@ -138,12 +143,43 @@ def _apply(state: RunState, bridge: Bridge, llm: ModelClient, max_retries: int, 
         canvas = read_inventory(bridge) or canvas
         run_edit_step(step, state, canvas, bridge, llm, max_retries, label, index)
 
+        canvas = read_inventory(bridge) or canvas
+        if canvas_was_gutted(started_with, len(canvas.nodes), state):
+            break
+
     review(state, bridge)
     logger.info(
         "Done. %d change(s) applied, %d step(s) failed.",
         len(state.created_node_ids), len(state.failed_steps),
     )
     return state.result()
+
+
+# How much of the file an edit run may remove before it stops and says so.
+# A real run emptied a page; nothing downstream noticed, and it carried on
+# making edits to a blank canvas.
+GUTTED_FRACTION = 0.5
+
+
+def canvas_was_gutted(before: int, after: int, state: RunState) -> bool:
+    """Did that step take most of the design away? Stop if so, loudly.
+
+    Nothing here can put it back -- the Plugin API has no undo for us to call --
+    but FIGMA'S undo still works, and it works best the moment it happens. So
+    the run's job is to notice immediately, say so in words the user can act on,
+    and above all not spend the next four steps editing a blank page.
+    """
+    if before <= 0 or after >= before * GUTTED_FRACTION:
+        return False
+    message = (
+        f"STOPPED: the canvas went from {before} nodes to {after}. That is not an edit, "
+        "so the rest of this run has been abandoned. Press Ctrl+Z (Cmd+Z) in Figma NOW "
+        "to put it back -- Figma's own undo still has it."
+    )
+    logger.info("%s", message)
+    state.warnings.insert(0, message)
+    state.ended_early = True
+    return True
 
 
 def read_inventory(bridge: Bridge) -> inventory.Inventory | None:
